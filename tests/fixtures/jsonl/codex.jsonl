@@ -1,0 +1,8 @@
+{"type": "session_meta", "payload": {"id": "codex-canonical", "session_id": "root-thread", "cwd": "/fixture/project", "git": {"branch": "feature"}, "source": {"subagent": {"thread_spawn": {"parent_thread_id": "root-thread"}}}}}
+{"type": "response_item", "timestamp": "2026-08-10T12:03:00+02:00", "payload": {"type": "message", "role": "user", "content": "Unicode café 🐌\nsecond line  "}}
+{"type": "response_item", "timestamp": "2026-08-10T12:03:00+02:00", "payload": {"type": "function_call", "name": "exec", "arguments": "{\"cmd\":\"echo needle\"}"}}
+{"type": "response_item", "timestamp": "2026-08-10T12:03:00+02:00", "payload": {"type": "function_call_output", "output": "needle result"}}
+{"type": "response_item", "timestamp": "2026-08-10T12:03:00+02:00", "payload": {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Consider paths"}]}}
+{"type": "turn_context", "timestamp": "2026-08-10T12:03:00+02:00", "payload": {"summary": "A summary"}}
+{"type": "response_item", "payload": {"type": "message", "role": "developer", "content": "hidden preamble"}}
+{"type": "response_item", "payload": {"type": "message", "role": "user", "content": "# AGENTS.md instructions\ninjected"}}

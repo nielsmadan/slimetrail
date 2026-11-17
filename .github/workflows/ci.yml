@@ -1,0 +1,19 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  check:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+        timeout-minutes: 15
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        timeout-minutes: 15
+      - run: cargo test --locked --all-targets
+        timeout-minutes: 15

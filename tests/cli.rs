@@ -1,0 +1,687 @@
+use serde_json::{Value, json};
+use std::{
+    fs,
+    path::Path,
+    process::{Command, Output, Stdio},
+};
+use tempfile::TempDir;
+
+struct Fixture {
+    temp: TempDir,
+}
+impl Fixture {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("codex/sessions")).unwrap();
+        Self { temp }
+    }
+    fn root(&self) -> &Path {
+        self.temp.path()
+    }
+    fn write(&self, text: &str) {
+        let records = [
+            json!({"type":"session_meta","payload":{"id":"sample","cwd":self.root().join("work/app"),"git":{"branch":"main"}}}),
+            json!({"type":"response_item","timestamp":"2026-10-25T00:30:00Z","payload":{"type":"message","role":"user","content":text}}),
+            json!({"type":"response_item","timestamp":"2026-10-25T00:40:00Z","payload":{"type":"message","role":"assistant","content":"Second reply"}}),
+        ];
+        fs::write(
+            self.root().join("codex/sessions/sample.jsonl"),
+            records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+    }
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_slimetrail"));
+        command
+            .env_clear()
+            .env("HOME", self.root())
+            .env("CODEX_HOME", self.root().join("codex"))
+            .env("XDG_DATA_HOME", self.root().join("data"))
+            .env("TZ", "UTC")
+            .arg("--index-dir")
+            .arg(self.root().join("index"));
+        command
+    }
+    fn run(&self, args: &[&str]) -> Output {
+        self.command().args(args).output().unwrap()
+    }
+    fn json(&self, args: &[&str], code: i32) -> Value {
+        let output = self
+            .command()
+            .args(["--format", "json"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["version"], 1);
+        value
+    }
+}
+
+#[test]
+fn search_complete_empty_partial_and_fatal_envelopes() {
+    let fixture = Fixture::new();
+    fixture.write("Unicode café 🐌 and a.b");
+    let complete = fixture.json(&["search", "A.B", "--codex", "--scope", "all"], 0);
+    assert_eq!(complete["incomplete"], false);
+    assert_eq!(complete["diagnostics"], json!([]));
+    assert_eq!(complete["data"]["count"], 1);
+    assert_eq!(complete["data"]["results"][0]["ref"], "codex:sample");
+    assert_eq!(
+        complete["data"]["results"][0]["first_ts"],
+        "2026-10-25T00:30:00Z"
+    );
+    let empty = fixture.json(&["search", "missing", "--codex", "--scope", "all"], 0);
+    assert_eq!(empty["data"]["results"], json!([]));
+    let partial = fixture.json(
+        &["search", "café", "--codex", "--claude", "--scope", "all"],
+        1,
+    );
+    assert_eq!(partial["incomplete"], true);
+    assert_eq!(partial["data"]["count"], 1);
+    assert!(!partial["diagnostics"].as_array().unwrap().is_empty());
+    let unavailable = fixture.json(&["search", "x", "--claude", "--scope", "all"], 1);
+    assert_eq!(unavailable["data"]["results"], json!([]));
+    let fatal = fixture.json(&["search", "(", "--regex", "--codex"], 2);
+    assert_eq!(fatal["data"], Value::Null);
+    assert_eq!(fatal["diagnostics"][0]["code"], "fatal");
+    let absent = fixture.json(&["read", "codex:absent"], 2);
+    assert_eq!(absent["data"], Value::Null);
+    let unavailable_read = fixture.json(&["read", "claude:absent"], 1);
+    assert_eq!(unavailable_read["data"], Value::Null);
+    let unavailable_entries = fixture.json(&["entries", "claude:absent"], 1);
+    assert_eq!(unavailable_entries["data"]["entries"], json!([]));
+    assert_eq!(unavailable_entries["data"]["session"], Value::Null);
+}
+
+#[test]
+fn read_pages_concatenate_unicode_and_entries_finalize_metadata() {
+    let fixture = Fixture::new();
+    fixture.write("café 🐌 needle");
+    let full = fixture.json(&["read", "codex:sample"], 0);
+    let body = full["data"]["body"].as_str().unwrap();
+    let mut actual = String::new();
+    let mut offset = 0;
+    loop {
+        let page = fixture.json(
+            &[
+                "read",
+                "codex:sample",
+                "--max-chars",
+                "7",
+                "--offset",
+                &offset.to_string(),
+            ],
+            0,
+        );
+        let data = &page["data"];
+        let text = data["body"].as_str().unwrap();
+        assert_eq!(data["returned_chars"], text.chars().count());
+        actual.push_str(text);
+        match data["next_offset"].as_u64() {
+            Some(next) => offset = next,
+            None => break,
+        }
+    }
+    assert_eq!(actual, body);
+    let entries = fixture.json(&["entries", "codex:sample"], 0);
+    assert_eq!(entries["data"]["entries"][0]["text"], "café 🐌 needle");
+    assert_eq!(
+        entries["data"]["entries"][0]["timestamp_ms"],
+        1792888200000_i64
+    );
+    assert_eq!(entries["data"]["session"]["ref"], "codex:sample");
+    assert_eq!(entries["incomplete"], false);
+    let raw = fixture.run(&["entries", "codex:sample", "--format", "json"]);
+    let raw = String::from_utf8(raw.stdout).unwrap();
+    assert!(raw.find("\"entries\"").unwrap() < raw.find("\"session\"").unwrap());
+}
+
+#[test]
+fn text_read_reports_scalar_continuation_without_changing_transcript() {
+    let fixture = Fixture::new();
+    fixture.write("café 🐌 needle");
+    let full = fixture.json(&["read", "codex:sample"], 0);
+    let body = full["data"]["body"].as_str().unwrap();
+    let split = body.chars().position(|ch| ch == '🐌').unwrap() + 1;
+    let first = fixture.run(&["read", "codex:sample", "--max-chars", &split.to_string()]);
+    assert!(first.status.success());
+    assert_eq!(
+        String::from_utf8(first.stdout).unwrap(),
+        body.chars().take(split).collect::<String>()
+    );
+    assert_eq!(
+        String::from_utf8(first.stderr).unwrap(),
+        format!("Transcript truncated; continue with --offset {split}\n")
+    );
+    let last = fixture.run(&["read", "codex:sample", "--offset", &split.to_string()]);
+    assert!(last.status.success());
+    assert_eq!(
+        String::from_utf8(last.stdout).unwrap(),
+        body.chars().skip(split).collect::<String>()
+    );
+    assert_eq!(last.stderr, b"");
+}
+
+#[test]
+fn incremental_index_reports_reuse_and_change() {
+    let fixture = Fixture::new();
+    fixture.write("needle");
+    let first = fixture.json(&["index", "--codex"], 0);
+    assert_eq!(first["data"]["reparsed"], 1);
+    let repeated = fixture.json(&["index", "--codex"], 0);
+    assert_eq!(repeated["data"]["reparsed"], 0);
+    assert_eq!(repeated["data"]["reused"], 1);
+    fixture.write("changed needle text");
+    let changed = fixture.json(&["index", "--codex"], 0);
+    assert_eq!(changed["data"]["reparsed"], 1);
+}
+
+#[test]
+fn help_selection_scope_and_environment_are_honored() {
+    let fixture = Fixture::new();
+    fixture.write("needle");
+    let help = fixture.run(&["--help"]);
+    assert!(help.status.success());
+    let text = String::from_utf8(help.stdout).unwrap();
+    for command in ["search", "read", "timeline", "index", "sessions", "entries"] {
+        let row = text
+            .lines()
+            .find(|line| line.trim_start().starts_with(&format!("{command} ")))
+            .unwrap();
+        assert!(
+            !row.trim_start()
+                .strip_prefix(command)
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "{row}"
+        );
+    }
+    let mut command = fixture.command();
+    let output = command
+        .env("AGENT_HARNESS", "codex")
+        .args([
+            "sessions",
+            "--current",
+            "--scope",
+            "all",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["data"]["count"],
+        1
+    );
+    let invalid = fixture.json(&["sessions", "--current"], 2);
+    assert!(
+        invalid["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("AGENT_HARNESS")
+    );
+    let target = fixture.root().join("work/app");
+    let current = fixture.json(
+        &[
+            "sessions",
+            "--codex",
+            "--scope",
+            "current",
+            "--cwd",
+            target.to_str().unwrap(),
+        ],
+        0,
+    );
+    assert_eq!(current["data"]["count"], 1);
+    let expanded = fixture.json(
+        &[
+            "sessions",
+            "--codex",
+            "--scope",
+            "current",
+            "--cwd",
+            "~/work/app",
+        ],
+        0,
+    );
+    assert_eq!(expanded["data"]["count"], 1);
+    let sibling = fixture.root().join("work/other");
+    let siblings = fixture.json(
+        &["sessions", "--codex", "--cwd", sibling.to_str().unwrap()],
+        0,
+    );
+    assert_eq!(siblings["data"]["count"], 1);
+    let mismatch = fixture.json(
+        &[
+            "sessions",
+            "--codex",
+            "--scope",
+            "current",
+            "--cwd",
+            sibling.to_str().unwrap(),
+        ],
+        0,
+    );
+    assert_eq!(mismatch["data"]["count"], 0);
+    let default_all = fixture.json(&["sessions", "--scope", "all"], 1);
+    assert_eq!(default_all["data"]["count"], 1);
+}
+
+#[test]
+fn agent_selectors_are_additive_and_all_takes_precedence() {
+    let fixture = Fixture::new();
+    fixture.write("needle");
+    let projects = fixture.root().join(".claude/projects/app");
+    fs::create_dir_all(&projects).unwrap();
+    fs::write(
+        projects.join("claude.jsonl"),
+        json!({"type":"user","sessionId":"claude-sample","uuid":"u1","cwd":fixture.root().join("work/app"),"message":{"content":"needle"}}).to_string() + "\n",
+    ).unwrap();
+    let output = fixture
+        .command()
+        .env("AGENT_HARNESS", "CoDeX")
+        .args([
+            "search",
+            "needle",
+            "--current",
+            "--claude",
+            "--scope",
+            "all",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let selected: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(selected["data"]["agents"], json!(["claude", "codex"]));
+    assert_eq!(
+        selected["data"]["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["ref"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["claude:claude-sample", "codex:sample"])
+    );
+    let all = fixture.json(
+        &["search", "needle", "--all", "--codex", "--scope", "all"],
+        1,
+    );
+    assert_eq!(
+        all["data"]["agents"],
+        json!(["claude", "codex", "cursor", "droid", "opencode", "pi"])
+    );
+    assert_eq!(all["data"]["count"], 2);
+    let invalid = fixture.json(&["sessions", "--all", "--current"], 2);
+    assert_eq!(invalid["data"], Value::Null);
+    assert!(
+        invalid["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("AGENT_HARNESS")
+    );
+    let output = fixture
+        .command()
+        .env("AGENT_HARNESS", "CoDeX")
+        .args([
+            "search",
+            "needle",
+            "--all",
+            "--current",
+            "--scope",
+            "all",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let selected: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(selected["data"]["agents"], all["data"]["agents"]);
+    assert_eq!(selected["data"]["count"], 2);
+}
+
+#[test]
+fn literal_regex_case_and_kind_options_reach_api() {
+    let fixture = Fixture::new();
+    fixture.write("a.b NEEDLE");
+    let literal = fixture.json(&["search", "a.b", "--codex", "--scope", "all"], 0);
+    assert_eq!(literal["data"]["count"], 1);
+    let sensitive = fixture.json(
+        &[
+            "search",
+            "needle",
+            "--case-sensitive",
+            "--codex",
+            "--scope",
+            "all",
+        ],
+        0,
+    );
+    assert_eq!(sensitive["data"]["count"], 0);
+    let regex = fixture.json(
+        &[
+            "search",
+            "a.b|reply",
+            "--regex",
+            "--codex",
+            "--scope",
+            "all",
+        ],
+        0,
+    );
+    assert_eq!(regex["data"]["results"][0]["matches"], 2);
+    let tools = fixture.json(
+        &[
+            "search", "a.b", "--kind", "tool", "--codex", "--scope", "all",
+        ],
+        0,
+    );
+    assert_eq!(tools["data"]["count"], 0);
+}
+
+#[test]
+fn timeline_parses_zones_inclusive_dates_and_rejects_dst_ambiguities() {
+    let fixture = Fixture::new();
+    fixture.write("needle");
+    let timeline = fixture.json(
+        &[
+            "timeline",
+            "--since",
+            "2026-10-25",
+            "--until",
+            "2026-10-25",
+            "--time-zone",
+            "Europe/Berlin",
+            "--codex",
+            "--scope",
+            "all",
+        ],
+        0,
+    );
+    assert_eq!(timeline["data"]["sessions"][0]["active_minutes"], 10.0);
+    assert_eq!(timeline["data"]["daily_active_minutes"]["2026-10-25"], 10.0);
+    for time in ["2026-10-25T02:30:00", "2026-03-29T02:30:00"] {
+        let result = fixture.json(
+            &[
+                "timeline",
+                "--since",
+                time,
+                "--until",
+                "2026-10-26",
+                "--time-zone",
+                "Europe/Berlin",
+                "--codex",
+            ],
+            2,
+        );
+        assert!(
+            result["diagnostics"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("explicit UTC offset")
+        );
+    }
+    let explicit = fixture.json(
+        &[
+            "timeline",
+            "--since",
+            "2026-10-25T02:00:00+02:00",
+            "--until",
+            "2026-10-25T03:00:00+01:00",
+            "--time-zone",
+            "Europe/Berlin",
+            "--codex",
+            "--scope",
+            "all",
+        ],
+        0,
+    );
+    assert_eq!(explicit["data"]["sessions"].as_array().unwrap().len(), 1);
+    for args in [
+        vec!["timeline"],
+        vec!["timeline", "--days", "0"],
+        vec!["timeline", "--days", "-1"],
+        vec!["timeline", "--since", "2026-10-25", "--days", "1"],
+        vec![
+            "timeline",
+            "--since",
+            "2026-10-25",
+            "--time-zone",
+            "invalid/zone",
+        ],
+    ] {
+        assert_eq!(fixture.run(&args).status.code(), Some(2));
+    }
+    let duration = fixture.json(
+        &[
+            "timeline",
+            "--days",
+            "1",
+            "--until",
+            "2026-10-25T01:00:00Z",
+            "--codex",
+            "--scope",
+            "all",
+        ],
+        0,
+    );
+    assert_eq!(duration["data"]["sessions"].as_array().unwrap().len(), 1);
+    let mut command = fixture.command();
+    let output = command
+        .env("TZ", "Invalid/Zone")
+        .args(["sessions", "--codex", "--time-zone", "UTC"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+}
+
+#[test]
+fn fatal_index_errors_are_json_and_stderr_without_transcript() {
+    let fixture = Fixture::new();
+    fixture.write("private synthetic marker");
+    fs::write(fixture.root().join("index"), "blocking file").unwrap();
+    let output = fixture
+        .command()
+        .args(["sessions", "--codex", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["data"], Value::Null);
+    assert_eq!(value["incomplete"], true);
+    assert_eq!(
+        value["diagnostics"][0]["message"],
+        "invalid argument: index directories must be private directories with mode 0700"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "fatal: invalid argument: index directories must be private directories with mode 0700\n"
+    );
+    assert!(
+        !String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("private synthetic marker")
+    );
+}
+
+#[test]
+fn post_read_timestamp_errors_keep_private_text_out_of_diagnostics() {
+    let fixture = Fixture::new();
+    fixture.write("private synthetic marker");
+    fixture.json(&["index", "--codex"], 0);
+    let db = rusqlite::Connection::open(
+        fixture
+            .root()
+            .join("index")
+            .join(slimetrail::index::DATABASE),
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE entries SET timestamp=?1,timestamp_raw=NULL WHERE entry_index=0",
+        [i64::MAX],
+    )
+    .unwrap();
+    drop(db);
+    for format in ["json", "text"] {
+        let output = fixture.run(&["read", "codex:sample", "--format", format]);
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "fatal: invalid timestamp\n"
+        );
+        if format == "json" {
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["data"], Value::Null);
+            assert_eq!(value["diagnostics"][0]["message"], "invalid timestamp");
+        }
+        assert!(
+            !String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("private synthetic marker")
+        );
+    }
+}
+
+#[test]
+fn broken_stdout_is_quiet() {
+    let fixture = Fixture::new();
+    fixture.write(&"needle".repeat(100_000));
+    let mut child = fixture
+        .command()
+        .args(["entries", "codex:sample", "--format", "json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stderr, b"");
+}
+
+#[test]
+fn default_index_uses_xdg_data_home_and_explicit_index_wins() {
+    let fixture = Fixture::new();
+    fixture.write("needle");
+    let output = Command::new(env!("CARGO_BIN_EXE_slimetrail"))
+        .env_clear()
+        .env("HOME", fixture.root())
+        .env("CODEX_HOME", fixture.root().join("codex"))
+        .env("XDG_DATA_HOME", fixture.root().join("data"))
+        .env("TZ", "UTC")
+        .args(["index", "--codex"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fixture.root().join("data/slimetrail").is_dir());
+    fixture.json(&["index", "--codex"], 0);
+    assert!(fixture.root().join("index").is_dir());
+}
+
+#[test]
+fn entries_keep_partial_records_and_report_final_status() {
+    use std::io::Write;
+    let fixture = Fixture::new();
+    fixture.write("good record");
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(fixture.root().join("codex/sessions/sample.jsonl"))
+        .unwrap();
+    writeln!(file, "{{malformed").unwrap();
+    let output = fixture.json(&["entries", "codex:sample"], 1);
+    assert_eq!(output["data"]["entries"][0]["text"], "good record");
+    assert_eq!(output["data"]["session"]["ref"], "codex:sample");
+    assert_eq!(output["incomplete"], true);
+    assert!(!output["diagnostics"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn unavailable_unselected_root_allows_healthy_selection_and_identifies_partial_source() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let blocked = fixture.root().join("blocked");
+    fs::create_dir(&blocked).unwrap();
+    let pi = fixture.root().join("pi");
+    fs::create_dir(&pi).unwrap();
+    fs::write(pi.join("one.jsonl"), "{\"type\":\"session\",\"id\":\"healthy\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"usable needle\"}}\n").unwrap();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+    let run = |mixed| {
+        let mut command = fixture.command();
+        command
+            .env("SESSION_TRACKER_PROJECTS_DIR", blocked.join("projects"))
+            .env("PI_SESSIONS_DIR", &pi)
+            .args([
+                "search", "needle", "--pi", "--scope", "all", "--format", "json",
+            ]);
+        if mixed {
+            command.arg("--claude");
+        }
+        command.output().unwrap()
+    };
+    let single = run(false);
+    let mixed = run(true);
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        single.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&single.stderr)
+    );
+    assert_eq!(mixed.status.code(), Some(1));
+    for output in [&single, &mixed] {
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["data"]["results"][0]["ref"], "pi:healthy");
+    }
+    assert_eq!(
+        String::from_utf8(mixed.stderr).unwrap(),
+        format!(
+            "source_unavailable: [claude {}] Required session store could not be enumerated\n",
+            blocked.join("projects").display()
+        )
+    );
+}
+
+#[test]
+fn malformed_source_stderr_has_identity_and_preserves_text_read_stdout() {
+    let fixture = Fixture::new();
+    fixture.write("usable needle");
+    let complete = fixture.run(&["read", "codex:sample"]);
+    let path = fixture.root().join("codex/sessions/sample.jsonl");
+    let valid = fs::read_to_string(&path).unwrap();
+    fs::write(&path, valid + "private malformed marker\n").unwrap();
+    let partial = fixture.run(&["read", "codex:sample"]);
+    assert_eq!(partial.status.code(), Some(1));
+    assert_eq!(partial.stdout, complete.stdout);
+    assert_eq!(
+        String::from_utf8(partial.stderr).unwrap(),
+        format!(
+            "malformed_records: [codex {}] 1 nonempty records were not valid JSON objects\n",
+            path.display()
+        )
+    );
+}

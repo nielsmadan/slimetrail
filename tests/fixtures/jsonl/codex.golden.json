@@ -1,0 +1,32 @@
+[
+  {
+    "role": "user",
+    "kind": "message",
+    "text": "Unicode café 🐌\nsecond line  ",
+    "timestamp": "2026-08-10T12:03:00+02:00"
+  },
+  {
+    "role": "function_call",
+    "kind": "tool",
+    "text": "exec\n{\"cmd\":\"echo needle\"}",
+    "timestamp": "2026-08-10T12:03:00+02:00"
+  },
+  {
+    "role": "function_call_output",
+    "kind": "tool",
+    "text": "needle result",
+    "timestamp": "2026-08-10T12:03:00+02:00"
+  },
+  {
+    "role": "reasoning",
+    "kind": "meta",
+    "text": "Consider paths",
+    "timestamp": "2026-08-10T12:03:00+02:00"
+  },
+  {
+    "role": "summary",
+    "kind": "meta",
+    "text": "A summary",
+    "timestamp": "2026-08-10T12:03:00+02:00"
+  }
+]

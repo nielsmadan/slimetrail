@@ -1,0 +1,8 @@
+{"binary_sha256": "6a56415b888c986cff7fb0f9f531c2465f669ae8d3a1bbd5a92c37a473493c0a", "purpose": "synthetic release child-key index comparison", "samples_per_case": 1}
+{"entries": 2000, "complete_child_key": false, "seconds": 0.232218, "counters": {"discovered": 1, "reused": 0, "reparsed": 1, "removed": 0, "failed": 0, "elapsed_ms": 222}}
+{"entries": 2000, "complete_child_key": true, "seconds": 0.067771, "counters": {"discovered": 1, "reused": 0, "reparsed": 1, "removed": 0, "failed": 0, "elapsed_ms": 58}}
+{"entries": 4000, "complete_child_key": false, "seconds": 0.798506, "counters": {"discovered": 1, "reused": 0, "reparsed": 1, "removed": 0, "failed": 0, "elapsed_ms": 788}}
+{"entries": 4000, "complete_child_key": true, "seconds": 0.134319, "counters": {"discovered": 1, "reused": 0, "reparsed": 1, "removed": 0, "failed": 0, "elapsed_ms": 123}}
+{"entries": 8000, "complete_child_key": false, "seconds": 3.498129, "counters": {"discovered": 1, "reused": 0, "reparsed": 1, "removed": 0, "failed": 0, "elapsed_ms": 3485}}
+{"entries": 8000, "complete_child_key": true, "seconds": 0.255068, "counters": {"discovered": 1, "reused": 0, "reparsed": 1, "removed": 0, "failed": 0, "elapsed_ms": 244}}
+{"cleanup": "removed_owned_workspace", "workspace_exists": false}

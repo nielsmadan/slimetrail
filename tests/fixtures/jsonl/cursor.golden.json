@@ -1,0 +1,5 @@
+[
+  {"role":"user","kind":"message","text":"needle cursor café 🦀","timestamp":1786356420000},
+  {"role":"assistant","kind":"message","text":"looking","timestamp":null},
+  {"role":"assistant","kind":"tool","text":"Shell\n{\"command\": \"grep needle-in-cursor-tool\"}","timestamp":1786356480000}
+]

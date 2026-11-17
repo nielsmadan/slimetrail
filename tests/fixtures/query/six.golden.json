@@ -1,0 +1,321 @@
+{
+  "claude": {
+    "search": {
+      "needle": {
+        "score": 2.0,
+        "matches": 2,
+        "by_kind": {
+          "tool": 2
+        },
+        "snippets": [
+          "[user/tool] …: \"echo needle\", \"cwd\"…",
+          "[user/tool] …result needle"
+        ]
+      },
+      "café": {
+        "score": 3.0,
+        "matches": 1,
+        "by_kind": {
+          "message": 1
+        },
+        "snippets": [
+          "[user/message] Unicode café 🐌 secon…"
+        ]
+      },
+      "Native": {
+        "score": 5.0,
+        "matches": 1,
+        "by_kind": {
+          "title": 1
+        },
+        "snippets": [
+          "[title] Native title"
+        ]
+      },
+      "title": {
+        "score": 5.0,
+        "matches": 1,
+        "by_kind": {
+          "title": 1
+        },
+        "snippets": [
+          "[title] Native title"
+        ]
+      }
+    },
+    "read": {
+      "lite": "2026-08-10T12:03:00+02:00 [user/message]\nUnicode café 🐌\nsecond line\n\n2026-08-10T12:03:00+02:00 [assistant/message]\nDone\n\n2026-08-10T12:03:00+02:00 [user/message]\nAutomated reminder\n\n",
+      "full": "2026-08-10T12:03:00+02:00 [user/message]\nUnicode café 🐌\nsecond line\n\n2026-08-10T12:03:00+02:00 [assistant/message]\nDone\n\n2026-08-10T12:03:00+02:00 [user/message]\nAutomated reminder\n\n",
+      "log": "2026-08-10T12:03:00+02:00 [user/message]\nUnicode café 🐌\nsecond line\n\n2026-08-10T12:03:00+02:00 [user/tool]\nShell\n{\"command\": \"echo needle\", \"cwd\": \"/fixture\"}\nresult needle\n\n2026-08-10T12:03:00+02:00 [assistant/message]\nDone\n\n2026-08-10T12:03:00+02:00 [user/message]\nAutomated reminder\n\n"
+    },
+    "spans": [
+      {
+        "start": 1786356180000,
+        "end": 1786356180000,
+        "human_prompts": 1
+      }
+    ],
+    "daily": {}
+  },
+  "codex": {
+    "search": {
+      "needle": {
+        "score": 2.0,
+        "matches": 2,
+        "by_kind": {
+          "tool": 2
+        },
+        "snippets": [
+          "[function_call/tool] …\":\"echo needle\"}",
+          "[function_call_output/tool] needle result"
+        ]
+      },
+      "café": {
+        "score": 3.0,
+        "matches": 1,
+        "by_kind": {
+          "message": 1
+        },
+        "snippets": [
+          "[user/message] Unicode café 🐌 secon…"
+        ]
+      },
+      "Native": null,
+      "title": null
+    },
+    "read": {
+      "lite": "2026-08-10T12:03:00+02:00 [user/message]\nUnicode café 🐌\nsecond line\n\n",
+      "full": "2026-08-10T12:03:00+02:00 [user/message]\nUnicode café 🐌\nsecond line\n\n2026-08-10T12:03:00+02:00 [reasoning/meta]\nConsider paths\n\n2026-08-10T12:03:00+02:00 [summary/meta]\nA summary\n\n",
+      "log": "2026-08-10T12:03:00+02:00 [user/message]\nUnicode café 🐌\nsecond line\n\n2026-08-10T12:03:00+02:00 [function_call/tool]\nexec\n{\"cmd\":\"echo needle\"}\n\n2026-08-10T12:03:00+02:00 [function_call_output/tool]\nneedle result\n\n2026-08-10T12:03:00+02:00 [reasoning/meta]\nConsider paths\n\n2026-08-10T12:03:00+02:00 [summary/meta]\nA summary\n\n"
+    },
+    "spans": [
+      {
+        "start": 1786356180000,
+        "end": 1786356180000,
+        "human_prompts": 0
+      }
+    ],
+    "daily": {}
+  },
+  "cursor": {
+    "search": {
+      "needle": {
+        "score": 4.0,
+        "matches": 2,
+        "by_kind": {
+          "message": 1,
+          "tool": 1
+        },
+        "snippets": [
+          "[user/message] needle cursor…",
+          "[assistant/tool] …: \"grep needle-in-curs…"
+        ]
+      },
+      "café": {
+        "score": 3.0,
+        "matches": 1,
+        "by_kind": {
+          "message": 1
+        },
+        "snippets": [
+          "[user/message] …cursor café 🦀"
+        ]
+      },
+      "Native": null,
+      "title": {
+        "score": 5.0,
+        "matches": 1,
+        "by_kind": {
+          "title": 1
+        },
+        "snippets": [
+          "[title] Cursor title"
+        ]
+      }
+    },
+    "read": {
+      "lite": "2026-08-10T10:07:00Z [user/message]\nneedle cursor café 🦀\n\n[assistant/message]\nlooking\n\n",
+      "full": "2026-08-10T10:07:00Z [user/message]\nneedle cursor café 🦀\n\n[assistant/message]\nlooking\n\n",
+      "log": "2026-08-10T10:07:00Z [user/message]\nneedle cursor café 🦀\n\n[assistant/message]\nlooking\n\n2026-08-10T10:08:00Z [assistant/tool]\nShell\n{\"command\": \"grep needle-in-cursor-tool\"}\n\n"
+    },
+    "spans": [
+      {
+        "start": 1786356420000,
+        "end": 1786356480000,
+        "human_prompts": 1
+      }
+    ],
+    "daily": {
+      "2026-08-10": 60000
+    }
+  },
+  "droid": {
+    "search": {
+      "needle": {
+        "score": 2.0,
+        "matches": 2,
+        "by_kind": {
+          "tool": 2
+        },
+        "snippets": [
+          "[user/tool] …: \"echo needle\", \"cwd\"…",
+          "[user/tool] …result needle"
+        ]
+      },
+      "café": {
+        "score": 3.0,
+        "matches": 1,
+        "by_kind": {
+          "message": 1
+        },
+        "snippets": [
+          "[user/message] Unicode café 🐌 secon…"
+        ]
+      },
+      "Native": {
+        "score": 5.0,
+        "matches": 1,
+        "by_kind": {
+          "title": 1
+        },
+        "snippets": [
+          "[title] Native title"
+        ]
+      },
+      "title": {
+        "score": 5.0,
+        "matches": 1,
+        "by_kind": {
+          "title": 1
+        },
+        "snippets": [
+          "[title] Native title"
+        ]
+      }
+    },
+    "read": {
+      "lite": "2026-08-10T12:03:00+02:00 [user/message]\nUnicode café 🐌\nsecond line\n\n2026-08-10T12:03:00+02:00 [assistant/message]\nDone\n\n",
+      "full": "2026-08-10T12:03:00+02:00 [user/message]\nUnicode café 🐌\nsecond line\n\n2026-08-10T12:03:00+02:00 [assistant/message]\nDone\n\n",
+      "log": "2026-08-10T12:03:00+02:00 [user/message]\nUnicode café 🐌\nsecond line\n\n2026-08-10T12:03:00+02:00 [user/tool]\nShell\n{\"command\": \"echo needle\", \"cwd\": \"/fixture\"}\nresult needle\n\n2026-08-10T12:03:00+02:00 [assistant/message]\nDone\n\n"
+    },
+    "spans": [
+      {
+        "start": 1786356180000,
+        "end": 1786356180000,
+        "human_prompts": 1
+      }
+    ],
+    "daily": {}
+  },
+  "opencode": {
+    "search": {
+      "needle": {
+        "score": 5.0,
+        "matches": 3,
+        "by_kind": {
+          "message": 1,
+          "tool": 2
+        },
+        "snippets": [
+          "[user/message] needle opencod…",
+          "[assistant/tool] …: \"echo needle\"} needl…",
+          "[assistant/tool] …eedle\"} needle"
+        ]
+      },
+      "café": {
+        "score": 3.0,
+        "matches": 1,
+        "by_kind": {
+          "message": 1
+        },
+        "snippets": [
+          "[user/message] …pencode café 🦀"
+        ]
+      },
+      "Native": null,
+      "title": {
+        "score": 5.0,
+        "matches": 1,
+        "by_kind": {
+          "title": 1
+        },
+        "snippets": [
+          "[title] …penCode title"
+        ]
+      }
+    },
+    "read": {
+      "lite": "2026-08-10T10:01:00Z [user/message]\nneedle opencode café 🦀\n\n",
+      "full": "2026-08-10T10:01:00Z [user/message]\nneedle opencode café 🦀\n\n2026-08-10T10:02:00Z [assistant/meta]\nReason carefully\n\n",
+      "log": "2026-08-10T10:01:00Z [user/message]\nneedle opencode café 🦀\n\n2026-08-10T10:02:00Z [assistant/meta]\nReason carefully\n\n2026-08-10T10:03:00Z [assistant/tool]\nshell\n{\"command\": \"echo needle\"}\nneedle\n\n"
+    },
+    "spans": [
+      {
+        "start": 1786356060000,
+        "end": 1786356180000,
+        "human_prompts": 1
+      }
+    ],
+    "daily": {
+      "2026-08-10": 120000
+    }
+  },
+  "pi": {
+    "search": {
+      "needle": {
+        "score": 2.0,
+        "matches": 2,
+        "by_kind": {
+          "tool": 2
+        },
+        "snippets": [
+          "[user/tool] …: \"echo needle\", \"cwd\"…",
+          "[user/tool] …result needle"
+        ]
+      },
+      "café": {
+        "score": 3.0,
+        "matches": 1,
+        "by_kind": {
+          "message": 1
+        },
+        "snippets": [
+          "[user/message] Unicode café 🐌 secon…"
+        ]
+      },
+      "Native": {
+        "score": 5.0,
+        "matches": 1,
+        "by_kind": {
+          "title": 1
+        },
+        "snippets": [
+          "[title] Native title"
+        ]
+      },
+      "title": {
+        "score": 5.0,
+        "matches": 1,
+        "by_kind": {
+          "title": 1
+        },
+        "snippets": [
+          "[title] Native title"
+        ]
+      }
+    },
+    "read": {
+      "lite": "2026-08-10T12:03:00+02:00 [user/message]\nUnicode café 🐌\nsecond line\n\n2026-08-10T12:03:00+02:00 [assistant/message]\nDone\n\n",
+      "full": "2026-08-10T12:03:00+02:00 [user/message]\nUnicode café 🐌\nsecond line\n\n2026-08-10T12:03:00+02:00 [assistant/message]\nDone\n\n",
+      "log": "2026-08-10T12:03:00+02:00 [user/message]\nUnicode café 🐌\nsecond line\n\n2026-08-10T12:03:00+02:00 [user/tool]\nShell\n{\"command\": \"echo needle\", \"cwd\": \"/fixture\"}\nresult needle\n\n2026-08-10T12:03:00+02:00 [assistant/message]\nDone\n\n"
+    },
+    "spans": [
+      {
+        "start": 1786356180000,
+        "end": 1786356180000,
+        "human_prompts": 1
+      }
+    ],
+    "daily": {}
+  }
+}

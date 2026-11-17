@@ -1,0 +1,4 @@
+{"type": "session", "id": "pi-canonical", "cwd": "/fixture/project", "name": "Native title"}
+{"type": "message", "id": "p1", "timestamp": "2026-08-10T12:03:00+02:00", "message": {"role": "user", "content": [{"type": "text", "text": "Unicode café 🐌\nsecond line  "}, {"type": "tool_use", "name": "Shell", "input": {"command": "echo needle", "cwd": "/fixture"}}, {"type": "tool_result", "content": "result needle"}]}}
+{"type": "message", "timestamp": "2026-08-10T12:03:00+02:00", "message": {"role": "assistant", "content": "Done"}}
+{"type": "model_change", "modelId": "ignored"}

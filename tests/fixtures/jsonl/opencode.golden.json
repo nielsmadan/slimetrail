@@ -1,0 +1,5 @@
+[
+  {"role":"user","kind":"message","text":"needle opencode café 🦀","timestamp":1786356060000},
+  {"role":"assistant","kind":"meta","text":"Reason carefully","timestamp":1786356120000},
+  {"role":"assistant","kind":"tool","text":"shell\n{\"command\": \"echo needle\"}\nneedle","timestamp":1786356180000}
+]

@@ -1,0 +1,1 @@
+{"version":1,"incomplete":false,"diagnostics":[],"data":{"agent":"codex","id":"synthetic","ref":"codex:synthetic","source":"fixture.jsonl","title":"Synthetic session","cwd":"/fixture/project","branch":"main","first_ts":"1970-01-01T00:00:00Z","last_ts":"1970-01-01T00:00:01Z","parent_ref":null,"archived":false}}

@@ -1,0 +1,14 @@
+   Compiling slimetrail v0.1.0 (/Users/nielsmadan/wrksp/slimetrail/dev1)
+    Finished `release` profile [optimized] target(s) in 2.57s
+     Running unittests src/lib.rs (target/release/deps/slimetrail-1a849a0112736d15)
+
+running 1 test
+documents=2000 query=missing legacy_rows=0 legacy_vm_steps=32037 legacy_us=268 corrected_rows=0 corrected_vm_steps=52 corrected_us=24
+documents=2000 query=needle legacy_rows=2 legacy_vm_steps=32220 legacy_us=224 corrected_rows=2 corrected_vm_steps=319 corrected_us=82
+documents=4000 query=missing legacy_rows=0 legacy_vm_steps=64037 legacy_us=721 corrected_rows=0 corrected_vm_steps=52 corrected_us=26
+documents=4000 query=needle legacy_rows=2 legacy_vm_steps=64220 legacy_us=484 corrected_rows=2 corrected_vm_steps=319 corrected_us=61
+documents=8000 query=missing legacy_rows=0 legacy_vm_steps=128037 legacy_us=1435 corrected_rows=0 corrected_vm_steps=52 corrected_us=30
+documents=8000 query=needle legacy_rows=2 legacy_vm_steps=128220 legacy_us=1302 corrected_rows=2 corrected_vm_steps=319 corrected_us=58
+test index::store::tests::candidate_query_release_scaling ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.46s

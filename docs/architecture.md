@@ -1,0 +1,43 @@
+# Architecture and privacy
+
+The CLI captures environment, current directory, clock and IANA time zone once. Core functions receive a `Context` and explicit options. The Rust library is an implementation seam; the external compatibility boundary is [CLI JSON v1](json-protocol.md), not serialized internal models. There is no Python import API.
+
+## Refresh and query lifecycle
+
+`src/api.rs` opens one `IndexSession`, refreshes selected agents, then queries under the same exclusive lifecycle lease. The lease owns all index connections and private snapshot lifetimes. Concurrent invocations sharing an index serialize, including reads; a bounded lock wait reports an index-busy error. Different indexes have independent snapshot staging.
+
+`src/sources/` discovers identities before emitting entries. Native header/row identity wins over a filename guess. Each `Entry` has a dense display index and a `source_id` based on a native identity plus emitted-item ordinal, or physical-record ordinal plus emitted-item ordinal. These are stable on unchanged reread and append, not across arbitrary rewrites. Parent provenance is optional when the store only establishes automation/subagent status.
+
+Discovery includes native archives and child sessions. Duplicate session identities prefer the live source, then newer source mtime, then deterministic path order. The shared ringleader archive is read only for recognized Claude-format records; other positively recognized formats are skipped, and ambiguous/malformed candidates are diagnosed. This avoids mislabelling every archived harness as Claude.
+
+The index fingerprints source dependencies using device, inode, size, nanosecond mtime and ctime, including companion-file presence. Codex's title index, Droid settings, Cursor metadata and database sidecars participate. Codex title records are parsed once per observed title-file fingerprint into a shared immutable final-title map; later records, including empty titles, win. Available root prefixes are canonicalized; missing or inaccessible suffixes retain their lexical identity. All roots are serialized and SHA-256 hashed into a namespace. Source availability is diagnosed only for selected agents, so an inaccessible unselected store does not abort healthy queries. Every source/session/entry/document relationship includes namespace and owning source, so identical IDs from different roots cannot mix. Namespace garbage collection is deferred; removing the index remains a full reset.
+
+Refresh covers all selected agents before cwd/date/kind filtering. Unchanged sources reuse parsed entries. Changed or growing files are reread completely, one source at a time, streaming into a transactional savepoint. A before/after fingerprint change retries once; repeated churn rolls back and marks coverage incomplete. Stable malformed sources may publish their good entries with persistent diagnostics. Failed old rows are retained for recovery but excluded from current query results.
+
+Each agent's refresh generation is persisted as incomplete before source changes commit. Queryable generations must have a finished refresh, including a finished partial refresh. Only complete discovery permits deletion of missing sources. A restart refreshes again before querying, so interrupted ingestion does not silently present mixed generations as complete. Source modules receive cache metadata and never open the index.
+
+## Index storage and search
+
+The current file is `index-v2.sqlite3`. Schema/parser/search-normalization changes can require a new index version; this version is independent of JSON protocol version 1. A non-versioned `lifecycle.lock` covers all versions. Only exact recognized older index filenames and their sidecars are pruned under the lease; newer versions are preserved. Active databases are never unlinked or renamed.
+
+Entries hold original text. Search documents hold ASCII-lowercased searchable text and flags for non-ASCII/NUL data. Native titles produce one search document per session; derived titles do not. External-content FTS5 stores trigram postings against those documents rather than another FTS content copy. Transactional insert/delete/update triggers synchronize postings. Storage therefore still includes normalized searchable text as well as originals. The document child-key index includes entry index, avoiding growing per-session scans during deferred foreign-key checks.
+
+ASCII literal queries of at least three characters use a safely quoted trigram candidate query. Case-insensitive matching unions all non-ASCII documents into the candidates; both case modes union NUL-containing documents. Short, non-ASCII and NUL literals, and arbitrary regexes, scan indexed documents. Rust regex verification of original text is the final authority, including Unicode simple case folding. There is no hand-maintained folding map or speculative regex prefilter.
+
+Candidates stream in one global pass ordered by session/document. FTS rowids and indexed Unicode/NUL subsets form a union before original-text joins; eligible session keys and kind filters apply before text hydration, with native titles preserved. Fallback scans traverse the session index, reject ineligible keys and kinds before text hydration, and sort document order within each session; temporary text sorting is bounded by the largest accepted session rather than the whole eligible corpus. Ranked results remain bounded. Read pages stream entries but must visit the complete rendered session to calculate `total_chars`. Timeline selects event metadata only, retaining in-window events and missing-timestamp counts without loading entry text. See [performance](performance.md) for measured costs.
+
+## Private SQLite snapshots
+
+Original agent databases are **never opened through SQLite**, even with `mode=ro`: SQLite could create or modify native sidecars. Instead `src/sources/sqlite.rs` retains read-only OS handles for the DB/WAL and observes SHM/rollback-journal metadata. It captures all pre-copy identities and timestamps before copying DB/WAL bytes up to their captured lengths, then compares all post-copy identities and timestamps after copying. Short reads, replacements or churn reject the attempt; it retries once. Source SHM contents are never copied.
+
+Accepted copies live in fresh 0700 directories under the index's owned staging directory, with 0600 files. SQLite opens only the private copy read-write for WAL recovery, then enables `query_only`; its locks and sidecars stay private. Shared snapshot handles let all changed sessions from one backing database use the same accepted copy. Snapshots disappear after readers close. Under the lifecycle lease, startup removes only recognized abandoned snapshots in that index's staging directory, never global temporary directories.
+
+Clean rollback-mode databases are supported; a nonempty rollback journal is rejected rather than attempting potentially unsafe recovery, including recovery involving original master-journal paths. This is metadata-validated quiescence, not an atomic OS snapshot or protection against adversarial metadata forgery. A continuously changing source can remain unavailable.
+
+OpenCode always snapshots and enumerates its inventory, even on an otherwise unchanged refresh, then reuses unchanged entries. Cached sessions alone cannot prove complete inventory. A future shortcut requires a persisted completeness proof. Database changes conservatively reparse affected sessions; aggregate row counts or maximum timestamps are not sufficient evidence against same-size edits.
+
+## Security boundary
+
+The index contains private session data and possibly secrets. Index directories must be 0700 and files, locks and journals 0600. Existing insecure, symlink or multiply linked index files are rejected. Canonicalized paths reject source/index overlap in either direction. Discovery avoids recursive symlink traversal into unrelated stores. Core diagnostics omit entry text, but ordinary query output intentionally includes transcript data and identifiers.
+
+Tests use synthetic fixtures. The opt-in real benchmark uses a separate private repo-local index, emits only aggregate metrics, discards search stdout, sanitizes stderr and removes its entire owned workspace in `finally`. It does not use the default XDG index or mutate a real transcript to simulate incremental refresh. See the [benchmark procedure](tests/search-performance/README.md).

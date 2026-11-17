@@ -1,0 +1,20 @@
+[
+  {
+    "role": "user",
+    "kind": "message",
+    "text": "Unicode café 🐌\nsecond line  ",
+    "timestamp": "2026-08-10T12:03:00+02:00"
+  },
+  {
+    "role": "user",
+    "kind": "tool",
+    "text": "Shell\n{\"command\": \"echo needle\", \"cwd\": \"/fixture\"}\nresult needle",
+    "timestamp": "2026-08-10T12:03:00+02:00"
+  },
+  {
+    "role": "assistant",
+    "kind": "message",
+    "text": "Done",
+    "timestamp": "2026-08-10T12:03:00+02:00"
+  }
+]

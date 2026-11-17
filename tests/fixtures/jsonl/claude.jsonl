@@ -1,0 +1,4 @@
+{"type": "user", "sessionId": "claude-canonical", "uuid": "u1", "cwd": "/fixture/project", "gitBranch": "feature", "timestamp": "2026-08-10T12:03:00+02:00", "message": {"content": [{"type": "text", "text": "Unicode café 🐌\nsecond line  "}, {"type": "tool_use", "name": "Shell", "input": {"command": "echo needle", "cwd": "/fixture"}}, {"type": "tool_result", "content": "result needle"}]}}
+{"type": "assistant", "timestamp": "2026-08-10T12:03:00+02:00", "message": "Done"}
+{"type": "custom-title", "customTitle": "Native title"}
+{"type": "user", "isMeta": true, "timestamp": "2026-08-10T12:03:00+02:00", "message": {"content": "Automated reminder"}}
