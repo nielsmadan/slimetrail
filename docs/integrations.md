@@ -15,7 +15,7 @@ This map records the integration landscape identified during the 2026-11-16 desi
 | time-reconstruct | loadout: `skills/time-reconstruct/scripts/reconstruct.py` | Session spans, obtained by importing the check-agent-logs script |
 | circus | ringleader's `rl --json` interface | Indirect session consumption through ringleader |
 
-Ringleader retains its registry, classification, token/cost accounting and all native-store mutations: rename, hide, archive, delete, companion-file moves, workspace relocation/rebinding, launch and fork. Slimetrail does not implement those capability protocols. Publication and consumer distribution work, including Homebrew changes, are separate from the local build/install workflow.
+Ringleader retains its registry, classification, token/cost accounting and all native-store mutations: rename, hide, archive, delete, companion-file moves, workspace relocation/rebinding, launch and fork. Slimetrail does not implement those capability protocols. GitHub binary releases follow the [release workflow](development-and-releases.md). Consumer distribution work, including Homebrew changes, remains separate.
 
 ## Reference implementations
 

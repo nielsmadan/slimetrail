@@ -40,8 +40,8 @@ pub(super) fn encode<T: serde::Serialize>(value: &T) -> Result<String> {
     Ok(serde_json::to_string(value)?)
 }
 
-fn decode<T: serde::de::DeserializeOwned>(value: String) -> Result<T> {
-    Ok(serde_json::from_str(&value)?)
+fn decode<T: serde::de::DeserializeOwned>(value: &str) -> Result<T> {
+    Ok(serde_json::from_str(value)?)
 }
 
 pub(super) fn cache(
@@ -62,8 +62,8 @@ pub(super) fn cache(
                     id: row.get(0)?,
                 },
                 source,
-                dependencies: decode(row.get(2)?)?,
-                fingerprint: decode(row.get(3)?)?,
+                dependencies: decode(&row.get::<_, String>(2)?)?,
+                fingerprint: decode(&row.get::<_, String>(3)?)?,
             },
         );
     }
@@ -172,7 +172,7 @@ impl IndexSession {
         let mut statement = self.connection.prepare(&sql)?;
         let mut rows = statement.query([&self.namespace])?;
         while let Some(row) = rows.next()? {
-            let session: Session = decode(row.get(0)?)?;
+            let session: Session = decode(&row.get::<_, String>(0)?)?;
             if self.refreshed.contains(&session.key.agent) {
                 emit(session)?;
             }
@@ -185,7 +185,9 @@ impl IndexSession {
         let sql = format!("SELECT x.metadata FROM sessions x {VISIBLE} AND x.agent=?2 AND x.id=?3");
         let mut statement = self.connection.prepare(&sql)?;
         let mut rows = statement.query((&self.namespace, key.agent.to_string(), &key.id))?;
-        rows.next()?.map(|r| decode(r.get(0)?)).transpose()
+        rows.next()?
+            .map(|r| decode(&r.get::<_, String>(0)?))
+            .transpose()
     }
 
     pub fn visit_entries(
@@ -303,7 +305,9 @@ impl IndexSession {
             let text = if entry_index.is_some() {
                 row.get(4)?
             } else {
-                decode::<Session>(row.get(5)?)?.title.unwrap_or_default()
+                decode::<Session>(&row.get::<_, String>(5)?)?
+                    .title
+                    .unwrap_or_default()
             };
             emit(Document {
                 role: row.get(6)?,
@@ -359,7 +363,7 @@ fn read_entry(row: &Row<'_>, key: &SessionKey) -> Result<Entry> {
     })
 }
 
-fn kind_name(kind: Kind) -> &'static str {
+const fn kind_name(kind: Kind) -> &'static str {
     match kind {
         Kind::Message => "message",
         Kind::Meta => "meta",
@@ -644,7 +648,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(events, [Some(1794787200000), Some(1794787200000)]);
+        assert_eq!(events, [Some(1_794_787_200_000), Some(1_794_787_200_000)]);
     }
 
     #[test]

@@ -39,7 +39,9 @@ impl IndexSession {
         let mut reader_roots = serde_json::to_value(&ctx.roots)?;
         for value in reader_roots
             .as_object_mut()
-            .expect("Roots is an object")
+            .ok_or_else(|| {
+                crate::Error::InvalidArgument("Roots must serialize as an object".into())
+            })?
             .values_mut()
         {
             if let Some(path) = value.as_str() {
@@ -121,7 +123,7 @@ mod tests {
             );
         }
         let path = snapshot.database.clone();
-        let mut other = ctx.clone();
+        let mut other = ctx;
         other.index_dir = dir.path().join("other-index");
         drop(IndexSession::open(&other).unwrap());
         assert!(path.exists());

@@ -1,2 +1,8 @@
 /target/
 /.local/
+/.cache/
+/dist/
+/.dist-stage.*/
+/.dist-old.*/
+__pycache__/
+*.profraw

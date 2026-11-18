@@ -64,7 +64,7 @@ fn ready(worker: &mut Worker) {
 }
 
 #[test]
-#[ignore]
+#[ignore = "Subprocess worker invoked explicitly by the concurrency tests"]
 fn index_worker() {
     let Ok(config) = std::env::var("SLIMETRAIL_INDEX_TEST_CONTEXT") else {
         return;

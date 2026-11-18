@@ -6,6 +6,10 @@ use slimetrail::*;
 use std::{collections::BTreeSet, fs};
 
 #[test]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "The Python goldens store fixture scores as floats"
+)]
 fn six_agent_reference_search_read_and_timeline_goldens() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
@@ -28,7 +32,7 @@ fn six_agent_reference_search_read_and_timeline_goldens() {
             let mut opt = options(query);
             opt.filter = selected.clone();
             let result = search(&ctx, &opt).unwrap().data.unwrap();
-            let actual = result.results.first().map(|hit|json!({"score":hit.score as f64,"matches":hit.matches,"by_kind":hit.by_kind,"snippets":hit.snippets})).unwrap_or(Value::Null);
+            let actual = result.results.first().map_or(Value::Null, |hit|json!({"score":hit.score as f64,"matches":hit.matches,"by_kind":hit.by_kind,"snippets":hit.snippets}));
             assert_eq!(
                 actual,
                 golden[agent.to_string()]["search"][query],
@@ -46,7 +50,7 @@ fn six_agent_reference_search_read_and_timeline_goldens() {
                 &ReadOptions {
                     mode,
                     offset: 0,
-                    max_chars: 100000,
+                    max_chars: 100_000,
                 },
             )
             .unwrap()
@@ -64,7 +68,7 @@ fn six_agent_reference_search_read_and_timeline_goldens() {
                 filter: selected,
                 since: ts("2026-08-10T00:00:00Z"),
                 until: ts("2026-08-11T00:00:00Z"),
-                idle_ms: 1800000,
+                idle_ms: 1_800_000,
             },
         )
         .unwrap()

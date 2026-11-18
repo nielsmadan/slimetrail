@@ -4,17 +4,17 @@ Read and search local coding-agent sessions from Claude Code, Codex, Cursor, Dro
 
 ## Build and install
 
-Rust 1.89 or newer is required (edition 2024). SQLite is bundled. The implementation uses Unix filesystem permissions and locks; macOS is exercised locally and Linux has a CI recipe. Windows is not supported. No release package or Homebrew tap is published by this checkout.
+Rust 1.89 or newer is required (edition 2024); development uses the toolchain pinned in `rust-toolchain.toml`. SQLite is bundled. The implementation uses Unix filesystem permissions and locks; CI runs on macOS and Linux. Windows is not supported. Release automation builds macOS/Linux binaries; Homebrew distribution is separate.
 
 ```sh
-timeout 900 just build-release
+timeout 900 just build
 ./target/release/slimetrail --help
 timeout 900 just install
 ```
 
-`just install` installs into Cargo's installation directory (normally `~/.cargo/bin`) and replaces an existing binary even when the package version is unchanged. Add that directory to `PATH`. For a custom prefix, use `CARGO_INSTALL_ROOT=/path/to/prefix timeout 900 just install`; the binary goes in that prefix's `bin`. Use the same environment override with `just uninstall` to remove it. The shell examples use GNU `timeout` from coreutils.
+`just install` installs into Cargo's installation directory (normally `~/.cargo/bin`) and replaces an existing binary even when the package version is unchanged. Add that directory to `PATH`. For a custom prefix, use `CARGO_INSTALL_ROOT=/path/to/prefix timeout 900 just install`; the binary goes in that prefix's `bin`. Use the same environment override with `just uninstall` to remove it. The shell examples require `timeout`; install coreutils if it is unavailable.
 
-Run `just` to list commands. `just setup` fetches locked dependencies and runs `just doctor` to check the Rust tools. Development commands are `just test`, `just lint`, and `just format`; `timeout 900 just check` runs formatting checks, strict Clippy, and all-target tests. `just build-release` builds the optimized binary, and `just clean` removes Cargo build artifacts. Wrap builds, installs, and tests in a deadline as shown above.
+Run `just` to list commands. `just setup` installs pinned analysis tools and Git hooks, fetches locked dependencies and runs `just doctor`. `just check` runs formatting, lint, tests and a secret scan; `just check-all` adds dependency, workflow and documentation checks. `just build` builds the host binary; `just build-release` assembles cross-platform release artifacts. See [development and releases](docs/development-and-releases.md) for prerequisites, coverage, benchmarks and `just release`.
 
 ## Use
 
@@ -69,4 +69,4 @@ The external interface is the CLI's [version-1 JSON protocol](docs/json-protocol
 
 Exit **0** means complete (including no matches), **1** means partial source coverage, and **2** means usage or fatal runtime failure. JSON stdout is machine-readable; diagnostics also go to stderr. A result with `incomplete: true` can contain useful data, or no data if the requested session could not be established.
 
-Read [architecture and privacy](docs/architecture.md), [supported formats and finite compatibility differences](docs/compatibility.md), [consumer boundaries and migration references](docs/integrations.md), and [performance limitations and measurements](docs/performance.md). Token usage/cost, native-store mutations, consumer migrations, a daemon and publication are outside v1.
+Read [architecture and privacy](docs/architecture.md), [supported formats and finite compatibility differences](docs/compatibility.md), [consumer boundaries and migration references](docs/integrations.md), and [performance limitations and measurements](docs/performance.md). Token usage/cost, native-store mutations, consumer migrations and a daemon are outside v1.

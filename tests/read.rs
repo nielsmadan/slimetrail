@@ -15,15 +15,14 @@ fn scalar_pages_concatenate_across_timestamps_headers_and_multibyte_text() {
         &[
             event(
                 "user",
-                "α🐌é\nline \t\u{1f}",
+                "α🐌e\u{301}\nline \t\u{1f}",
                 Some("2026-01-02T03:04:05+03:00"),
             ),
             event("assistant", "完了", None),
         ],
     );
     let key = "claude:one".parse().unwrap();
-    let expected =
-        "2026-01-02T03:04:05+03:00 [user/message]\nα🐌é\nline\n\n[assistant/message]\n完了\n\n";
+    let expected = "2026-01-02T03:04:05+03:00 [user/message]\nα🐌e\u{301}\nline\n\n[assistant/message]\n完了\n\n";
     let full = read(
         &ctx,
         &key,

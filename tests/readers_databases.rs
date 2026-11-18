@@ -48,11 +48,11 @@ fn cursor(ctx: &Context, id: &str) -> (PathBuf, PathBuf) {
         .join(format!("lossy-slug/agent-transcripts/{id}/{id}.jsonl"));
     write(&transcript, include_str!("fixtures/jsonl/cursor.jsonl"));
     let meta = ctx.roots.cursor_chats.join(format!("hash/{id}/meta.json"));
-    write(&meta, &json!({"cwd":"/fixture/project", "title":"Cursor title", "createdAtMs":1786356360000i64,"updatedAtMs":1786356480000i64}).to_string());
+    write(&meta, &json!({"cwd":"/fixture/project", "title":"Cursor title", "createdAtMs":1_786_356_360_000_i64,"updatedAtMs":1_786_356_480_000_i64}).to_string());
     (transcript, meta)
 }
 
-fn cursor_store(meta: &Path, value: Value) -> Connection {
+fn cursor_store(meta: &Path, value: &Value) -> Connection {
     let connection = Connection::open(meta.with_file_name("store.db")).unwrap();
     connection
         .execute_batch(
@@ -60,7 +60,7 @@ fn cursor_store(meta: &Path, value: Value) -> Connection {
         )
         .unwrap();
     connection
-        .execute("INSERT INTO meta VALUES('0', ?)", [hex(&value)])
+        .execute("INSERT INTO meta VALUES('0', ?)", [hex(value)])
         .unwrap();
     connection
 }
@@ -69,8 +69,11 @@ fn hex(value: &Value) -> String {
     value
         .to_string()
         .bytes()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+        .fold(String::new(), |mut hex, byte| {
+            use std::fmt::Write;
+            write!(hex, "{byte:02x}").unwrap();
+            hex
+        })
 }
 
 fn opencode(ctx: &Context) -> Connection {
@@ -87,19 +90,19 @@ fn opencode(ctx: &Context) -> Connection {
         (
             "p1",
             "m1",
-            1786356060000i64,
+            1_786_356_060_000_i64,
             json!({"type":"text", "text":"needle opencode café 🦀"}),
         ),
         (
             "p2",
             "m2",
-            1786356120000i64,
+            1_786_356_120_000_i64,
             json!({"type":"reasoning", "text":"Reason carefully"}),
         ),
         (
             "p3",
             "m2",
-            1786356180000i64,
+            1_786_356_180_000_i64,
             json!({"type":"tool", "tool":"shell", "state":{"input":{"command":"echo needle"},"output":"needle"}}),
         ),
     ] {
@@ -113,7 +116,7 @@ fn opencode(ctx: &Context) -> Connection {
     connection
 }
 
-fn empty_cache() -> DiscoveryCache {
+const fn empty_cache() -> DiscoveryCache {
     DiscoveryCache {
         by_source: BTreeMap::new(),
     }
@@ -476,7 +479,7 @@ fn cursor_metadata_and_database_only_changes_refresh_subagent_flags() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     let (_, meta) = cursor(&ctx, "main");
-    let writer = cursor_store(&meta, json!({"name":"Store title"}));
+    let writer = cursor_store(&meta, &json!({"name":"Store title"}));
     let source = source_for(&ctx, Agent::Cursor).unwrap();
     let first = discover(source.as_ref(), &ctx);
     assert!(!parse(source.as_ref(), &first.sessions[0]).1[0].automated);
@@ -513,7 +516,7 @@ fn cursor_partial_transcripts_and_metadata_errors_are_sanitized() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     let (transcript, meta) = cursor(&ctx, "main");
-    let writer = cursor_store(&meta, json!({"name":"title"}));
+    let writer = cursor_store(&meta, &json!({"name":"title"}));
     writer
         .execute("UPDATE meta SET value='private invalid hex'", [])
         .unwrap();

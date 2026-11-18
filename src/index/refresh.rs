@@ -114,6 +114,10 @@ pub(super) fn run(
     run_sources(index, agents, readers)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep the transaction lifecycle visible"
+)]
 fn run_sources(
     index: &mut IndexSession,
     agents: &BTreeSet<Agent>,
@@ -144,22 +148,19 @@ fn run_sources(
         let previous = store::cache(&index.connection, &index.namespace, agent)?;
         let discovered = source.discover(&index.context, &previous);
         let mut agent_diagnostics = Vec::new();
-        let (sessions, mut enumeration_complete) = match discovered {
-            Ok(discovery) => {
-                let complete =
-                    discovery.complete_agents.contains(&agent) && discovery.diagnostics.is_empty();
-                agent_diagnostics.extend(discovery.diagnostics);
-                (discovery.sessions, complete)
-            }
-            Err(_) => {
-                agent_diagnostics.push(diagnostic(
-                    agent,
-                    None,
-                    "source_unavailable",
-                    "Selected source could not be enumerated",
-                ));
-                (Vec::new(), false)
-            }
+        let (sessions, mut enumeration_complete) = if let Ok(discovery) = discovered {
+            let complete =
+                discovery.complete_agents.contains(&agent) && discovery.diagnostics.is_empty();
+            agent_diagnostics.extend(discovery.diagnostics);
+            (discovery.sessions, complete)
+        } else {
+            agent_diagnostics.push(diagnostic(
+                agent,
+                None,
+                "source_unavailable",
+                "Selected source could not be enumerated",
+            ));
+            (Vec::new(), false)
         };
         if !enumeration_complete && agent_diagnostics.is_empty() {
             agent_diagnostics.push(diagnostic(
@@ -376,7 +377,7 @@ mod tests {
             if changes == 1 {
                 assert_eq!(texts, ["revision 1"]);
             } else {
-                assert!(texts.is_empty());
+                assert_eq!(texts, [] as [std::string::String; 0]);
                 assert_eq!(
                     index
                         .connection

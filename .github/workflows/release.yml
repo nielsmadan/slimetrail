@@ -1,0 +1,145 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+env:
+  RELEASE_TAG: ${{ github.ref_name }}
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: nielsmadan/curtaincall@8362e71ffa86422960d7e356f620085bcc62f925 # v1.3.0
+      - name: Validate annotated tag and ancestry
+        run: curtains ci validate-tag "$RELEASE_TAG" "$GITHUB_SHA"
+      - uses: ./.github/actions/setup
+      - run: just check-all check-secret-history coverage
+      - id: msrv
+        run: sed -n 's/^rust-version = "\(.*\)"/version=\1/p' Cargo.toml >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - run: cargo check --locked --all-targets --all-features
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
+        timeout-minutes: 15
+
+  build:
+    needs: check
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-apple-darwin
+            os: macos-15
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04
+            packages: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          targets: ${{ matrix.target }}
+          tools: 'false'
+      - if: matrix.packages != ''
+        run: sudo apt-get update && sudo apt-get install -y "$PACKAGES"
+        env:
+          PACKAGES: ${{ matrix.packages }}
+      - run: cargo build --locked --release --target "$TARGET"
+        timeout-minutes: 15
+        env:
+          TARGET: ${{ matrix.target }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+          CC_aarch64_unknown_linux_gnu: ${{ matrix.linker }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binary-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/slimetrail
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: nielsmadan/curtaincall@8362e71ffa86422960d7e356f620085bcc62f925 # v1.3.0
+      - name: Revalidate tag
+        run: |
+          RELEASE_COMMIT=$(curtains ci validate-tag "$RELEASE_TAG" "$GITHUB_SHA")
+          echo "RELEASE_COMMIT=$RELEASE_COMMIT" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: binaries
+      - name: Assemble dist
+        run: |
+          set -euo pipefail
+          mkdir dist
+          lipo -create \
+            binaries/binary-aarch64-apple-darwin/slimetrail \
+            binaries/binary-x86_64-apple-darwin/slimetrail \
+            -output dist/slimetrail-macos-universal
+          cp binaries/binary-aarch64-unknown-linux-gnu/slimetrail dist/slimetrail-linux-aarch64
+          cp binaries/binary-x86_64-unknown-linux-gnu/slimetrail dist/slimetrail-linux-x86_64
+          chmod +x dist/*
+          (cd dist && shasum -a 256 slimetrail-* > SHA256SUMS)
+          cat dist/SHA256SUMS
+      - name: Verify version matches tag
+        run: |
+          set -euo pipefail
+          binary_version="$(./dist/slimetrail-macos-universal --version)"
+          binary_version="${binary_version#slimetrail }"
+          tag_version="${RELEASE_TAG#v}"
+          if [ "$binary_version" != "$tag_version" ]; then
+            echo "Cargo.toml version $binary_version does not match tag $tag_version" >&2
+            exit 1
+          fi
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/slimetrail-*
+      - name: Write release notes
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/release-notes.md"
+          previous_tag="$(curtains ci previous-tag "$RELEASE_TAG")"
+          if [ -n "$previous_tag" ]; then
+            git log --no-merges --format='- %s' "$previous_tag..$RELEASE_TAG" > "$notes"
+            printf '\n**Full Changelog**: https://github.com/%s/compare/%s...%s\n' \
+              "$GITHUB_REPOSITORY" "$previous_tag" "$RELEASE_TAG" >> "$notes"
+          else
+            echo "Initial release." > "$notes"
+          fi
+          cat "$notes"
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curtains ci publish "$RELEASE_TAG" "$RELEASE_COMMIT" \
+            --notes "$RUNNER_TEMP/release-notes.md" \
+            --title "slimetrail $RELEASE_TAG" \
+            dist/*

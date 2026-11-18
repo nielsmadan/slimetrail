@@ -20,7 +20,7 @@ pub struct Opencode {
 }
 
 impl Opencode {
-    pub fn new(_: &Context) -> Self {
+    pub const fn new(_: &Context) -> Self {
         Self { staging: None }
     }
 
@@ -120,37 +120,38 @@ impl Source for Opencode {
     }
 
     fn discover(&self, ctx: &Context, previous: &DiscoveryCache) -> Result<Discovery> {
-        match discovery(ctx, previous, self.staging.as_deref()) {
-            Ok(sessions) => Ok(Discovery {
-                sessions,
-                diagnostics: Vec::new(),
-                complete_agents: BTreeSet::from([Agent::Opencode]),
-            }),
-            Err(_) => {
-                let legacy =
-                    !ctx.roots.opencode_db.exists() && ctx.roots.opencode_legacy_storage.exists();
-                Ok(Discovery {
-                    sessions: Vec::new(),
-                    complete_agents: BTreeSet::new(),
-                    diagnostics: vec![diagnostic(
-                        Agent::Opencode,
-                        &ctx.roots.opencode_db,
-                        if legacy {
-                            "unsupported_legacy_store"
-                        } else {
-                            "source_unavailable"
-                        },
-                        if legacy {
-                            "Legacy OpenCode storage is unsupported"
-                        } else {
-                            "OpenCode database could not be read consistently or has an unsupported schema"
-                        },
-                    )],
-                })
-            }
-        }
+        discovery(ctx, previous, self.staging.as_deref()).map_or_else(|_| {
+            let legacy =
+                !ctx.roots.opencode_db.exists() && ctx.roots.opencode_legacy_storage.exists();
+            Ok(Discovery {
+                sessions: Vec::new(),
+                complete_agents: BTreeSet::new(),
+                diagnostics: vec![diagnostic(
+                    Agent::Opencode,
+                    &ctx.roots.opencode_db,
+                    if legacy {
+                        "unsupported_legacy_store"
+                    } else {
+                        "source_unavailable"
+                    },
+                    if legacy {
+                        "Legacy OpenCode storage is unsupported"
+                    } else {
+                        "OpenCode database could not be read consistently or has an unsupported schema"
+                    },
+                )],
+            })
+        }, |sessions| Ok(Discovery {
+            sessions,
+            diagnostics: Vec::new(),
+            complete_agents: BTreeSet::from([Agent::Opencode]),
+        }))
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep the ordered parsing states together"
+    )]
     fn parse(
         &self,
         raw: &RawSession,

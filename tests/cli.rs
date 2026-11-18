@@ -90,7 +90,10 @@ fn search_complete_empty_partial_and_fatal_envelopes() {
     );
     assert_eq!(partial["incomplete"], true);
     assert_eq!(partial["data"]["count"], 1);
-    assert!(!partial["diagnostics"].as_array().unwrap().is_empty());
+    assert_ne!(
+        partial["diagnostics"].as_array().unwrap().as_slice(),
+        &[] as &[Value]
+    );
     let unavailable = fixture.json(&["search", "x", "--claude", "--scope", "all"], 1);
     assert_eq!(unavailable["data"]["results"], json!([]));
     let fatal = fixture.json(&["search", "(", "--regex", "--codex"], 2);
@@ -139,7 +142,7 @@ fn read_pages_concatenate_unicode_and_entries_finalize_metadata() {
     assert_eq!(entries["data"]["entries"][0]["text"], "café 🐌 needle");
     assert_eq!(
         entries["data"]["entries"][0]["timestamp_ms"],
-        1792888200000_i64
+        1_792_888_200_000_i64
     );
     assert_eq!(entries["data"]["session"]["ref"], "codex:sample");
     assert_eq!(entries["incomplete"], false);
@@ -617,7 +620,10 @@ fn entries_keep_partial_records_and_report_final_status() {
     assert_eq!(output["data"]["entries"][0]["text"], "good record");
     assert_eq!(output["data"]["session"]["ref"], "codex:sample");
     assert_eq!(output["incomplete"], true);
-    assert!(!output["diagnostics"].as_array().unwrap().is_empty());
+    assert_ne!(
+        output["diagnostics"].as_array().unwrap().as_slice(),
+        &[] as &[Value]
+    );
 }
 
 #[test]

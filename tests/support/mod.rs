@@ -1,7 +1,7 @@
 use slimetrail::{Roots, Session, SessionKey, TitleOrigin, resolve_roots};
 use std::{collections::BTreeMap, path::Path};
 
-pub fn roots_at(base: &Path) -> Roots {
+pub(crate) fn roots_at(base: &Path) -> Roots {
     let env = BTreeMap::from([
         (
             "CODEX_HOME".into(),
@@ -15,7 +15,7 @@ pub fn roots_at(base: &Path) -> Roots {
     resolve_roots(base, &env).unwrap()
 }
 
-pub fn session() -> Session {
+pub(crate) fn session() -> Session {
     Session {
         key: "codex:synthetic".parse::<SessionKey>().unwrap(),
         title: Some("Synthetic session".into()),

@@ -4,16 +4,18 @@ Run when changing discovery, snapshotting, indexing or matching, and compare onl
 
 ## Prerequisites and execution
 
-Use Python 3.10+ with stdlib SQLite, a Rust toolchain meeting the manifest's MSRV, and `timeout`. Run from the repository root. Build optimized code first:
+Use Python 3.11+ with stdlib SQLite, a Rust toolchain meeting the manifest's MSRV, and `timeout`. Run from the repository root. Build optimized code first:
 
 ```sh
-timeout 900 cargo build --release --locked
+timeout 900 just build
 timeout 900 python3 scripts/benchmark.py
 ```
 
 The default generator creates 50 sessions per agent and 200 message entries per session, across six supported formats, in an owned temporary directory below `.local/`. Every tenth message contains `needle`, the next contains `café`, and the rest contain ASCII filler. Cursor has companion JSON metadata; OpenCode uses a synthetic SQLite DB. Native titles exist for Cursor/Droid/OpenCode/Pi. This measures representative format plumbing and text volume, not a realistic distribution of tools or message lengths.
 
 The driver records one cold index, one index warmup, five warm indexes, five OpenCode-only and Claude-only inventories, then a warmup and five measurements each for `needle`, `ed`, `café`, and regex `needle|café`. Queries use `--scope all --max-snippets 0 --format json --time-zone UTC`. It appends one message to one synthetic Claude transcript and records a final incremental refresh. `--sessions`, `--entries` and `--repeat` adjust workload/repetitions; preserve them for comparisons.
+
+`just bench` runs this synthetic procedure and validates complete coverage, warm reuse, exactly one changed-source reparse and cleanup. Scheduled CI retains its aggregate output as an artifact without a timing threshold.
 
 Real sources require explicit opt-in:
 

@@ -15,7 +15,7 @@ fn indexed_literals_equal_independent_scalar_matcher() {
     let ctx = context(dir.path());
     let texts = [
         "ABC abc abab a.b a*b a?b \"quoted\" 100% under_score /a/b c:\\path",
-        "ſearch Kelvin Σ σ ς café CAFÉ",
+        "ſearch \u{212a}elvin Σ σ ς café CAFÉ",
         "prefix\0needle suffix",
         "no matches",
         "aaa aaaa",
@@ -249,7 +249,7 @@ fn ordering_and_top_limits_are_deterministic() {
 fn scope_app_and_source_mtime_follow_reference_rules() {
     let dir = tempfile::tempdir().unwrap();
     let mut ctx = context(dir.path());
-    ctx.now_ms = 200 * 86400000;
+    ctx.now_ms = 200 * 86_400_000;
     let paths = [
         ("current", Some("/fixture/project")),
         ("sibling", Some("/fixture/other")),
@@ -267,7 +267,7 @@ fn scope_app_and_source_mtime_follow_reference_rules() {
         );
         fs::File::open(path)
             .unwrap()
-            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_millis(199 * 86400000))
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(17_193_600))
             .unwrap();
     }
     let mut opt = options("needle");

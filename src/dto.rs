@@ -1,8 +1,14 @@
-use crate::{Result, model::*};
+use crate::{
+    Result,
+    model::{
+        Agent, Entry, Kind, ReadMode, ReadPage, SearchResult, Session, SessionKey, Sort,
+        TimelineResult, Timestamp,
+    },
+};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionDto {
     pub agent: Agent,
     pub id: String,
@@ -16,7 +22,7 @@ pub struct SessionDto {
     pub parent_ref: Option<String>,
     pub archived: bool,
 }
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SearchHitDto {
     #[serde(flatten)]
     pub session: SessionDto,
@@ -25,7 +31,7 @@ pub struct SearchHitDto {
     pub by_kind: BTreeMap<String, u64>,
     pub snippets: Vec<String>,
 }
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SearchDataDto {
     pub query: String,
     pub agents: Vec<Agent>,
@@ -33,7 +39,7 @@ pub struct SearchDataDto {
     pub count: usize,
     pub results: Vec<SearchHitDto>,
 }
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReadDataDto {
     #[serde(flatten)]
     pub session: SessionDto,
@@ -66,7 +72,7 @@ pub struct TimelineDataDto {
     pub sessions: Vec<TimelineSessionDto>,
     pub daily_active_minutes: BTreeMap<String, f64>,
 }
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EntryDto {
     pub index: u64,
     pub source_id: String,
@@ -176,7 +182,7 @@ impl TryFrom<&Entry> for EntryDto {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionsDataDto {
     pub count: usize,
     pub sessions: Vec<SessionDto>,
@@ -240,12 +246,12 @@ impl TryFrom<&TimelineResult> for TimelineDataDto {
                                 Ok(SpanDto {
                                     start: format_timestamp(span.start)?,
                                     end: format_timestamp(span.end)?,
-                                    minutes: span.end.abs_diff(span.start) as f64 / 60_000.0,
+                                    minutes: minutes(span.end.abs_diff(span.start)),
                                     prompts: span.human_prompts,
                                 })
                             })
                             .collect::<Result<_>>()?,
-                        active_minutes: session.active_ms as f64 / 60_000.0,
+                        active_minutes: minutes(session.active_ms),
                         start: session
                             .spans
                             .first()
@@ -262,7 +268,7 @@ impl TryFrom<&TimelineResult> for TimelineDataDto {
             daily_active_minutes: result
                 .daily_active_ms
                 .iter()
-                .map(|(day, time)| (day.clone(), *time as f64 / 60_000.0))
+                .map(|(day, time)| (day.clone(), minutes(*time)))
                 .collect(),
         })
     }
@@ -279,4 +285,12 @@ impl TryFrom<&[Session]> for SessionsDataDto {
                 .collect::<Result<_>>()?,
         })
     }
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "The JSON protocol represents elapsed minutes as floating point"
+)]
+const fn minutes(milliseconds: u64) -> f64 {
+    milliseconds as f64 / 60_000.0
 }

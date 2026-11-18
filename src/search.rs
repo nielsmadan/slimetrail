@@ -1,8 +1,8 @@
 use crate::{
+    Context, Error, Result, SearchHit, SearchOptions, SearchResult, Sort,
     api::{accepts, selected},
     index::{Document, IndexSession},
     read::{kind_name, python_whitespace},
-    *,
 };
 use regex::{Regex, RegexBuilder};
 use std::{cmp::Ordering, collections::BTreeMap};
@@ -70,7 +70,7 @@ pub(crate) fn run(
                     snippets: Vec::new(),
                 });
             }
-            accumulate(current.as_mut().unwrap(), document, options, pattern);
+            accumulate(current.as_mut().unwrap(), &document, options, pattern);
             Ok(())
         },
     )?;
@@ -114,7 +114,7 @@ fn compare(left: &SearchHit, right: &SearchHit, sort: Sort) -> Ordering {
     .then_with(|| left.session.key.id.cmp(&right.session.key.id))
 }
 
-fn accumulate(hit: &mut SearchHit, document: Document, options: &SearchOptions, pattern: &Regex) {
+fn accumulate(hit: &mut SearchHit, document: &Document, options: &SearchOptions, pattern: &Regex) {
     if document.kind != "title"
         && !options.filter.kinds.is_empty()
         && !options
@@ -163,14 +163,12 @@ fn snippet(text: &str, start: usize, end: usize, context: usize) -> String {
         .char_indices()
         .rev()
         .nth(context.saturating_sub(1))
-        .map(|(i, _)| i)
-        .unwrap_or(0);
+        .map_or(0, |(i, _)| i);
     let left = if context == 0 { start } else { left };
     let right = text[end..]
         .char_indices()
         .nth(context)
-        .map(|(i, _)| end + i)
-        .unwrap_or(text.len());
+        .map_or(text.len(), |(i, _)| end + i);
     let body = text[left..right]
         .split(python_whitespace)
         .filter(|s| !s.is_empty())

@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub fn context(base: &Path) -> Context {
+pub(crate) fn context(base: &Path) -> Context {
     Context {
         roots: resolve_roots(
             base,
@@ -28,10 +28,10 @@ pub fn context(base: &Path) -> Context {
         time_zone: "UTC".into(),
     }
 }
-pub fn ts(text: &str) -> i64 {
+pub(crate) fn ts(text: &str) -> i64 {
     text.parse::<jiff::Timestamp>().unwrap().as_millisecond()
 }
-pub fn filter(agent: Agent) -> Filter {
+pub(crate) fn filter(agent: Agent) -> Filter {
     Filter {
         agents: BTreeSet::from([agent]),
         cwd: "/fixture/project".into(),
@@ -41,7 +41,7 @@ pub fn filter(agent: Agent) -> Filter {
         kinds: BTreeSet::new(),
     }
 }
-pub fn options(query: &str) -> SearchOptions {
+pub(crate) fn options(query: &str) -> SearchOptions {
     SearchOptions {
         filter: filter(Agent::Claude),
         query: query.into(),
@@ -53,11 +53,11 @@ pub fn options(query: &str) -> SearchOptions {
         context_chars: 8,
     }
 }
-pub fn write(path: &Path, text: &str) {
+pub(crate) fn write(path: &Path, text: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, text).unwrap();
 }
-pub fn records(path: &Path, values: &[Value]) {
+pub(crate) fn records(path: &Path, values: &[Value]) {
     write(
         path,
         &(values
@@ -68,7 +68,7 @@ pub fn records(path: &Path, values: &[Value]) {
             + "\n"),
     );
 }
-pub fn claude(
+pub(crate) fn claude(
     ctx: &Context,
     id: &str,
     title: Option<&str>,
@@ -87,10 +87,10 @@ pub fn claude(
     records(&path, &values);
     path
 }
-pub fn event(role: &str, text: &str, time: Option<&str>) -> Value {
+pub(crate) fn event(role: &str, text: &str, time: Option<&str>) -> Value {
     json!({"type":role,"timestamp":time,"message":{"content":text}})
 }
-pub fn six(ctx: &Context) {
+pub(crate) fn six(ctx: &Context) {
     for (agent, root) in [
         (Agent::Claude, &ctx.roots.claude_projects),
         (Agent::Codex, &ctx.roots.codex_sessions),
@@ -124,19 +124,19 @@ pub fn six(ctx: &Context) {
         (
             "p1",
             "m1",
-            1786356060000i64,
+            1_786_356_060_000_i64,
             json!({"type":"text","text":"needle opencode café 🦀"}),
         ),
         (
             "p2",
             "m2",
-            1786356120000i64,
+            1_786_356_120_000_i64,
             json!({"type":"reasoning","text":"Reason carefully"}),
         ),
         (
             "p3",
             "m2",
-            1786356180000i64,
+            1_786_356_180_000_i64,
             json!({"type":"tool","tool":"shell","state":{"input":{"command":"echo needle"},"output":"needle"}}),
         ),
     ] {

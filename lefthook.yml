@@ -1,0 +1,16 @@
+pre-commit:
+  parallel: true
+  commands:
+    rust:
+      glob: "*.rs"
+      run: just format-check-rust lint-rust
+    python:
+      glob: "*.py"
+      run: just format-check-python lint-python
+    secrets:
+      run: just check-staged-secrets
+
+pre-push:
+  commands:
+    check:
+      run: just check-all

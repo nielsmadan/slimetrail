@@ -1,7 +1,12 @@
 use clap::{Args, Parser, Subcommand};
 use jiff::{Timestamp, civil, tz::TimeZone};
 use serde::Serialize;
-use slimetrail::{dto::*, *};
+use slimetrail::{
+    Agent, Context, Diagnostic, Entry, Envelope, Error, Filter, Kind, ReadMode, ReadOptions,
+    Result, Scope, SearchOptions, Session, SessionKey, Sort, TimelineOptions,
+    dto::{EntryDto, ReadDataDto, SearchDataDto, SessionDto, SessionsDataDto, TimelineDataDto},
+    entries, read, refresh, resolve_roots, search, sessions, timeline,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{self, Write},
@@ -18,6 +23,10 @@ struct Cli {
 }
 
 #[derive(Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Clap models independent agent selectors as flags"
+)]
 struct Common {
     #[arg(long, global = true, default_value = "text", value_parser = ["text", "json"])]
     format: String,
@@ -117,7 +126,7 @@ fn positive_u64(value: &str) -> std::result::Result<u64, String> {
         .ok_or_else(|| "must be a positive integer".into())
 }
 
-pub fn run() -> i32 {
+pub(crate) fn run() -> i32 {
     let cli = Cli::parse();
     let env = std::env::vars().collect::<BTreeMap<_, _>>();
     let mut stdout = io::stdout().lock();
@@ -150,6 +159,7 @@ pub fn run() -> i32 {
     }
 }
 
+#[expect(clippy::too_many_lines, reason = "Keep command dispatch together")]
 fn execute(cli: &Cli, env: &BTreeMap<String, String>, out: &mut dyn Write) -> Result<i32> {
     let home = env
         .get("HOME")
@@ -161,8 +171,7 @@ fn execute(cli: &Cli, env: &BTreeMap<String, String>, out: &mut dyn Write) -> Re
     let index_dir = cli.common.index_dir.clone().unwrap_or_else(|| {
         env.get("XDG_DATA_HOME")
             .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".local/share"))
+            .map_or_else(|| home.join(".local/share"), PathBuf::from)
             .join("slimetrail")
     });
     let ctx = Context {
@@ -203,7 +212,7 @@ fn execute(cli: &Cli, env: &BTreeMap<String, String>, out: &mut dyn Write) -> Re
             )?;
             emit(
                 out,
-                convert(result, |v| SearchDataDto::try_from(v))?,
+                &convert(result, |v| SearchDataDto::try_from(v))?,
                 is_json,
             )
         }
@@ -229,7 +238,7 @@ fn execute(cli: &Cli, env: &BTreeMap<String, String>, out: &mut dyn Write) -> Re
             )?;
             let result = convert(result, |v| ReadDataDto::try_from(v))?;
             if is_json {
-                emit(out, result, true)
+                emit(out, &result, true)
             } else {
                 diagnostics(&result.diagnostics);
                 if let Some(data) = result.data {
@@ -258,7 +267,7 @@ fn execute(cli: &Cli, env: &BTreeMap<String, String>, out: &mut dyn Write) -> Re
                 .ok_or_else(|| Error::InvalidArgument("idle-minutes is too large".into()))?;
             emit(
                 out,
-                convert(
+                &convert(
                     timeline(
                         &ctx,
                         &TimelineOptions {
@@ -273,10 +282,10 @@ fn execute(cli: &Cli, env: &BTreeMap<String, String>, out: &mut dyn Write) -> Re
                 is_json,
             )
         }
-        Command::Index => emit(out, refresh(&ctx, &filter.agents)?, is_json),
+        Command::Index => emit(out, &refresh(&ctx, &filter.agents)?, is_json),
         Command::Sessions => emit(
             out,
-            convert(sessions(&ctx, &filter)?, |s| {
+            &convert(sessions(&ctx, &filter)?, |s| {
                 SessionsDataDto::try_from(s.as_slice())
             })?,
             is_json,
@@ -445,10 +454,10 @@ fn convert<T, U>(
         data: value.data.as_ref().map(transform).transpose()?,
     })
 }
-fn emit<T: Serialize>(out: &mut dyn Write, value: Envelope<T>, is_json: bool) -> Result<i32> {
+fn emit<T: Serialize>(out: &mut dyn Write, value: &Envelope<T>, is_json: bool) -> Result<i32> {
     diagnostics(&value.diagnostics);
     if is_json {
-        json(out, &value)?;
+        json(out, value)?;
     } else if let Some(data) = &value.data {
         serde_json::to_writer_pretty(&mut *out, data)?;
         writeln!(out).map_err(output_error)?;

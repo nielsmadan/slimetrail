@@ -112,7 +112,7 @@ fn checked_in_reference_goldens_match_four_sources() {
         .unwrap();
         assert_eq!(actual, expected, "{agent}");
         assert_eq!(parsed.session.cwd, Some("/fixture/project".into()));
-        assert_eq!(entries[0].timestamp, Some(1786356180000));
+        assert_eq!(entries[0].timestamp, Some(1_786_356_180_000));
         assert_eq!(
             parsed.session.title_origin,
             Some(if agent == Agent::Codex {
@@ -145,7 +145,7 @@ fn malformed_and_truncated_records_preserve_good_entries_and_redact_content() {
         let source = source_for(&ctx, agent).unwrap();
         let discovery = discover(source.as_ref(), &ctx);
         let (parsed, entries) = parse(source.as_ref(), &discovery.sessions[0]);
-        assert!(!entries.is_empty());
+        assert_ne!(entries, [] as [slimetrail::Entry; 0]);
         assert!(!parsed.complete);
         assert_eq!(parsed.diagnostics.len(), 1);
         assert_eq!(
@@ -472,7 +472,7 @@ fn mixed_ringleader_archive_only_admits_identified_claude_records() {
     let d = discover(source.as_ref(), &ctx);
     assert_eq!(d.sessions.len(), 1);
     assert_eq!(d.sessions[0].key.id, "claude-canonical");
-    assert!(d.diagnostics.is_empty());
+    assert_eq!(d.diagnostics, [] as [slimetrail::Diagnostic; 0]);
     assert!(d.complete_agents.contains(&Agent::Claude));
     write(
         &archive.join("project/unknown.jsonl"),

@@ -53,7 +53,7 @@ impl<'a> CursorDependencies<'a> {
 }
 
 impl Cursor {
-    pub fn new(_: &Context) -> Self {
+    pub const fn new(_: &Context) -> Self {
         Self { staging: None }
     }
 
@@ -197,7 +197,7 @@ fn db_metadata(snapshot: &PrivateSnapshot) -> Result<Value> {
             let a = char::from(pair[0]).to_digit(16);
             let b = char::from(pair[1]).to_digit(16);
             a.zip(b)
-                .map(|(a, b)| (a * 16 + b) as u8)
+                .and_then(|(a, b)| u8::try_from(a * 16 + b).ok())
                 .ok_or_else(|| Error::InvalidArgument("Cursor store metadata is malformed".into()))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -225,7 +225,9 @@ fn prompt_time(text: &str) -> Option<jiff::Timestamp> {
     if !matches!(sign, '+' | '-') {
         return None;
     }
-    let (hours, minutes) = offset[1..].split_once(':').unwrap_or((&offset[1..], "0"));
+    let (hours, minutes) = offset[1..]
+        .split_once(':')
+        .unwrap_or_else(|| (&offset[1..], "0"));
     let hours = hours.parse::<u8>().ok()?;
     let minutes = minutes.parse::<u8>().ok()?;
     if hours > 23 || minutes > 59 {
@@ -313,6 +315,10 @@ impl Source for Cursor {
         Agent::Cursor
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep the ordered parsing states together"
+    )]
     fn discover(&self, ctx: &Context, previous: &DiscoveryCache) -> Result<Discovery> {
         let mut diagnostics = Vec::new();
         let mut files = Vec::new();
@@ -358,7 +364,7 @@ impl Source for Cursor {
                 ));
                 continue;
             }
-            if !path.extension().is_some_and(|e| e == "jsonl") {
+            if path.extension().is_none_or(|e| e != "jsonl") {
                 continue;
             }
             let id = path
@@ -459,6 +465,10 @@ impl Source for Cursor {
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep the ordered parsing states together"
+    )]
     fn parse(
         &self,
         raw: &RawSession,
@@ -487,38 +497,34 @@ impl Source for Cursor {
         };
         let owner = if dependencies.own_metadata == dependencies.parent_metadata {
             own.clone()
+        } else if let Ok(meta) = metadata(dependencies.parent_metadata) {
+            meta
         } else {
-            match metadata(dependencies.parent_metadata) {
-                Ok(meta) => meta,
-                Err(_) => {
-                    diagnostics.push(diagnostic(
-                        Agent::Cursor,
-                        path,
-                        "metadata_unavailable",
-                        "Cursor parent metadata is missing or malformed",
-                    ));
-                    Value::Null
-                }
-            }
+            diagnostics.push(diagnostic(
+                Agent::Cursor,
+                path,
+                "metadata_unavailable",
+                "Cursor parent metadata is missing or malformed",
+            ));
+            Value::Null
         };
         let db = if dependencies.database.exists() {
-            let result = match &raw.snapshot {
-                Some(snapshot) => db_metadata(snapshot),
-                None => sqlite::snapshot_at(dependencies.database, self.staging.as_deref())
-                    .and_then(|(snapshot, _)| db_metadata(&snapshot)),
-            };
-            match result {
-                Ok(value) => value,
-                Err(_) => {
-                    diagnostics.push(diagnostic(
-                        Agent::Cursor,
-                        path,
-                        "metadata_unavailable",
-                        "Cursor database metadata could not be read",
-                    ));
-                    Value::Null
-                }
-            }
+            let result = raw.snapshot.as_ref().map_or_else(
+                || {
+                    sqlite::snapshot_at(dependencies.database, self.staging.as_deref())
+                        .and_then(|(snapshot, _)| db_metadata(&snapshot))
+                },
+                |snapshot| db_metadata(snapshot),
+            );
+            result.unwrap_or_else(|_| {
+                diagnostics.push(diagnostic(
+                    Agent::Cursor,
+                    path,
+                    "metadata_unavailable",
+                    "Cursor database metadata could not be read",
+                ));
+                Value::Null
+            })
         } else {
             Value::Null
         };

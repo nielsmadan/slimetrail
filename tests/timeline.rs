@@ -14,7 +14,7 @@ fn opts(since: &str, until: &str) -> TimelineOptions {
         filter: filter(Agent::Claude),
         since: ts(since),
         until: ts(until),
-        idle_ms: 1800000,
+        idle_ms: 1_800_000,
     }
 }
 
@@ -47,8 +47,8 @@ fn window_is_half_open_idle_boundary_inclusive_and_all_activity_counts() {
     assert_eq!(spans[0].human_prompts, 1);
     assert_eq!(spans[0].end, ts("2026-08-10T01:00:00Z"));
     assert_eq!(spans[1].human_prompts, 1);
-    assert_eq!(result.sessions[0].active_ms, 3600000);
-    assert_eq!(result.daily_active_ms["2026-08-10"], 3600000);
+    assert_eq!(result.sessions[0].active_ms, 3_600_000);
+    assert_eq!(result.daily_active_ms["2026-08-10"], 3_600_000);
 }
 
 #[test]
@@ -72,15 +72,15 @@ fn unordered_events_and_simultaneous_sessions_union_daily_time() {
         );
     }
     let mut opt = opts("2026-08-10T00:00:00Z", "2026-08-11T00:00:00Z");
-    opt.idle_ms = 3600000;
+    opt.idle_ms = 3_600_000;
     let result = timeline(&ctx, &opt).unwrap().data.unwrap();
     assert_eq!(result.sessions[0].session.key.id, "a");
     assert_eq!(result.sessions[0].spans[0].human_prompts, 2);
     assert_eq!(
         result.sessions.iter().map(|s| s.active_ms).sum::<u64>(),
-        7200000
+        7_200_000
     );
-    assert_eq!(result.daily_active_ms["2026-08-10"], 5400000);
+    assert_eq!(result.daily_active_ms["2026-08-10"], 5_400_000);
 }
 
 #[test]
@@ -113,11 +113,11 @@ fn civil_midnights_respect_spring_and_autumn_dst() {
             ],
         );
         let mut opt = opts(start, "2026-10-27T00:00:00Z");
-        opt.idle_ms = 26 * 3600000;
+        opt.idle_ms = 26 * 3_600_000;
         let result = timeline(&ctx, &opt).unwrap().data.unwrap();
         assert_eq!(result.daily_active_ms.len(), 1);
-        assert_eq!(result.daily_active_ms[day], hours * 3600000);
-        assert_eq!(result.sessions[0].active_ms, hours * 3600000);
+        assert_eq!(result.daily_active_ms[day], hours * 3_600_000);
+        assert_eq!(result.sessions[0].active_ms, hours * 3_600_000);
     }
 }
 
@@ -140,8 +140,8 @@ fn spans_split_at_midnight_in_explicit_zone() {
         .unwrap()
         .data
         .unwrap();
-    assert_eq!(result.daily_active_ms["2026-08-10"], 600000);
-    assert_eq!(result.daily_active_ms["2026-08-11"], 1200000);
+    assert_eq!(result.daily_active_ms["2026-08-10"], 600_000);
+    assert_eq!(result.daily_active_ms["2026-08-11"], 1_200_000);
 }
 
 #[test]
@@ -187,7 +187,10 @@ fn historical_until_uses_since_for_source_cutoff_not_today() {
         );
         fs::File::open(path)
             .unwrap()
-            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_millis(ts(modified) as u64))
+            .set_modified(
+                SystemTime::UNIX_EPOCH
+                    + Duration::from_millis(u64::try_from(ts(modified)).unwrap()),
+            )
             .unwrap();
     }
     let mut opt = opts("2026-08-10T00:00:00Z", "2026-08-11T00:00:00Z");

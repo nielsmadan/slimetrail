@@ -129,11 +129,9 @@ fn attempt(
     }
     let mut builder = tempfile::Builder::new();
     builder.prefix("slimetrail-snapshot-");
-    let directory = match staging {
-        Some(staging) => builder.tempdir_in(staging),
-        None => builder.tempdir(),
-    }
-    .map_err(|e| io(database, e))?;
+    let directory = staging
+        .map_or_else(|| builder.tempdir(), |staging| builder.tempdir_in(staging))
+        .map_err(|e| io(database, e))?;
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
         .map_err(|e| io(directory.path(), e))?;
     let private_db = directory.path().join("snapshot.db");
@@ -193,10 +191,10 @@ pub(crate) fn snapshot_at(
     database: &Path,
     staging: Option<&Path>,
 ) -> Result<(Arc<PrivateSnapshot>, Fingerprint)> {
-    match staging {
-        Some(staging) => snapshot_in(database, staging),
-        None => snapshot(database),
-    }
+    staging.map_or_else(
+        || snapshot(database),
+        |staging| snapshot_in(database, staging),
+    )
 }
 
 pub fn open(snapshot: &PrivateSnapshot) -> Result<Connection> {

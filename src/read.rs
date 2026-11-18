@@ -1,4 +1,7 @@
-use crate::{dto::format_timestamp, index::IndexSession, *};
+use crate::{
+    Kind, ReadMode, ReadOptions, ReadPage, Result, Session, dto::format_timestamp,
+    index::IndexSession,
+};
 
 pub(crate) fn run(
     index: &IndexSession,
@@ -54,7 +57,7 @@ pub(crate) fn run(
     Ok(page)
 }
 
-pub(crate) fn kind_name(kind: Kind) -> &'static str {
+pub(crate) const fn kind_name(kind: Kind) -> &'static str {
     match kind {
         Kind::Message => "message",
         Kind::Tool => "tool",

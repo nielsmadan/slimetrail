@@ -86,7 +86,7 @@ fn aliases_and_empty_overrides_fall_back() {
             "PI_CODING_AGENT_SESSION_DIR".into(),
             "/fixture/alias".into(),
         ),
-        ("PI_SESSIONS_DIR".into(), "".into()),
+        ("PI_SESSIONS_DIR".into(), String::new()),
         ("CURSOR_DATA_DIR".into(), "  ".into()),
         ("CURSOR_CONFIG_DIR".into(), "  ".into()),
         ("XDG_CONFIG_HOME".into(), "/fixture/config".into()),

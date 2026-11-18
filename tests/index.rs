@@ -146,7 +146,7 @@ fn unavailable_inventory_excludes_and_retains_old_rows() {
     let result = lease.refresh_under_lease(&selected(Agent::Claude)).unwrap();
     assert!(result.incomplete);
     assert_eq!(result.data.unwrap().removed, 0);
-    assert!(texts(&lease, &key("one")).is_empty());
+    assert_eq!(texts(&lease, &key("one")), [] as [std::string::String; 0]);
     drop(lease);
     let db = Connection::open(ctx.index_dir.join(DATABASE)).unwrap();
     assert_eq!(
@@ -188,7 +188,7 @@ fn replacement_changes_identity_and_truncation_replaces_all_entries() {
     write(&path, "");
     lease.refresh_under_lease(&selected(Agent::Claude)).unwrap();
     assert!(lease.session(&key("new")).unwrap().is_none());
-    assert!(texts(&lease, &key("one")).is_empty());
+    assert_eq!(texts(&lease, &key("one")), [] as [std::string::String; 0]);
     lease.verify_integrity().unwrap();
 }
 
@@ -605,7 +605,7 @@ fn namespace_canonicalization_does_not_bypass_reader_symlink_guards() {
     let mut lease = IndexSession::open(&ctx).unwrap();
     let result = lease.refresh_under_lease(&selected(Agent::Claude)).unwrap();
     assert!(result.incomplete);
-    assert!(texts(&lease, &key("one")).is_empty());
+    assert_eq!(texts(&lease, &key("one")), [] as [std::string::String; 0]);
     assert_eq!(
         fs::read_to_string(&path).unwrap(),
         fs::read_to_string(moved.join("project/one.jsonl")).unwrap()

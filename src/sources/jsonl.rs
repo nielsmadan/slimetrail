@@ -173,7 +173,7 @@ fn timestamp(value: &Value) -> Option<i64> {
         .as_str()?
         .parse::<jiff::Timestamp>()
         .ok()
-        .map(|t| t.as_millisecond())
+        .map(jiff::Timestamp::as_millisecond)
 }
 
 #[derive(Default)]
@@ -271,7 +271,7 @@ fn fallback_id(agent: Agent, path: &Path) -> String {
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
     if agent == Agent::Pi {
         stem.split_once('_')
-            .map_or(stem.to_string(), |(_, id)| id.to_string())
+            .map_or_else(|| stem.to_string(), |(_, id)| id.to_string())
     } else {
         stem.into_owned()
     }
@@ -321,6 +321,10 @@ impl FileReader {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep the ordered parsing states together"
+    )]
     pub fn discover(&self, ctx: &Context, previous: &DiscoveryCache) -> Result<Discovery> {
         let root = match self.agent {
             Agent::Claude => &ctx.roots.claude_projects,
@@ -371,17 +375,14 @@ impl FileReader {
             if self.agent == Agent::Droid {
                 dependencies.push(path.with_extension("settings.json"));
             }
-            let fingerprint = match fingerprint(&dependencies) {
-                Ok(value) => value,
-                Err(_) => {
-                    diagnostics.push(diagnostic(
-                        self.agent,
-                        &path,
-                        "source_unavailable",
-                        "Session metadata could not be read",
-                    ));
-                    continue;
-                }
+            let Ok(fingerprint) = fingerprint(&dependencies) else {
+                diagnostics.push(diagnostic(
+                    self.agent,
+                    &path,
+                    "source_unavailable",
+                    "Session metadata could not be read",
+                ));
+                continue;
             };
             let cached = previous
                 .by_source
@@ -445,9 +446,11 @@ impl FileReader {
                         chosen
                             .get(&raw.key.id)
                             .is_none_or(|(old_live, old_time, old)| {
-                                (live, modified) > (*old_live, *old_time)
-                                    || (live, modified) == (*old_live, *old_time)
-                                        && raw.source < old.source
+                                match (live, modified).cmp(&(*old_live, *old_time)) {
+                                    std::cmp::Ordering::Greater => true,
+                                    std::cmp::Ordering::Equal => raw.source < old.source,
+                                    std::cmp::Ordering::Less => false,
+                                }
                             });
                     if replace {
                         chosen.insert(raw.key.id.clone(), (live, modified, raw));
@@ -473,6 +476,10 @@ impl FileReader {
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep the ordered parsing states together"
+    )]
     pub fn parse(
         &self,
         raw: &RawSession,
@@ -511,7 +518,7 @@ impl FileReader {
                     Ok(value) if value.is_object() => {
                         automated |= value["tags"]
                             .as_array()
-                            .is_some_and(|tags| tags.iter().any(|tag| tag["name"] == "exec"))
+                            .is_some_and(|tags| tags.iter().any(|tag| tag["name"] == "exec"));
                     }
                     _ => diagnostics.push(diagnostic(
                         self.agent,
@@ -537,18 +544,17 @@ impl FileReader {
                 .as_ref()
                 .filter(|(old, _)| *old == signature)
                 .map(|(_, titles)| Arc::clone(titles));
-            let titles = match cached {
-                Some(titles) => titles,
-                None => {
-                    let titles = Arc::new(read_titles(names));
-                    if fingerprint(std::slice::from_ref(names))? != signature {
-                        return Err(Error::InvalidArgument(
-                            "Session names changed during parsing".into(),
-                        ));
-                    }
-                    *self.titles.borrow_mut() = Some((signature, Arc::clone(&titles)));
-                    titles
+            let titles = if let Some(titles) = cached {
+                titles
+            } else {
+                let titles = Arc::new(read_titles(names));
+                if fingerprint(std::slice::from_ref(names))? != signature {
+                    return Err(Error::InvalidArgument(
+                        "Session names changed during parsing".into(),
+                    ));
                 }
+                *self.titles.borrow_mut() = Some((signature, Arc::clone(&titles)));
+                titles
             };
             session.title = titles.names.get(&session.key.id).cloned().flatten();
             session.title_origin = session.title.as_ref().map(|_| TitleOrigin::Native);
@@ -783,6 +789,10 @@ fn tool_text(value: &Value) -> Option<String> {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep the ordered parsing states together"
+)]
 fn normalize(agent: Agent, record: &Value) -> Vec<Entry> {
     let kind = record["type"].as_str().unwrap_or("unknown");
     match agent {

@@ -1,4 +1,7 @@
-use crate::{api::accepts, index::IndexSession, *};
+use crate::{
+    Agent, Context, Diagnostic, Error, Result, Session, Span, TimelineOptions, TimelineResult,
+    TimelineSession, Timestamp, api::accepts, index::IndexSession,
+};
 use jiff::{Timestamp as Instant, tz::TimeZone};
 use std::{collections::BTreeMap, path::Path};
 
@@ -25,12 +28,12 @@ pub(crate) fn run(
         index.visit_events(&session.key, options.since, options.until, &mut |entry| {
             match entry.timestamp {
                 Some(time) if options.since <= time && time < options.until => {
-                    events.push((time, entry.human_prompt))
+                    events.push((time, entry.human_prompt));
                 }
                 None => {
                     *omissions
                         .entry((session.key.agent, session.source.clone()))
-                        .or_default() += 1
+                        .or_default() += 1;
                 }
                 _ => {}
             }

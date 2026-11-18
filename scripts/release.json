@@ -1,0 +1,19 @@
+{
+  "name": "Slimetrail",
+  "branch": "main",
+  "components": 3,
+  "initial_version": "0.1.0",
+  "sign": true,
+  "checks": [["just", "check-all"]],
+  "tools": ["git", "python3", "just", "cargo"],
+  "stages": [
+    {
+      "files": ["Cargo.toml", "Cargo.lock"],
+      "commands": [["python3", "scripts/prepare_release.py", "{version}"]],
+      "message": "chore: release {version}"
+    }
+  ],
+  "repository": "nielsmadan/slimetrail",
+  "workflow": "release.yml",
+  "publication": "GitHub Actions will publish macOS/Linux binaries, SHA256SUMS and build provenance"
+}
