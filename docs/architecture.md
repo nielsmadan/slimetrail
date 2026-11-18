@@ -2,6 +2,14 @@
 
 The CLI captures environment, current directory, clock and IANA time zone once. Core functions receive a `Context` and explicit options. The Rust library is an implementation seam; the external compatibility boundary is [CLI JSON v1](json-protocol.md), not serialized internal models. There is no Python import API.
 
+## Design rationale
+
+The project centralizes format knowledge previously duplicated across ringleader, check-agent-logs and time-reconstruct. The November 2026 design replaced repeated raw-file searches with a disposable incremental index: the initial investigation reported an all-agent search taking minutes on 2026-11-15, superseding a September assessment based on a 3.5-second scan of a smaller corpus. These are historical motivations, not slimetrail performance measurements; see [measured results and limitations](performance.md).
+
+Rust was chosen to reduce parsing and process-startup overhead. External consumers use versioned subprocess JSON, following ringleader's hooklinesinker integration model, so Python consumers need neither a stable Rust API nor platform-specific PyO3 wheels. Shared synthetic expected outputs constrain compatibility while Python readers coexist with the Rust implementation. [Integration boundaries and reference readers](integrations.md) describe the migration seam.
+
+The initial alternatives review, dated 2026-11-15, found `@tangle-network/harness-sessions` lacked Cursor support and search/indexing; ATXF (`leostera/atxf`) addressed transcript exchange; and `coding_agent_session_search` and `agent-sessions` coupled their readers to application search stacks outside this project's scope. This records the original selection rationale, not a current capability survey. V1 uses SQLite FTS5 with synchronous refresh and literal/regex matching; fuzzy search, embeddings, a daemon and file watching remain outside scope.
+
 ## Refresh and query lifecycle
 
 `src/api.rs` opens one `IndexSession`, refreshes selected agents, then queries under the same exclusive lifecycle lease. The lease owns all index connections and private snapshot lifetimes. Concurrent invocations sharing an index serialize, including reads; a bounded lock wait reports an index-busy error. Different indexes have independent snapshot staging.

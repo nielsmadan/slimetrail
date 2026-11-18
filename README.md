@@ -69,4 +69,4 @@ The external interface is the CLI's [version-1 JSON protocol](docs/json-protocol
 
 Exit **0** means complete (including no matches), **1** means partial source coverage, and **2** means usage or fatal runtime failure. JSON stdout is machine-readable; diagnostics also go to stderr. A result with `incomplete: true` can contain useful data, or no data if the requested session could not be established.
 
-Read [architecture and privacy](docs/architecture.md), [supported formats and finite compatibility differences](docs/compatibility.md), and [performance limitations and measurements](docs/performance.md). Token usage/cost, native-store mutations, consumer migrations, a daemon and publication are outside v1.
+Read [architecture and privacy](docs/architecture.md), [supported formats and finite compatibility differences](docs/compatibility.md), [consumer boundaries and migration references](docs/integrations.md), and [performance limitations and measurements](docs/performance.md). Token usage/cost, native-store mutations, consumer migrations, a daemon and publication are outside v1.
