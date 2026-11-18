@@ -76,7 +76,7 @@ Also out of scope:
 ## Build-session decisions resolved
 
 1. **Token usage.** Keep token/cost reading in ringleader; it is outside v1.
-2. **Package and distribution.** Build a local release binary and support `cargo install --path . --locked` with an explicit prefix for validation. Publishing, Homebrew tap changes, PyPI and consumer migrations are deferred. `just release` builds and `just install <prefix>` installs; no global install is part of the build-session work.
+2. **Package and distribution.** Build a local release binary and support `cargo install --path . --locked` with an explicit prefix for validation. Publishing, Homebrew tap changes, PyPI and consumer migrations are deferred. `just build-release` builds and `just install` installs into Cargo's installation directory, replacing the same version; `CARGO_INSTALL_ROOT` selects a temporary prefix for validation. No global install is part of the build-session work.
 3. **Dependencies.** Accept useful dependencies and retain Cargo.lock; macOS checks run locally and Linux has a CI recipe. A configured workflow alone does not establish Linux execution. Windows is not promised.
 4. **Entry schema details.** Keep `message`, `tool`, `meta`, with subtype/tool/automation fields; reasoning and compaction use metadata subtypes. Include native child/archive sessions with parent/provenance where known. Entry indices are dense and source IDs stable on unchanged reread/append, not through arbitrary rewrites. Timeline preserves Claude/Cursor child exclusions. Cursor legacy text/protobuf and OpenCode legacy file readers are outside supported v1 formats and diagnosed as incomplete where detected.
 

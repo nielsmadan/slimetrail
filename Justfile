@@ -1,10 +1,39 @@
+[private]
+default:
+    @just --list
+
+setup:
+    @cargo fetch --locked
+    @just doctor
+
+doctor:
+    @cargo --version
+    @rustc --version
+    @cargo fmt --version
+    @cargo clippy --version
+
+install:
+    @cargo install --path . --locked --force
+
+uninstall:
+    @cargo uninstall slimetrail
+
+test:
+    @cargo test --locked --all-targets
+
+lint:
+    @cargo clippy --locked --all-targets --all-features -- -D warnings
+
+format:
+    @cargo fmt
+
 check:
-    cargo fmt --check
-    cargo clippy --locked --all-targets --all-features -- -D warnings
-    cargo test --locked --all-targets
+    @cargo fmt --check
+    @just lint
+    @just test
 
-release:
-    cargo build --release --locked
+build-release:
+    @cargo build --release --locked
 
-install prefix:
-    cargo install --path . --locked --root {{quote(prefix)}}
+clean:
+    @cargo clean

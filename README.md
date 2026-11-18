@@ -7,12 +7,14 @@ Read and search local coding-agent sessions from Claude Code, Codex, Cursor, Dro
 Rust 1.89 or newer is required (edition 2024). SQLite is bundled. The implementation uses Unix filesystem permissions and locks; macOS is exercised locally and Linux has a CI recipe. Windows is not supported. No release package or Homebrew tap is published by this checkout.
 
 ```sh
-timeout 900 cargo build --release --locked
+timeout 900 just build-release
 ./target/release/slimetrail --help
-timeout 900 cargo install --path . --locked --root "$HOME/.local"
+timeout 900 just install
 ```
 
-The install command places the binary in the chosen prefix's `bin`; add that directory to `PATH`. The shell examples use GNU `timeout` from coreutils. Development checks are `timeout 900 just check` (format, Clippy with warnings denied, and all-target tests). `just release` builds release mode and `just install <prefix>` installs into an explicit prefix; wrap either in a deadline too.
+`just install` installs into Cargo's installation directory (normally `~/.cargo/bin`) and replaces an existing binary even when the package version is unchanged. Add that directory to `PATH`. For a custom prefix, use `CARGO_INSTALL_ROOT=/path/to/prefix timeout 900 just install`; the binary goes in that prefix's `bin`. Use the same environment override with `just uninstall` to remove it. The shell examples use GNU `timeout` from coreutils.
+
+Run `just` to list commands. `just setup` fetches locked dependencies and runs `just doctor` to check the Rust tools. Development commands are `just test`, `just lint`, and `just format`; `timeout 900 just check` runs formatting checks, strict Clippy, and all-target tests. `just build-release` builds the optimized binary, and `just clean` removes Cargo build artifacts. Wrap builds, installs, and tests in a deadline as shown above.
 
 ## Use
 
