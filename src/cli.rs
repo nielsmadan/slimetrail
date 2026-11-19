@@ -13,6 +13,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod search_text;
+
 #[derive(Parser)]
 #[command(version, about = "Read-only search across local coding-agent sessions")]
 struct Cli {
@@ -210,11 +212,14 @@ fn execute(cli: &Cli, env: &BTreeMap<String, String>, out: &mut dyn Write) -> Re
                     context_chars: *context,
                 },
             )?;
-            emit(
-                out,
-                &convert(result, |v| SearchDataDto::try_from(v))?,
-                is_json,
-            )
+            let result = convert(result, |v| SearchDataDto::try_from(v))?;
+            if is_json {
+                emit(out, &result, true)
+            } else {
+                diagnostics(&result.diagnostics);
+                search_text::render(out, &result).map_err(output_error)?;
+                Ok(i32::from(result.incomplete))
+            }
         }
         Command::Read {
             session,

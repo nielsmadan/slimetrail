@@ -19,6 +19,8 @@ For an exact missing session, a complete inventory produces a fatal not-found ar
 
 ## Shared session fields
 
+Search defaults to human-readable text blocks. That display format escapes terminal controls and bidirectional formatting controls; JSON preserves the original field values. Consumers should explicitly request `--format json` and use this versioned protocol rather than parse text output.
+
 Session objects contain the following fields. Search hits, read pages and timeline sessions flatten these fields into their own object, without a nested `session` member.
 
 | Field | Type / meaning |

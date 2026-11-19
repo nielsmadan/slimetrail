@@ -41,6 +41,8 @@ The default scope is `siblings`: the current directory and sessions whose cwd ha
 
 Search defaults: `--max-results 50`, `--max-snippets 3`, `--context 160`, `--sort score`, `--kind all`. Read defaults: `--mode lite`, `--offset 0`, `--max-chars 200000`. Timeline requires `--since` or positive `--days`, accepts `--until`, and defaults to `--idle-minutes 30`. Global flags are accepted around the subcommand, but cwd/app/date/kind filters do not narrow an explicit `read`/`entries` reference; agent selectors still must agree with that reference. `index` refreshes selected agents without applying those query filters.
 
+Search text output shows one block per returned session: its full reference, available title and cwd, occurrence count, score and labelled snippets. The header counts returned sessions after the result limit. Empty searches say `No matches.`; partial searches explicitly say `search incomplete`, including when no matches were found in available sources. Terminal controls and bidirectional formatting controls are escaped for display, with ordinary Unicode preserved. Use `--format json` for automation and original unescaped field values; its version-1 protocol is unchanged.
+
 ## Stores and index
 
 The default index is `$XDG_DATA_HOME/slimetrail`, falling back to `~/.local/share/slimetrail`. `--index-dir PATH` overrides it. The index contains transcript text and should be treated as sensitive: its directory must be mode 0700, files 0600. Existing insecure destinations, symlink destinations and overlap with source roots are rejected. The current private index is v2; an older private index is rebuilt automatically, while CLI JSON remains version 1. Stop all slimetrail processes before manually deleting an index; the next command rebuilds it.
