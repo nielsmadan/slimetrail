@@ -31,6 +31,9 @@ pub fn resolve_roots(home: &Path, env: &BTreeMap<String, String>) -> Result<Root
             .unwrap_or_else(|| codex_home.join("session_index.jsonl")),
         cursor_projects: cursor_data.join("projects"),
         cursor_chats: cursor_config.join("chats"),
+        devin_sessions_db: value("DEVIN_SESSIONS_DIR")
+            .unwrap_or_else(|| xdg_data.join("devin"))
+            .join("cli/sessions.db"),
         droid_sessions: value("FACTORY_HOME_OVERRIDE")
             .unwrap_or_else(|| home.to_path_buf())
             .join(".factory/sessions"),

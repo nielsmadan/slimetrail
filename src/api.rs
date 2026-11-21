@@ -104,6 +104,7 @@ pub(crate) fn selected(agents: &BTreeSet<Agent>) -> BTreeSet<Agent> {
             Agent::Claude,
             Agent::Codex,
             Agent::Cursor,
+            Agent::Devin,
             Agent::Droid,
             Agent::Opencode,
             Agent::Pi,

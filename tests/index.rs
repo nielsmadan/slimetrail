@@ -614,7 +614,12 @@ fn namespace_canonicalization_does_not_bypass_reader_symlink_guards() {
 
 #[test]
 fn native_roots_below_index_are_rejected_before_cleanup() {
-    for field in ["claude_projects", "opencode_db", "codex_session_index"] {
+    for field in [
+        "claude_projects",
+        "opencode_db",
+        "codex_session_index",
+        "devin_sessions_db",
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = context(dir.path());
         let native = ctx.index_dir.join("staging/slimetrail-snapshot-native");

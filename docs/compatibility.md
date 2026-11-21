@@ -1,6 +1,6 @@
 # Formats and behavior
 
-Compatibility is checked with synthetic normalized-entry and query goldens generated from the supplied `check-agent-logs` reader, plus independent tests of indexing, roots, failures and query behavior. This establishes coverage for the fixture formats below, not every historical agent release. No real transcript is a fixture. Reference generators are in `tests/fixtures/jsonl/generate.py` and `tests/fixtures/query/generate.py`.
+Compatibility is checked with synthetic normalized-entry and query goldens generated from the supplied `check-agent-logs` reader, plus independent tests of indexing, roots, failures and query behavior. This establishes coverage for the fixture formats below, not every historical agent release. Devin has no reference reader; its expected entries in `tests/readers_devin.rs` are hand-written from probe observations of Devin CLI 3000.14. No real transcript is a fixture. Reference generators are in `tests/fixtures/jsonl/generate.py` and `tests/fixtures/query/generate.py`.
 
 ## Supported stores
 
@@ -9,6 +9,7 @@ Compatibility is checked with synthetic normalized-entry and query goldens gener
 | Claude Code | Project JSONL, messages/tools/metadata, child sessions and recognized Claude ringleader archive records | Mixed-archive foreign formats are not treated as Claude; no store mutations |
 | Codex | Session/rollout JSONL, native archived sessions, header identity, title index, message/tool/reasoning records | Child ID is distinct from parent `session_id`; structured tool payload rendering differs from Python repr |
 | Cursor | JSONL under `agent-transcripts`, companion `meta.json`, private chat `store.db` metadata | Legacy role-delimited `.txt` transcripts produce incomplete diagnostics; protobuf message blobs are not decoded; missing tool output is not reconstructed |
+| Devin | CLI `sessions.db` (`sessions`, `message_nodes`, `subagent_heads`): the live chain from `main_chain_id`, history moved off it by compaction, subagent chains as child sessions `devin:ID/AGENT` | System prompt, rules and skill-listing nodes are not indexed; reverted turns and superseded node copies are excluded; `/fork` copies are independent sessions without `parent_ref`, so shared history matches in both and its human prompts count in both sessions' timeline spans; end-of-session ATIF `transcripts/`, Devin Desktop `cli-next/` and `DEVIN_SESSION_STORE=files` are not read |
 | Droid | Session JSONL and companion settings metadata | Automation/exec settings affect human prompt accounting and fingerprints |
 | OpenCode | SQLite session/message/part schema, optional parent/archive fields and project cwd fallback | Legacy file-only storage is diagnosed unsupported; unsupported schema or unstable snapshot produces incomplete coverage |
 | Pi | Session JSONL with canonical header ID, messages, tools and metadata | Filename guesses cannot replace a known header identity |
@@ -33,7 +34,7 @@ Timeline requires `--since` or positive `--days` (mutually exclusive). Entries a
 
 Sessions must also have source freshness at least the resolved since. An old unmodified source can therefore be excluded even if its records overlap the requested window. Explicit historical until windows do not independently apply a cutoff relative to today. Entries without usable timestamps are skipped with one counted diagnostic per source, making the timeline incomplete.
 
-An event gap at or below `--idle-minutes` stays in the same span; a larger gap starts another. The span ends at its last event, with no idle tail added; a single event has zero duration. Human prompts count only non-automated user message entries. Kind filters do not remove timeline events. Claude/Cursor child sessions with parent provenance or a `subagents` path are excluded from timeline to match reference behavior; search still includes them. Other harness child sessions remain included. A marker with no parent/path does not independently trigger that timeline exclusion.
+An event gap at or below `--idle-minutes` stays in the same span; a larger gap starts another. The span ends at its last event, with no idle tail added; a single event has zero duration. Human prompts count only non-automated user message entries. Kind filters do not remove timeline events. Claude/Cursor child sessions with parent provenance or a `subagents` path, and Devin subagent child sessions, are excluded from timeline (Claude/Cursor to match reference behavior; Devin because subagent activity happens inside the parent session); search still includes them. Other harness child sessions remain included. A marker with no parent/path does not independently trigger that timeline exclusion.
 
 Daily totals merge overlapping spans across all included sessions and split at civil-day boundaries in the selected zone. Summing session totals can exceed a day's union total because sessions overlap.
 

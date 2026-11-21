@@ -42,7 +42,7 @@ Accepted copies live in fresh 0700 directories under the index's owned staging d
 
 Clean rollback-mode databases are supported; a nonempty rollback journal is rejected rather than attempting potentially unsafe recovery, including recovery involving original master-journal paths. This is metadata-validated quiescence, not an atomic OS snapshot or protection against adversarial metadata forgery. A continuously changing source can remain unavailable.
 
-OpenCode always snapshots and enumerates its inventory, even on an otherwise unchanged refresh, then reuses unchanged entries. Cached sessions alone cannot prove complete inventory. A future shortcut requires a persisted completeness proof. Database changes conservatively reparse affected sessions; aggregate row counts or maximum timestamps are not sufficient evidence against same-size edits.
+OpenCode and Devin always snapshot and enumerate their inventory, even on an otherwise unchanged refresh, then reuse unchanged entries. Cached sessions alone cannot prove complete inventory. A future shortcut requires a persisted completeness proof. Database changes conservatively reparse affected sessions; aggregate row counts or maximum timestamps are not sufficient evidence against same-size edits.
 
 ## Security boundary
 

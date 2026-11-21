@@ -77,11 +77,13 @@ pub(crate) fn run(
 }
 
 fn excluded_child(session: &Session) -> bool {
-    matches!(session.key.agent, Agent::Claude | Agent::Cursor)
-        && (session.parent.is_some()
-            || Path::new(&session.source)
-                .components()
-                .any(|p| p.as_os_str() == "subagents"))
+    matches!(
+        session.key.agent,
+        Agent::Claude | Agent::Cursor | Agent::Devin
+    ) && (session.parent.is_some()
+        || Path::new(&session.source)
+            .components()
+            .any(|p| p.as_os_str() == "subagents"))
 }
 
 fn activity_spans(mut events: Vec<(Timestamp, bool)>, idle_ms: u64) -> Vec<Span> {

@@ -25,7 +25,7 @@ Session objects contain the following fields. Search hits, read pages and timeli
 
 | Field | Type / meaning |
 | --- | --- |
-| `agent` | `claude`, `codex`, `cursor`, `droid`, `opencode`, `pi` |
+| `agent` | `claude`, `codex`, `cursor`, `devin`, `droid`, `opencode`, `pi` |
 | `id`, `ref` | Strings; `ref` is exact `agent:id` |
 | `source` | Source path/provenance string; database sources may include a session locator |
 | `title`, `cwd`, `branch` | String or null |

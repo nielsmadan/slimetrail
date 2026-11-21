@@ -33,6 +33,7 @@ fn explicit_roots_win_and_archives_keep_agent_home() {
         "CODEX_HOME",
         "CURSOR_DATA_DIR",
         "CURSOR_CONFIG_DIR",
+        "DEVIN_SESSIONS_DIR",
         "XDG_CONFIG_HOME",
         "FACTORY_HOME_OVERRIDE",
         "PI_SESSIONS_DIR",
@@ -59,6 +60,10 @@ fn explicit_roots_win_and_archives_keep_agent_home() {
         ),
         (roots.cursor_projects, "/fixture/CURSOR_DATA_DIR/projects"),
         (roots.cursor_chats, "/fixture/CURSOR_CONFIG_DIR/chats"),
+        (
+            roots.devin_sessions_db,
+            "/fixture/DEVIN_SESSIONS_DIR/cli/sessions.db",
+        ),
         (
             roots.droid_sessions,
             "/fixture/FACTORY_HOME_OVERRIDE/.factory/sessions",
@@ -194,6 +199,10 @@ fn agent_home_overrides_supply_default_subdirectories() {
     let defaults = resolve_roots(home, &BTreeMap::new()).unwrap();
     assert_eq!(defaults.cursor_chats, home.join(".cursor/chats"));
     assert_eq!(defaults.droid_sessions, home.join(".factory/sessions"));
+    assert_eq!(
+        defaults.devin_sessions_db,
+        home.join(".local/share/devin/cli/sessions.db")
+    );
     assert_eq!(defaults.pi_sessions, home.join(".pi/agent/sessions"));
     assert_eq!(
         defaults.opencode_db,

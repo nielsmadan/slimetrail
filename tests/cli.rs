@@ -332,7 +332,9 @@ fn agent_selectors_are_additive_and_all_takes_precedence() {
     );
     assert_eq!(
         all["data"]["agents"],
-        json!(["claude", "codex", "cursor", "droid", "opencode", "pi"])
+        json!([
+            "claude", "codex", "cursor", "devin", "droid", "opencode", "pi"
+        ])
     );
     assert_eq!(all["data"]["count"], 2);
     let invalid = fixture.json(&["sessions", "--all", "--current"], 2);

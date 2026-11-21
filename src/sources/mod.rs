@@ -1,6 +1,7 @@
 pub mod claude;
 pub mod codex;
 pub mod cursor;
+pub mod devin;
 pub mod droid;
 pub mod jsonl;
 pub mod opencode;
@@ -43,6 +44,7 @@ pub fn registry(ctx: &Context) -> Vec<Box<dyn Source>> {
         Box::new(claude::Claude::new(ctx)),
         Box::new(codex::Codex::new(ctx)),
         Box::new(cursor::Cursor::new(ctx)),
+        Box::new(devin::Devin::new(ctx)),
         Box::new(droid::Droid::new(ctx)),
         Box::new(pi::Pi::new(ctx)),
         Box::new(opencode::Opencode::new(ctx)),
@@ -60,6 +62,7 @@ pub(crate) fn registry_in(ctx: &Context, staging: &std::path::Path) -> Vec<Box<d
         Box::new(claude::Claude::new(ctx)),
         Box::new(codex::Codex::new(ctx)),
         Box::new(cursor::Cursor::with_staging(staging)),
+        Box::new(devin::Devin::with_staging(staging)),
         Box::new(droid::Droid::new(ctx)),
         Box::new(pi::Pi::new(ctx)),
         Box::new(opencode::Opencode::with_staging(staging)),

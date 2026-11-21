@@ -1,6 +1,6 @@
 # slimetrail
 
-Read and search local coding-agent sessions from Claude Code, Codex, Cursor, Droid, OpenCode and Pi. A Rust CLI normalizes their supported formats into a private incremental SQLite index. Agent stores are read-only; every query refreshes the selected agents before returning results.
+Read and search local coding-agent sessions from Claude Code, Codex, Cursor, Devin, Droid, OpenCode and Pi. A Rust CLI normalizes their supported formats into a private incremental SQLite index. Agent stores are read-only; every query refreshes the selected agents before returning results.
 
 ## Build and install
 
@@ -33,7 +33,7 @@ slimetrail index --all --format json
 
 Use a returned `ref` as the exact `agent:id` for `read` or `entries`. `read` defaults to messages (`lite`); `full` includes metadata/reasoning and `log` includes tools too. JSON read responses expose `next_offset`; offsets count Unicode scalar values, not bytes. Text read stdout contains only the requested transcript slice. A truncated text page prints `Transcript truncated; continue with --offset N` to stderr; the final page prints no continuation notice. Keep the same read mode when continuing.
 
-No selector means all six agents. Named selectors combine; `--all` selects all; `--current` adds the agent named by `AGENT_HARNESS` and requires one of `claude`, `codex`, `cursor`, `droid`, `opencode`, `pi`. Missing or inaccessible selected stores make a response incomplete; stderr identifies their agent and source. Unselected unavailable stores do not abort a healthy selection. Select the agents installed on your machine to avoid those diagnostics.
+No selector means all seven agents. Named selectors combine; `--all` selects all; `--current` adds the agent named by `AGENT_HARNESS` and requires one of `claude`, `codex`, `cursor`, `devin`, `droid`, `opencode`, `pi`. Missing or inaccessible selected stores make a response incomplete; stderr identifies their agent and source. Unselected unavailable stores do not abort a healthy selection. Select the agents installed on your machine to avoid those diagnostics.
 
 Search defaults to case-insensitive **literal substring** matching. `--regex` opts into Rust regular expressions; look-around and backreferences are unsupported. There is no fuzzy or semantic search. Results are grouped by session and ranked by non-overlapping occurrences: title 5, message 3, metadata 2, tool 1. Only native titles contribute title matches; a title derived from a prompt is display-only. See [search and compatibility details](docs/compatibility.md).
 
@@ -57,13 +57,14 @@ Environment precedence is highest first; empty strings are ignored, and Cursor o
 | Codex title index | Sibling `session_index.jsonl` of `CODEX_SESSIONS_DIR` when set; otherwise `CODEX_HOME/session_index.jsonl` → `~/.codex/session_index.jsonl` |
 | Cursor transcripts | `CURSOR_DATA_DIR/projects` → `~/.cursor/projects` |
 | Cursor chats | `CURSOR_CONFIG_DIR/chats` → `XDG_CONFIG_HOME/cursor/chats` → `~/.cursor/chats` |
+| Devin SQLite | `DEVIN_SESSIONS_DIR/cli/sessions.db` → `XDG_DATA_HOME/devin/cli/sessions.db` → `~/.local/share/devin/cli/sessions.db` |
 | Droid | `(FACTORY_HOME_OVERRIDE or HOME)/.factory/sessions` |
 | Pi | `PI_SESSIONS_DIR` → `PI_CODING_AGENT_SESSION_DIR` → `PI_CODING_AGENT_DIR/sessions` → `~/.pi/agent/sessions` |
 | OpenCode SQLite | `OPENCODE_DB` → `XDG_DATA_HOME/opencode/opencode.db` → `~/.local/share/opencode/opencode.db` |
 | Legacy OpenCode detection | `(XDG_DATA_HOME or ~/.local/share)/opencode/storage` |
 | Optional ringleader archive | `(XDG_DATA_HOME or ~/.local/share)/ringleader/archive`; recognized Claude records only |
 
-All effective roots, including `codex_session_index`, archive and legacy paths, form an index namespace. Changing overrides cannot reuse another namespace's cached rows. Old namespaces remain until the index is removed. Codex title metadata and Droid companion settings participate in invalidation. Changed transcripts are reread in full; changed backing databases conservatively invalidate their sessions. Even an unchanged OpenCode database is privately snapshotted and enumerated to prove inventory completeness.
+All effective roots, including `codex_session_index`, archive and legacy paths, form an index namespace. Changing overrides cannot reuse another namespace's cached rows. Old namespaces remain until the index is removed. Codex title metadata and Droid companion settings participate in invalidation. Changed transcripts are reread in full; changed backing databases conservatively invalidate their sessions. Even an unchanged OpenCode or Devin database is privately snapshotted and enumerated to prove inventory completeness.
 
 ## Integrate
 

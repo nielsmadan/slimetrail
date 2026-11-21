@@ -130,7 +130,10 @@ pub(super) fn validate(ctx: &Context) -> Result<PathBuf> {
     for (field, value) in roots.as_object().expect("Roots is an object") {
         if let Some(path) = value.as_str() {
             let root = source_identity(Path::new(path), &ctx.cwd)?;
-            let root = if matches!(field.as_str(), "opencode_db" | "codex_session_index") {
+            let root = if matches!(
+                field.as_str(),
+                "opencode_db" | "codex_session_index" | "devin_sessions_db"
+            ) {
                 root.parent().unwrap_or(&root)
             } else {
                 &root

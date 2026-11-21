@@ -53,6 +53,8 @@ struct Common {
     #[arg(long, global = true)]
     cursor: bool,
     #[arg(long, global = true)]
+    devin: bool,
+    #[arg(long, global = true)]
     droid: bool,
     #[arg(long, global = true)]
     opencode: bool,
@@ -63,7 +65,7 @@ struct Common {
     #[arg(
         long,
         global = true,
-        help = "Select AGENT_HARNESS (claude/codex/cursor/droid/opencode/pi)"
+        help = "Select AGENT_HARNESS (claude/codex/cursor/devin/droid/opencode/pi)"
     )]
     current: bool,
 }
@@ -329,6 +331,7 @@ fn filter(
         (common.claude, Agent::Claude),
         (common.codex, Agent::Codex),
         (common.cursor, Agent::Cursor),
+        (common.devin, Agent::Devin),
         (common.droid, Agent::Droid),
         (common.opencode, Agent::Opencode),
         (common.pi, Agent::Pi),
@@ -344,7 +347,7 @@ fn filter(
                 .parse()
                 .map_err(|_| {
                     Error::InvalidArgument(
-                        "AGENT_HARNESS must name claude, codex, cursor, droid, opencode, or pi"
+                        "AGENT_HARNESS must name claude, codex, cursor, devin, droid, opencode, or pi"
                             .into(),
                     )
                 })?,
