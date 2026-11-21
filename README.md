@@ -62,7 +62,7 @@ Environment precedence is highest first; empty strings are ignored, and Cursor o
 | Pi | `PI_SESSIONS_DIR` → `PI_CODING_AGENT_SESSION_DIR` → `PI_CODING_AGENT_DIR/sessions` → `~/.pi/agent/sessions` |
 | OpenCode SQLite | `OPENCODE_DB` → `XDG_DATA_HOME/opencode/opencode.db` → `~/.local/share/opencode/opencode.db` |
 | Legacy OpenCode detection | `(XDG_DATA_HOME or ~/.local/share)/opencode/storage` |
-| Optional ringleader archive | `(XDG_DATA_HOME or ~/.local/share)/ringleader/archive`; recognized Claude, Codex, Droid and Pi transcripts, each read as its own agent's archived session |
+| Optional ringleader archive | `(XDG_DATA_HOME or ~/.local/share)/ringleader/archive`; recognized Claude, Codex, Cursor, Droid and Pi transcripts, each read as its own agent's archived session |
 
 All effective roots, including `codex_session_index`, archive and legacy paths, form an index namespace. Changing overrides cannot reuse another namespace's cached rows. Old namespaces remain until the index is removed. Codex title metadata and Droid companion settings participate in invalidation. Changed transcripts are reread in full; changed backing databases conservatively invalidate their sessions. Even an unchanged OpenCode or Devin database is privately snapshotted and enumerated to prove inventory completeness.
 

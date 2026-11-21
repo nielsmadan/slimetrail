@@ -1,6 +1,6 @@
 use super::{
     Source,
-    jsonl::{content_entries, diagnostic, fingerprint, records, string},
+    jsonl::{ArchiveKind, archive_kind, content_entries, diagnostic, fingerprint, records, string},
     sqlite,
 };
 use crate::{
@@ -19,6 +19,7 @@ use std::{
 
 pub struct Cursor {
     staging: Option<PathBuf>,
+    archive: Option<PathBuf>,
 }
 
 struct CursorDependencies<'a> {
@@ -53,14 +54,22 @@ impl<'a> CursorDependencies<'a> {
 }
 
 impl Cursor {
-    pub const fn new(_: &Context) -> Self {
-        Self { staging: None }
+    pub fn new(ctx: &Context) -> Self {
+        Self {
+            staging: None,
+            archive: ctx.roots.archive.clone(),
+        }
     }
 
-    pub(crate) fn with_staging(staging: &Path) -> Self {
+    pub(crate) fn with_staging(ctx: &Context, staging: &Path) -> Self {
         Self {
             staging: Some(staging.into()),
+            archive: ctx.roots.archive.clone(),
         }
+    }
+
+    fn archived(&self, path: &Path) -> bool {
+        self.archive.as_ref().is_some_and(|a| path.starts_with(a))
     }
 }
 
@@ -142,6 +151,17 @@ fn snapshot_for(
     let (snapshot, captured) = sqlite::snapshot_at(database, staging)?;
     snapshots.insert(database.to_owned(), (captured, Arc::clone(&snapshot)));
     Ok(snapshot)
+}
+
+fn archived_transcript(path: &Path, previous: &DiscoveryCache) -> bool {
+    let unchanged = previous
+        .by_source
+        .get(path.to_string_lossy().as_ref())
+        .is_some_and(|c| {
+            c.key.agent == Agent::Cursor
+                && fingerprint(&c.dependencies).is_ok_and(|f| f == c.fingerprint)
+        });
+    unchanged || matches!(archive_kind(path), Ok(ArchiveKind::Agent(Agent::Cursor)))
 }
 
 fn parent(path: &Path) -> Option<String> {
@@ -349,12 +369,30 @@ impl Source for Cursor {
                 ))
             })
             .collect();
-        let mut snapshots = BTreeMap::<PathBuf, (Fingerprint, Arc<PrivateSnapshot>)>::new();
-        let mut sessions = BTreeMap::<String, (i128, RawSession)>::new();
-        for path in files
-            .into_iter()
-            .filter(|p| p.components().any(|c| c.as_os_str() == "agent-transcripts"))
+        let mut archived = Vec::new();
+        if let Some(archive) = &self.archive
+            && !fs::symlink_metadata(archive)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
         {
+            if walk(archive, &mut archived).is_err() {
+                diagnostics.push(diagnostic(
+                    Agent::Cursor,
+                    archive,
+                    "source_unavailable",
+                    "Archive could not be enumerated",
+                ));
+            }
+            archived.retain(|p| {
+                p.extension().is_some_and(|e| e == "jsonl") && archived_transcript(p, previous)
+            });
+        }
+        let mut snapshots = BTreeMap::<PathBuf, (Fingerprint, Arc<PrivateSnapshot>)>::new();
+        let mut sessions = BTreeMap::<String, (bool, i128, RawSession)>::new();
+        let live = files
+            .into_iter()
+            .filter(|p| p.components().any(|c| c.as_os_str() == "agent-transcripts"));
+        for path in live.chain(archived) {
+            let archived = self.archived(&path);
             if path.extension().is_some_and(|e| e == "txt") {
                 diagnostics.push(diagnostic(
                     Agent::Cursor,
@@ -372,13 +410,22 @@ impl Source for Cursor {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned();
-            let own = metadata
-                .get(&id)
-                .cloned()
-                .unwrap_or_else(|| ctx.roots.cursor_chats.join(&id).join("meta.json"));
-            let owner = parent(&path)
-                .and_then(|id| metadata.get(&id).cloned())
-                .unwrap_or_else(|| own.clone());
+            let (chat_root, own, owner) = match &self.archive {
+                Some(archive) if archived => {
+                    let own = path.with_extension("").join("meta.json");
+                    (archive, own.clone(), own)
+                }
+                _ => {
+                    let own = metadata
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_else(|| ctx.roots.cursor_chats.join(&id).join("meta.json"));
+                    let owner = parent(&path)
+                        .and_then(|id| metadata.get(&id).cloned())
+                        .unwrap_or_else(|| own.clone());
+                    (&ctx.roots.cursor_chats, own, owner)
+                }
+            };
             let database = own.with_file_name("store.db");
             let dependencies = CursorDependencies {
                 transcript: &path,
@@ -390,7 +437,7 @@ impl Source for Cursor {
             let source = path.to_string_lossy().into_owned();
             let result: Result<(i128, RawSession)> = (|| {
                 for companion in [&own, &owner] {
-                    validate_companion(&ctx.roots.cursor_chats, companion)?;
+                    validate_companion(chat_root, companion)?;
                 }
                 let signature = fingerprint(&dependencies)?;
                 let cached = previous
@@ -439,10 +486,12 @@ impl Source for Cursor {
                             "Cursor companion metadata is missing",
                         ));
                     }
-                    if sessions.get(&id).is_none_or(|(old_time, old)| {
-                        time > *old_time || time == *old_time && raw.source < old.source
+                    let rank = (!archived, time);
+                    if sessions.get(&id).is_none_or(|(old_live, old_time, old)| {
+                        rank > (*old_live, *old_time)
+                            || rank == (*old_live, *old_time) && raw.source < old.source
                     }) {
-                        sessions.insert(id, (time, raw));
+                        sessions.insert(id, (!archived, time, raw));
                     }
                 }
                 Err(_) => diagnostics.push(diagnostic(
@@ -459,7 +508,7 @@ impl Source for Cursor {
             BTreeSet::new()
         };
         Ok(Discovery {
-            sessions: sessions.into_values().map(|(_, raw)| raw).collect(),
+            sessions: sessions.into_values().map(|(_, _, raw)| raw).collect(),
             diagnostics,
             complete_agents,
         })
@@ -549,7 +598,7 @@ impl Source for Cursor {
             source_updated_at: Some(metadata.mtime() * 1000 + metadata.mtime_nsec() / 1_000_000),
             parent,
             source: raw.source.clone(),
-            archived: false,
+            archived: self.archived(path),
         };
         let mut pending = None;
         let mut index = 0;

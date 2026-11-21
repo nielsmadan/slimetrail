@@ -297,6 +297,13 @@ pub(crate) fn archive_kind(path: &Path) -> Result<ArchiveKind> {
             found = ArchiveKind::Agent(agent);
             return Ok(false);
         }
+        if record.get("type").is_none()
+            && record["role"].is_string()
+            && record["message"].is_object()
+        {
+            found = ArchiveKind::Agent(Agent::Cursor);
+            return Ok(false);
+        }
         if matches!(kind, "session_meta" | "session_start" | "session")
             || (kind == "message" && record["message"]["role"].is_string())
             || record["role"].is_string()

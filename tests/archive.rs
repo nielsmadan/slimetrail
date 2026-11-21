@@ -7,7 +7,7 @@ use std::{
 };
 use tempfile::TempDir;
 
-const JSONL_AGENTS: [&str; 4] = ["--claude", "--codex", "--droid", "--pi"];
+const FILE_AGENTS: [&str; 5] = ["--claude", "--codex", "--cursor", "--droid", "--pi"];
 
 struct Fixture {
     temp: TempDir,
@@ -21,6 +21,8 @@ impl Fixture {
             "codex/sessions",
             ".factory/sessions",
             ".pi/agent/sessions",
+            ".cursor/projects",
+            ".cursor/chats",
         ] {
             fs::create_dir_all(temp.path().join(store)).unwrap();
         }
@@ -77,8 +79,37 @@ fn codex_rollout(text: &str) -> Vec<Value> {
     ]
 }
 
+fn cursor_transcript(path: &Path, text: &str) {
+    write(
+        path,
+        &[
+            json!({"role":"user","message":{"content":[{"type":"text","text":format!("<user_query>\n{text}\n</user_query>")}]}}),
+            json!({"role":"assistant","message":{"content":[{"type":"text","text":"looking"}]}}),
+        ],
+    );
+}
+
+fn cursor_store(chat: &Path, value: &Value) {
+    let connection = rusqlite::Connection::open(chat.join("store.db")).unwrap();
+    connection
+        .execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")
+        .unwrap();
+    connection
+        .execute("INSERT INTO meta VALUES('0', hex(?1))", [value.to_string()])
+        .unwrap();
+}
+
 fn mixed_archive(fixture: &Fixture) {
     let archive = fixture.archive();
+    cursor_transcript(&archive.join("cursor-archived.jsonl"), "needle-cursor");
+    let chat = archive.join("cursor-archived");
+    fs::create_dir_all(&chat).unwrap();
+    fs::write(
+        chat.join("meta.json"),
+        json!({"title":"Archived cursor title","cwd":"/fixture/cursor-project","createdAtMs":1_762_000_000_000_i64}).to_string(),
+    )
+    .unwrap();
+    cursor_store(&chat, &json!({"name":"Store title"}));
     write(
         &archive.join("claude-archived.jsonl"),
         &[
@@ -155,7 +186,7 @@ fn args<'a>(command: &'a str, rest: &[&'a str]) -> Vec<&'a str> {
 fn mixed_ringleader_archive_attributes_each_transcript_to_its_agent() {
     let fixture = Fixture::new();
     mixed_archive(&fixture);
-    let listed = fixture.json(&args("sessions", &JSONL_AGENTS), 1);
+    let listed = fixture.json(&args("sessions", &FILE_AGENTS), 1);
     assert_eq!(
         refs(&listed),
         [
@@ -166,6 +197,7 @@ fn mixed_ringleader_archive_attributes_each_transcript_to_its_agent() {
                 Some("claude:claude-archived".to_owned())
             ),
             ("codex:codex-archived".to_owned(), true, None),
+            ("cursor:cursor-archived".to_owned(), true, None),
             ("droid:droid-archived".to_owned(), true, None),
             ("pi:pi-archived".to_owned(), true, None),
         ]
@@ -181,6 +213,7 @@ fn mixed_ringleader_archive_attributes_each_transcript_to_its_agent() {
     );
     for (agent, id) in [
         ("codex", "codex-archived"),
+        ("cursor", "cursor-archived"),
         ("droid", "droid-archived"),
         ("pi", "pi-archived"),
     ] {
@@ -201,6 +234,11 @@ fn mixed_ringleader_archive_attributes_each_transcript_to_its_agent() {
     }
     let droid = fixture.json(&["entries", "droid:droid-archived"], 0);
     assert_eq!(droid["data"]["entries"][0]["automated"], true);
+    let cursor = fixture.json(&["sessions", "--cursor"], 0);
+    let session = &cursor["data"]["sessions"][0];
+    assert_eq!(session["title"], "Archived cursor title");
+    assert_eq!(session["cwd"], "/fixture/cursor-project");
+    assert_eq!(session["archived"], true);
 }
 
 #[test]
@@ -249,7 +287,7 @@ fn agent_like_archive_files_no_reader_claims_are_diagnosed() {
             json!({"type":"user","message":"Claude-looking record after a foreign one"}),
         ],
     );
-    let listed = fixture.json(&args("sessions", &JSONL_AGENTS), 1);
+    let listed = fixture.json(&args("sessions", &FILE_AGENTS), 1);
     assert_eq!(listed["data"]["count"], 0);
     let mut diagnostics: Vec<_> = listed["diagnostics"]
         .as_array()
@@ -312,27 +350,163 @@ fn warm_index_reuses_archived_sessions_and_droid_sidecar_invalidates() {
     let fixture = Fixture::new();
     mixed_archive(&fixture);
     fs::remove_file(fixture.archive().join("unrecognized.jsonl")).unwrap();
-    let first = fixture.json(&args("index", &JSONL_AGENTS), 0);
-    assert_eq!(first["data"]["reparsed"], 5);
-    let warm = fixture.json(&args("index", &JSONL_AGENTS), 0);
-    assert_eq!(warm["data"]["reused"], 5);
+    let first = fixture.json(&args("index", &FILE_AGENTS), 0);
+    assert_eq!(first["data"]["reparsed"], 6);
+    let warm = fixture.json(&args("index", &FILE_AGENTS), 0);
+    assert_eq!(warm["data"]["reused"], 6);
     assert_eq!(warm["data"]["reparsed"], 0);
     fs::write(
         fixture.archive().join("droid-archived.settings.json"),
         r#"{"tags":[]}"#,
     )
     .unwrap();
-    let changed = fixture.json(&args("index", &JSONL_AGENTS), 0);
+    let changed = fixture.json(&args("index", &FILE_AGENTS), 0);
     assert_eq!(changed["data"]["reparsed"], 1);
-    assert_eq!(changed["data"]["reused"], 4);
+    assert_eq!(changed["data"]["reused"], 5);
     let droid = fixture.json(&["entries", "droid:droid-archived"], 0);
     assert_eq!(droid["data"]["entries"][0]["automated"], false);
 }
 
 #[test]
+fn archived_cursor_chat_metadata_and_store_invalidate_their_session() {
+    let fixture = Fixture::new();
+    mixed_archive(&fixture);
+    let chat = fixture.archive().join("cursor-archived");
+    assert_eq!(
+        fixture.json(&["index", "--cursor"], 0)["data"]["reparsed"],
+        1
+    );
+    assert_eq!(fixture.json(&["index", "--cursor"], 0)["data"]["reused"], 1);
+    fs::write(
+        chat.join("meta.json"),
+        json!({"title":"Renamed","cwd":"/fixture/cursor-project"}).to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        fixture.json(&["index", "--cursor"], 0)["data"]["reparsed"],
+        1
+    );
+    let listed = fixture.json(&["sessions", "--cursor"], 0);
+    assert_eq!(listed["data"]["sessions"][0]["title"], "Renamed");
+    rusqlite::Connection::open(chat.join("store.db"))
+        .unwrap()
+        .execute("UPDATE meta SET value='7b7d'", [])
+        .unwrap();
+    assert_eq!(
+        fixture.json(&["index", "--cursor"], 0)["data"]["reparsed"],
+        1
+    );
+}
+
+#[test]
+fn archived_cursor_without_chat_directory_reports_missing_metadata() {
+    let fixture = Fixture::new();
+    let archive = fixture.archive();
+    cursor_transcript(&archive.join("no-chat.jsonl"), "needle-no-chat");
+    cursor_transcript(&archive.join("claude-like.jsonl"), "needle-claude-like");
+    fs::create_dir_all(archive.join("claude-like/tool-results")).unwrap();
+    fs::write(
+        archive.join("claude-like/tool-results/result.txt"),
+        "payload",
+    )
+    .unwrap();
+    let listed = fixture.json(&["sessions", "--cursor"], 1);
+    assert_eq!(
+        refs(&listed),
+        [
+            ("cursor:claude-like".to_owned(), true, None),
+            ("cursor:no-chat".to_owned(), true, None),
+        ]
+    );
+    assert!(
+        listed["data"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["cwd"].is_null())
+    );
+    let mut diagnostics: Vec<_> = listed["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            (
+                d["code"].as_str().unwrap().to_owned(),
+                Path::new(d["source"].as_str().unwrap())
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        })
+        .collect();
+    diagnostics.sort();
+    let expected = |name: &str| ("metadata_unavailable".to_owned(), name.to_owned());
+    assert_eq!(
+        diagnostics,
+        [
+            expected("claude-like.jsonl"),
+            expected("claude-like.jsonl"),
+            expected("no-chat.jsonl"),
+            expected("no-chat.jsonl"),
+        ]
+    );
+    let found = fixture.json(&["search", "needle-no-chat", "--cursor"], 1);
+    assert_eq!(found["data"]["results"][0]["ref"], "cursor:no-chat");
+}
+
+#[test]
+fn cursor_chat_directory_and_claude_companion_stay_with_their_own_transcripts() {
+    let fixture = Fixture::new();
+    mixed_archive(&fixture);
+    fs::remove_file(fixture.archive().join("unrecognized.jsonl")).unwrap();
+    let claude = fixture.json(&["sessions", "--claude"], 0);
+    let session = claude["data"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["ref"] == "claude:claude-archived")
+        .unwrap();
+    assert_eq!(session["cwd"], "/fixture/project");
+    assert_eq!(refs(&claude).len(), 2);
+    let cursor = fixture.json(&["sessions", "--cursor"], 0);
+    assert_eq!(
+        refs(&cursor),
+        [("cursor:cursor-archived".to_owned(), true, None)]
+    );
+}
+
+#[test]
+fn live_cursor_session_wins_over_its_archived_copy() {
+    let fixture = Fixture::new();
+    mixed_archive(&fixture);
+    let live = fixture
+        .root()
+        .join(".cursor/projects/slug/agent-transcripts/cursor-archived/cursor-archived.jsonl");
+    cursor_transcript(&live, "needle-live");
+    fs::File::open(&live)
+        .unwrap()
+        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(10))
+        .unwrap();
+    let chat = fixture.root().join(".cursor/chats/hash/cursor-archived");
+    fs::create_dir_all(&chat).unwrap();
+    fs::write(
+        chat.join("meta.json"),
+        json!({"title":"Live title","cwd":"/fixture/live"}).to_string(),
+    )
+    .unwrap();
+    let listed = fixture.json(&["sessions", "--cursor"], 0);
+    assert_eq!(
+        refs(&listed),
+        [("cursor:cursor-archived".to_owned(), false, None)]
+    );
+    assert_eq!(listed["data"]["sessions"][0]["title"], "Live title");
+}
+
+#[test]
 fn missing_ringleader_archive_is_a_complete_result() {
     let fixture = Fixture::new();
-    let listed = fixture.json(&args("sessions", &JSONL_AGENTS), 0);
+    let listed = fixture.json(&args("sessions", &FILE_AGENTS), 0);
     assert_eq!(listed["incomplete"], false);
     assert_eq!(listed["data"]["count"], 0);
 }

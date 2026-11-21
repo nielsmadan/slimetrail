@@ -61,7 +61,7 @@ pub(crate) fn registry_in(ctx: &Context, staging: &std::path::Path) -> Vec<Box<d
     vec![
         Box::new(claude::Claude::new(ctx)),
         Box::new(codex::Codex::new(ctx)),
-        Box::new(cursor::Cursor::with_staging(staging)),
+        Box::new(cursor::Cursor::with_staging(ctx, staging)),
         Box::new(devin::Devin::with_staging(staging)),
         Box::new(droid::Droid::new(ctx)),
         Box::new(pi::Pi::new(ctx)),
