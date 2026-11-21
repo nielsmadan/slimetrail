@@ -6,15 +6,15 @@ Compatibility is checked with synthetic normalized-entry and query goldens gener
 
 | Agent | Supported data | Boundaries |
 | --- | --- | --- |
-| Claude Code | Project JSONL, messages/tools/metadata, child sessions and recognized Claude ringleader archive records | Mixed-archive foreign formats are not treated as Claude; no store mutations |
-| Codex | Session/rollout JSONL, native archived sessions, header identity, title index, message/tool/reasoning records | Child ID is distinct from parent `session_id`; structured tool payload rendering differs from Python repr |
+| Claude Code | Project JSONL, messages/tools/metadata, child sessions and recognized Claude ringleader archive records | Other agents' archived transcripts go to their own readers, never to Claude; no store mutations |
+| Codex | Session/rollout JSONL, native archived sessions, ringleader-archived rollouts, header identity, title index, message/tool/reasoning records | Child ID is distinct from parent `session_id`; structured tool payload rendering differs from Python repr |
 | Cursor | JSONL under `agent-transcripts`, companion `meta.json`, private chat `store.db` metadata | Legacy role-delimited `.txt` transcripts produce incomplete diagnostics; protobuf message blobs are not decoded; missing tool output is not reconstructed |
 | Devin | CLI `sessions.db` (`sessions`, `message_nodes`, `subagent_heads`): the live chain from `main_chain_id`, history moved off it by compaction, subagent chains as child sessions `devin:ID/AGENT` | System prompt, rules and skill-listing nodes are not indexed; reverted turns and superseded node copies are excluded; `/fork` copies are independent sessions without `parent_ref`, so shared history matches in both and its human prompts count in both sessions' timeline spans; end-of-session ATIF `transcripts/`, Devin Desktop `cli-next/` and `DEVIN_SESSION_STORE=files` are not read |
-| Droid | Session JSONL and companion settings metadata | Automation/exec settings affect human prompt accounting and fingerprints |
+| Droid | Session JSONL and companion settings metadata, live or ringleader-archived with the settings beside the transcript | Automation/exec settings affect human prompt accounting and fingerprints |
 | OpenCode | SQLite session/message/part schema, optional parent/archive fields and project cwd fallback | Legacy file-only storage is diagnosed unsupported; unsupported schema or unstable snapshot produces incomplete coverage |
-| Pi | Session JSONL with canonical header ID, messages, tools and metadata | Filename guesses cannot replace a known header identity |
+| Pi | Session JSONL, live or ringleader-archived, with canonical header ID, messages, tools and metadata | Filename guesses cannot replace a known header identity |
 
-Required selected stores that are missing or unreadable are incomplete. The optional ringleader archive may be absent normally. Cursor metadata failures are explicit; cwd is never reconstructed from a lossy project slug. A subagent marker can mark entries automated without supplying a reliable `parent_ref`. Unknown records with meaningful searchable content can normalize to metadata; records without searchable content may be ignored. Stable malformed records preserve usable entries with diagnostics; repeated source churn excludes stale entries.
+Required selected stores that are missing or unreadable are incomplete. The optional ringleader archive may be absent normally. Each archived transcript is attributed to an agent only by a positive format marker; one no reader recognizes is diagnosed `archive_format_unknown` when Claude is selected. Cursor metadata failures are explicit; cwd is never reconstructed from a lossy project slug. A subagent marker can mark entries automated without supplying a reliable `parent_ref`. Unknown records with meaningful searchable content can normalize to metadata; records without searchable content may be ignored. Stable malformed records preserve usable entries with diagnostics; repeated source churn excludes stale entries.
 
 Store root and environment precedence is in the [README](../README.md#stores-and-index). Tests override Codex's home as well as its sessions directory so native archive lookup cannot escape to real stores. Stored cwd paths are expected to be absolute; a nonstandard stored `~` is not expanded. CLI `--cwd ~` is expanded from captured HOME.
 
@@ -44,7 +44,7 @@ Daily totals merge overlapping spans across all included sessions and split at c
 2. The public output is a versioned CLI JSON envelope with explicit DTOs. Python consumers use subprocess JSON; importing the reference module is not the integration model.
 3. All selected-source failures return incomplete coverage with exit 1, even when no usable sources remain. Fatal usage/index/runtime failures return 2. This replaces the script's differing all-agent and explicit-selector failure exits.
 4. Non-string Codex tool arguments/results render as deterministic insertion-order JSON, not Python `repr`; existing string payloads remain strings.
-5. Only recognized Claude records from the mixed ringleader archive are included there; foreign agent archive routing is deferred. Native Codex archives are supported.
+5. The mixed ringleader archive is routed by format: Claude, Codex, Droid and Pi transcripts are read as archived sessions of their own agent. Native Codex archives are also supported.
 6. Cursor legacy text and OpenCode legacy file storage are explicitly unsupported/incomplete. No guessed Cursor protobuf decoder or synthetic tool-output reconstruction is included.
 7. Native `thinking`/`reasoning` content blocks become metadata with subtype `reasoning`. Content arrays retain adjacent message/reasoning/tool runs in source order, rather than flattening reasoning into messages and collecting tools separately. This changes emitted-item ordinals for mixed blocks; lite reads exclude reasoning and meta-only searches score it at weight 2.
 

@@ -16,6 +16,7 @@ use std::{
 pub struct FileReader {
     agent: Agent,
     archives: Vec<PathBuf>,
+    shared: Option<PathBuf>,
     names: Option<PathBuf>,
     titles: RefCell<Option<(Fingerprint, Arc<Titles>)>>,
 }
@@ -277,28 +278,36 @@ fn fallback_id(agent: Agent, path: &Path) -> String {
     }
 }
 
-enum ArchiveKind {
-    Claude,
-    Other,
+pub(crate) enum ArchiveKind {
+    Agent(Agent),
     Unknown,
 }
 
-fn archive_kind(path: &Path) -> Result<ArchiveKind> {
+pub(crate) fn archive_kind(path: &Path) -> Result<ArchiveKind> {
     let mut found = ArchiveKind::Unknown;
     records(path, &mut |_, record| {
         let kind = record["type"].as_str().unwrap_or("");
+        let agent = match kind {
+            "session_meta" if record["payload"].is_object() => Some(Agent::Codex),
+            "session_start" => Some(Agent::Droid),
+            "session" => Some(Agent::Pi),
+            _ => None,
+        };
+        if let Some(agent) = agent {
+            found = ArchiveKind::Agent(agent);
+            return Ok(false);
+        }
         if matches!(kind, "session_meta" | "session_start" | "session")
             || (kind == "message" && record["message"]["role"].is_string())
             || record["role"].is_string()
         {
-            found = ArchiveKind::Other;
             return Ok(false);
         }
         if matches!(kind, "custom-title" | "ai-title")
             || (matches!(kind, "user" | "assistant")
                 && (record["message"].is_object() || record["message"].is_string()))
         {
-            found = ArchiveKind::Claude;
+            found = ArchiveKind::Agent(Agent::Claude);
             return Ok(false);
         }
         Ok(true)
@@ -308,14 +317,16 @@ fn archive_kind(path: &Path) -> Result<ArchiveKind> {
 
 impl FileReader {
     pub fn new(agent: Agent, ctx: &Context) -> Self {
-        let archives = match agent {
-            Agent::Claude => ctx.roots.archive.iter().cloned().collect(),
+        let shared = ctx.roots.archive.clone();
+        let mut archives = match agent {
             Agent::Codex => vec![ctx.roots.codex_archived_sessions.clone()],
             _ => Vec::new(),
         };
+        archives.extend(shared.iter().cloned());
         Self {
             agent,
             archives,
+            shared,
             names: (agent == Agent::Codex).then(|| ctx.roots.codex_session_index.clone()),
             titles: RefCell::new(None),
         }
@@ -388,14 +399,11 @@ impl FileReader {
                 .by_source
                 .get(&source)
                 .filter(|c| c.fingerprint == fingerprint && c.key.agent == self.agent);
-            if self.agent == Agent::Claude
-                && self.archives.iter().any(|a| path.starts_with(a))
-                && cached.is_none()
-            {
+            if self.shared.as_ref().is_some_and(|a| path.starts_with(a)) && cached.is_none() {
+                let owner = self.agent == Agent::Claude;
                 match archive_kind(&path) {
-                    Ok(ArchiveKind::Claude) => {}
-                    Ok(ArchiveKind::Other) => continue,
-                    Ok(ArchiveKind::Unknown) => {
+                    Ok(ArchiveKind::Agent(agent)) if agent == self.agent => {}
+                    Ok(ArchiveKind::Unknown) if owner => {
                         diagnostics.push(diagnostic(
                             self.agent,
                             &path,
@@ -404,7 +412,7 @@ impl FileReader {
                         ));
                         continue;
                     }
-                    Err(_) => {
+                    Err(_) if owner => {
                         diagnostics.push(diagnostic(
                             self.agent,
                             &path,
@@ -413,6 +421,7 @@ impl FileReader {
                         ));
                         continue;
                     }
+                    _ => continue,
                 }
             }
             let result: Result<(i128, RawSession)> = (|| {
