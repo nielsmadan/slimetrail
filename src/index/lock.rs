@@ -1,6 +1,7 @@
 use crate::{Context, Error, Result};
 use sha2::{Digest, Sha256};
 use std::{
+    fmt::Write as _,
     fs::{self, File, OpenOptions},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
@@ -55,6 +56,15 @@ fn canonical_path(path: &Path, cwd: &Path, source: bool) -> Result<PathBuf> {
     Ok(resolved)
 }
 
+fn hex_digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::new(), |mut hex, b| {
+            let _ = write!(hex, "{b:02x}");
+            hex
+        })
+}
+
 pub(super) fn namespace(ctx: &Context) -> Result<(String, String)> {
     let mut roots = serde_json::to_value(&ctx.roots)?;
     for value in roots
@@ -67,7 +77,7 @@ pub(super) fn namespace(ctx: &Context) -> Result<(String, String)> {
         }
     }
     let encoded = serde_json::to_string(&roots)?;
-    Ok((format!("{:x}", Sha256::digest(encoded.as_bytes())), encoded))
+    Ok((hex_digest(encoded.as_bytes()), encoded))
 }
 
 pub(super) fn check_file(path: &Path) -> Result<bool> {
@@ -211,4 +221,17 @@ pub(super) fn cleanup(staging: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hex_digest;
+
+    #[test]
+    fn hex_digest_is_lowercase_sha256_hex() {
+        assert_eq!(
+            hex_digest(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 }
