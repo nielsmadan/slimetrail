@@ -1,10 +1,10 @@
 {
   "name": "Slimetrail",
   "branch": "main",
-  "components": 3,
+  "version_parts": 3,
   "initial_version": "0.1.0",
   "sign": true,
-  "checks": [["just", "check-all"]],
+  "preflight": [["just", "check-all"]],
   "tools": ["git", "python3", "just", "cargo"],
   "stages": [
     {
@@ -15,5 +15,5 @@
   ],
   "repository": "nielsmadan/slimetrail",
   "workflow": "release.yml",
-  "publication": "GitHub Actions will publish macOS/Linux binaries, SHA256SUMS and build provenance"
+  "success_message": "GitHub Actions will publish macOS/Linux binaries, SHA256SUMS and build provenance"
 }

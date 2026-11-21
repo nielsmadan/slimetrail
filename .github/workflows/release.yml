@@ -18,7 +18,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: nielsmadan/curtaincall@8362e71ffa86422960d7e356f620085bcc62f925 # v1.3.0
+      - uses: nielsmadan/curtaincall@ce208fe4317ffda4315c37d2c2f942782966e867 # v2.0.1
       - name: Validate annotated tag and ancestry
         run: curtains ci validate-tag "$RELEASE_TAG" "$GITHUB_SHA"
       - uses: ./.github/actions/setup
@@ -88,7 +88,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: nielsmadan/curtaincall@8362e71ffa86422960d7e356f620085bcc62f925 # v1.3.0
+      - uses: nielsmadan/curtaincall@ce208fe4317ffda4315c37d2c2f942782966e867 # v2.0.1
       - name: Revalidate tag
         run: |
           RELEASE_COMMIT=$(curtains ci validate-tag "$RELEASE_TAG" "$GITHUB_SHA")
