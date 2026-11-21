@@ -13,7 +13,7 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 jiff = { version = "0.2", features = ["serde"] }
 tempfile = "3"
 rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
