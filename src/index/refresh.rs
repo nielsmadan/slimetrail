@@ -206,13 +206,14 @@ fn run_sources(
                 let empty = DiscoveryCache {
                     by_source: BTreeMap::new(),
                 };
-                if let Ok(discovery) = source.discover(&index.context, &empty)
-                    && let Some(replacement) = discovery
+                if let Ok(mut discovery) = source.discover(&index.context, &empty)
+                    && let Some(found) = discovery
                         .sessions
-                        .into_iter()
-                        .find(|s| s.source == raw.source)
+                        .iter()
+                        .position(|s| s.source == raw.source)
+                        .or_else(|| discovery.sessions.iter().position(|s| s.key == raw.key))
                 {
-                    raw = replacement;
+                    raw = discovery.sessions.swap_remove(found);
                     outcome = ingest(index, source.as_ref(), &raw, generation)?;
                 }
             }
@@ -319,6 +320,68 @@ mod tests {
                 Ok(parsed)
             }
         }
+    }
+
+    struct HookedSource {
+        reader: Box<dyn Source>,
+        hook: Box<dyn Fn()>,
+        calls: Rc<Cell<usize>>,
+    }
+
+    impl Source for HookedSource {
+        fn agent(&self) -> Agent {
+            self.reader.agent()
+        }
+        fn discover(&self, ctx: &Context, previous: &DiscoveryCache) -> Result<Discovery> {
+            self.reader.discover(ctx, previous)
+        }
+        fn parse(
+            &self,
+            raw: &RawSession,
+            emit: &mut dyn FnMut(Entry) -> Result<()>,
+        ) -> Result<ParsedSession> {
+            let parsed = self.reader.parse(raw, emit)?;
+            self.calls.set(self.calls.get() + 1);
+            if self.calls.get() == 1 {
+                (self.hook)();
+            }
+            Ok(parsed)
+        }
+    }
+
+    fn rollout(text: &str) -> String {
+        [
+            serde_json::json!({"type":"session_meta","payload":{"id":"stable","source":"cli"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":text}}),
+        ]
+        .iter()
+        .map(|r| r.to_string() + "\n")
+        .collect()
+    }
+
+    fn retry(ctx: &Context, hook: Box<dyn Fn()>) -> (IndexSession, Envelope<IndexStats>) {
+        let agents = BTreeSet::from([Agent::Codex]);
+        let mut index = IndexSession::open(ctx).unwrap();
+        let calls = Rc::new(Cell::new(0));
+        let reader = HookedSource {
+            reader: sources::source_for(ctx, Agent::Codex).unwrap(),
+            hook,
+            calls: Rc::clone(&calls),
+        };
+        let result = run_sources(&mut index, &agents, vec![Box::new(reader)]).unwrap();
+        assert_eq!(calls.get(), 2);
+        (index, result)
+    }
+
+    fn texts(index: &IndexSession, key: &SessionKey) -> Vec<String> {
+        let mut texts = Vec::new();
+        index
+            .visit_entries(key, &mut |e| {
+                texts.push(e.text);
+                Ok(())
+            })
+            .unwrap();
+        texts
     }
 
     fn write(path: &Path, text: &str) {
@@ -428,5 +491,84 @@ mod tests {
                 .is_none()
         );
         index.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn compressed_rollout_decompressed_mid_refresh_retries_at_the_plain_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let plain = ctx
+            .roots
+            .codex_sessions
+            .join("2026/11/01/rollout-stable.jsonl");
+        let zst = plain.with_extension("jsonl.zst");
+        fs::create_dir_all(plain.parent().unwrap()).unwrap();
+        fs::write(
+            &zst,
+            ruzstd::encoding::compress_to_vec(
+                rollout("compressed text").as_bytes(),
+                ruzstd::encoding::CompressionLevel::Fastest,
+            ),
+        )
+        .unwrap();
+        let (swap_plain, swap_zst) = (plain.clone(), zst);
+        let (mut index, result) = retry(
+            &ctx,
+            Box::new(move || {
+                fs::write(&swap_plain, rollout("compressed text")).unwrap();
+                fs::remove_file(&swap_zst).unwrap();
+            }),
+        );
+        let codes: Vec<_> = result.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert_eq!(codes, ["source_changed"]);
+        assert_eq!(result.data.unwrap().failed, 0);
+        let key = SessionKey {
+            agent: Agent::Codex,
+            id: "stable".into(),
+        };
+        let session = index.session(&key).unwrap().unwrap();
+        assert_eq!(session.source, plain.to_string_lossy());
+        assert_eq!(texts(&index, &key), ["compressed text"]);
+        let count: i64 = index
+            .connection
+            .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let agents = BTreeSet::from([Agent::Codex]);
+        assert!(!index.refresh_under_lease(&agents).unwrap().incomplete);
+        index.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn moved_source_retries_at_the_live_copy_of_its_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let first = ctx.roots.codex_sessions.join("rollout-first.jsonl");
+        let moved = ctx.roots.codex_sessions.join("rollout-moved.jsonl");
+        let archived = ctx
+            .roots
+            .codex_archived_sessions
+            .join("rollout-archived.jsonl");
+        fs::create_dir_all(&ctx.roots.codex_sessions).unwrap();
+        fs::create_dir_all(&ctx.roots.codex_archived_sessions).unwrap();
+        fs::write(&first, rollout("live text")).unwrap();
+        let (from, to, copy) = (first, moved.clone(), archived);
+        let (index, result) = retry(
+            &ctx,
+            Box::new(move || {
+                fs::rename(&from, &to).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                fs::write(&copy, rollout("archived text")).unwrap();
+            }),
+        );
+        assert_eq!(result.data.unwrap().failed, 0);
+        let key = SessionKey {
+            agent: Agent::Codex,
+            id: "stable".into(),
+        };
+        let session = index.session(&key).unwrap().unwrap();
+        assert_eq!(session.source, moved.to_string_lossy());
+        assert!(!session.archived);
+        assert_eq!(texts(&index, &key), ["live text"]);
     }
 }

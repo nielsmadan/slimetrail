@@ -52,7 +52,7 @@ Environment precedence is highest first; empty strings are ignored, and Cursor o
 | Store | Root precedence |
 | --- | --- |
 | Claude projects | `SESSION_TRACKER_PROJECTS_DIR` → `CLAUDE_CONFIG_DIR/projects` → `~/.claude/projects` |
-| Codex sessions | `CODEX_SESSIONS_DIR` → `CODEX_HOME/sessions` → `~/.codex/sessions` |
+| Codex sessions | `CODEX_SESSIONS_DIR` → `CODEX_HOME/sessions` → `~/.codex/sessions`; plain `.jsonl` and compressed `.jsonl.zst` rollouts |
 | Codex native archive | `CODEX_HOME/archived_sessions` → `~/.codex/archived_sessions` |
 | Codex title index | Sibling `session_index.jsonl` of `CODEX_SESSIONS_DIR` when set; otherwise `CODEX_HOME/session_index.jsonl` → `~/.codex/session_index.jsonl` |
 | Cursor transcripts | `CURSOR_DATA_DIR/projects` → `~/.cursor/projects` |

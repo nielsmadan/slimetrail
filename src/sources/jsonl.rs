@@ -2,12 +2,16 @@ use crate::{
     Agent, Context, Diagnostic, Discovery, DiscoveryCache, Entry, Error, Fingerprint, Kind,
     ParsedSession, RawSession, Result, Session, SessionKey, TitleOrigin,
 };
+use ruzstd::decoding::{
+    BlockDecodingStrategy, FrameDecoder,
+    errors::{FrameDecoderError, ReadFrameHeaderError},
+};
 use serde_json::Value;
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -104,7 +108,23 @@ pub fn diagnostic(agent: Agent, path: &Path, code: &str, message: &str) -> Diagn
     }
 }
 
-fn walk(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+fn compressed(path: &Path) -> bool {
+    path.extension().is_some_and(|x| x == "zst")
+        && path
+            .file_stem()
+            .is_some_and(|s| Path::new(s).extension().is_some_and(|x| x == "jsonl"))
+}
+
+fn readable(path: PathBuf) -> PathBuf {
+    let plain = path.with_extension("");
+    if compressed(&path) && fs::symlink_metadata(&plain).is_ok_and(|m| m.is_file()) {
+        plain
+    } else {
+        path
+    }
+}
+
+fn walk(root: &Path, files: &mut Vec<PathBuf>, zst: bool) -> Result<()> {
     let metadata = fs::symlink_metadata(root).map_err(|e| io(root, e))?;
     if metadata.file_type().is_symlink() {
         return Err(Error::InvalidArgument("source root is a symlink".into()));
@@ -116,7 +136,10 @@ fn walk(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
             let ty = entry.file_type().map_err(|e| io(&entry.path(), e))?;
             if ty.is_dir() {
                 directories.push(entry.path());
-            } else if ty.is_file() && entry.path().extension().is_some_and(|x| x == "jsonl") {
+            } else if ty.is_file()
+                && (entry.path().extension().is_some_and(|x| x == "jsonl")
+                    || (zst && compressed(&entry.path())))
+            {
                 files.push(entry.path());
             }
         }
@@ -131,8 +154,16 @@ pub fn records(path: &Path, visit: &mut dyn FnMut(u64, &Value) -> Result<bool>) 
             "transcript must be a regular file".into(),
         ));
     }
-    let file = File::open(path).map_err(|e| io(path, e))?;
-    let mut reader = BufReader::new(file);
+    let file = BufReader::new(File::open(path).map_err(|e| io(path, e))?);
+    let mut reader: Box<dyn BufRead> = if compressed(path) {
+        Box::new(BufReader::new(Frames {
+            source: file,
+            decoder: FrameDecoder::new(),
+            active: false,
+        }))
+    } else {
+        Box::new(file)
+    };
     let mut bytes = Vec::new();
     let mut line = 0;
     let mut malformed = 0;
@@ -159,6 +190,50 @@ pub fn records(path: &Path, visit: &mut dyn FnMut(u64, &Value) -> Result<bool>) 
         }
     }
     Ok(malformed)
+}
+
+struct Frames<R> {
+    source: R,
+    decoder: FrameDecoder,
+    active: bool,
+}
+
+impl<R: BufRead> Read for Frames<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.active {
+                while self.decoder.can_collect() == 0 && !self.decoder.is_finished() {
+                    self.decoder
+                        .decode_blocks(&mut self.source, BlockDecodingStrategy::UptoBlocks(1))
+                        .map_err(std::io::Error::other)?;
+                }
+                let read = self.decoder.read(buf)?;
+                if read > 0 || buf.is_empty() {
+                    return Ok(read);
+                }
+                self.active = false;
+            }
+            if self.source.fill_buf()?.is_empty() {
+                return Ok(0);
+            }
+            match self.decoder.reset(&mut self.source) {
+                Ok(()) => self.active = true,
+                Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame {
+                    length,
+                    ..
+                })) => {
+                    let skipped = std::io::copy(
+                        &mut (&mut self.source).take(length.into()),
+                        &mut std::io::sink(),
+                    )?;
+                    if skipped < u64::from(length) {
+                        return Err(std::io::ErrorKind::UnexpectedEof.into());
+                    }
+                }
+                Err(e) => return Err(std::io::Error::other(e)),
+            }
+        }
+    }
 }
 
 pub fn string(value: &Value, name: &str) -> Option<String> {
@@ -271,6 +346,8 @@ fn header(agent: Agent, path: &Path) -> Result<Header> {
 }
 
 fn fallback_id(agent: Agent, path: &Path) -> String {
+    let plain = path.with_extension("");
+    let path = if compressed(path) { &plain } else { path };
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
     if agent == Agent::Pi {
         stem.split_once('_')
@@ -355,7 +432,8 @@ impl FileReader {
         };
         let mut diagnostics = Vec::new();
         let mut files = Vec::new();
-        if walk(root, &mut files).is_err() {
+        let zst = self.agent == Agent::Codex;
+        if walk(root, &mut files, zst).is_err() {
             diagnostics.push(diagnostic(
                 self.agent,
                 root,
@@ -365,7 +443,7 @@ impl FileReader {
         }
         for archive in &self.archives {
             if fs::symlink_metadata(archive).is_ok_and(|m| m.is_dir()) {
-                if walk(archive, &mut files).is_err() {
+                if walk(archive, &mut files, zst).is_err() {
                     diagnostics.push(diagnostic(
                         self.agent,
                         archive,
@@ -385,6 +463,7 @@ impl FileReader {
                 ));
             }
         }
+        let mut files: Vec<_> = files.into_iter().map(readable).collect();
         files.sort();
         files.dedup();
         let mut chosen: BTreeMap<String, (bool, i128, RawSession)> = BTreeMap::new();
@@ -409,10 +488,11 @@ impl FileReader {
                 .get(&source)
                 .filter(|c| c.fingerprint == fingerprint && c.key.agent == self.agent);
             if self.shared.as_ref().is_some_and(|a| path.starts_with(a)) && cached.is_none() {
-                let owner = self.agent == Agent::Claude;
+                let zst = compressed(&path);
+                let owner = self.agent == if zst { Agent::Codex } else { Agent::Claude };
                 match archive_kind(&path) {
                     Ok(ArchiveKind::Agent(agent)) if agent == self.agent => {}
-                    Ok(ArchiveKind::Unknown) if owner => {
+                    Ok(kind) if owner && (zst || matches!(kind, ArchiveKind::Unknown)) => {
                         diagnostics.push(diagnostic(
                             self.agent,
                             &path,
