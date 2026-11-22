@@ -225,7 +225,9 @@ fn header(agent: Agent, path: &Path) -> Result<Header> {
                     });
                 header.cwd = string(payload, "cwd").map(PathBuf::from);
                 header.branch = string(&payload["git"], "branch");
-                header.automated = !payload["source"].is_null() && payload["source"] != "cli";
+                header.automated = !payload["source"].is_null()
+                    && payload["source"] != "cli"
+                    && payload["source"] != "vscode";
                 return Ok(false);
             }
             Agent::Droid if kind == "session_start" => {
