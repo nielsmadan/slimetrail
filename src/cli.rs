@@ -408,7 +408,7 @@ fn boundary(value: &str, until: bool, zone: &TimeZone) -> Result<i64> {
             .parse::<civil::DateTime>()
             .map_err(|_| Error::InvalidArgument("expected ISO date or datetime".into()))?
     };
-    zone.to_ambiguous_zoned(dt)
+    zone.to_ambiguous_zoned_datetime(dt)
         .unambiguous()
         .map(|z| z.timestamp().as_millisecond())
         .map_err(|_| {

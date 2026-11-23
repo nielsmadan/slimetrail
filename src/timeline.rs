@@ -124,11 +124,11 @@ fn daily<'a>(
     let mut totals = BTreeMap::new();
     for (mut cursor, end) in merged {
         while cursor < end {
-            let local = Instant::from_millisecond(cursor)?.to_zoned(zone.clone());
+            let local = Instant::from_millisecond(cursor)?.to_zoned_datetime(zone.clone());
             let next = local
                 .date()
                 .tomorrow()?
-                .to_zoned(zone.clone())?
+                .to_zoned_datetime(zone.clone())?
                 .start_of_day()?
                 .timestamp()
                 .as_millisecond();
