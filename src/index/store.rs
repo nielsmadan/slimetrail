@@ -88,9 +88,36 @@ pub(super) fn discovery_failed(
     namespace: &str,
     agent: Agent,
     diagnostics: &[Diagnostic],
+    seq: i64,
 ) -> Result<()> {
-    connection.execute("INSERT INTO refresh_runs(namespace,agent,generation,status,diagnostics) VALUES(?1,?2,0,'incomplete',?3) ON CONFLICT(namespace,agent) DO UPDATE SET status='incomplete',diagnostics=excluded.diagnostics", (namespace, agent.to_string(), encode(&diagnostics)?))?;
+    connection.execute("INSERT INTO refresh_runs(namespace,agent,generation,status,diagnostics,published,published_seq) VALUES(?1,?2,0,'incomplete',?3,0,?4) ON CONFLICT(namespace,agent) DO UPDATE SET status='incomplete',diagnostics=excluded.diagnostics,published_seq=excluded.published_seq", (namespace, agent.to_string(), encode(&diagnostics)?, seq))?;
     Ok(())
+}
+
+pub(super) fn begin_run(connection: &Connection) -> Result<i64> {
+    Ok(connection.query_row(
+        "UPDATE settings SET refresh_seq=refresh_seq+1 WHERE id=1 RETURNING refresh_seq",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+pub(super) fn published(
+    connection: &Connection,
+    namespace: &str,
+    agents: &BTreeSet<Agent>,
+    since: i64,
+) -> Result<Option<Vec<Diagnostic>>> {
+    let mut statement = connection.prepare("SELECT diagnostics FROM refresh_runs WHERE namespace=?1 AND agent=?2 AND published=generation AND published_seq>?3")?;
+    let mut diagnostics = Vec::new();
+    for agent in agents {
+        let mut rows = statement.query(params![namespace, agent.to_string(), since])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        diagnostics.extend(decode::<Vec<Diagnostic>>(&row.get::<_, String>(0)?)?);
+    }
+    Ok(Some(diagnostics))
 }
 
 pub(super) fn carry_forward(
@@ -100,7 +127,7 @@ pub(super) fn carry_forward(
     generation: i64,
     seen: &BTreeSet<String>,
 ) -> Result<()> {
-    connection.execute("UPDATE sources SET generation=?1 WHERE namespace=?2 AND agent=?3 AND status IN ('fresh','partial') AND generation<?1 AND source NOT IN (SELECT value FROM json_each(?4))", params![generation, namespace, agent.to_string(), encode(seen)?])?;
+    connection.execute("UPDATE sources SET generation=?1 WHERE namespace=?2 AND agent=?3 AND status IN ('fresh','partial') AND generation>=COALESCE((SELECT published FROM refresh_runs WHERE namespace=?2 AND agent=?3),0) AND source NOT IN (SELECT value FROM json_each(?4))", params![generation, namespace, agent.to_string(), encode(seen)?])?;
     Ok(())
 }
 
@@ -184,11 +211,15 @@ pub(super) fn session(
     Ok(())
 }
 
-const VISIBLE: &str = "JOIN sources s ON s.namespace=x.namespace AND s.agent=x.agent AND s.source=x.source JOIN refresh_runs r ON r.namespace=s.namespace AND r.agent=s.agent AND r.generation=s.generation WHERE x.namespace=?1 AND s.status IN ('fresh','partial')";
+const VISIBLE: &str = "JOIN sources s ON s.namespace=x.namespace AND s.agent=x.agent AND s.source=x.source JOIN refresh_runs r ON r.namespace=s.namespace AND r.agent=s.agent WHERE x.namespace=?1 AND s.status IN ('fresh','partial') AND s.generation>=COALESCE(r.published,0)";
 
 impl IndexSession {
+    fn readable(&self, agent: Agent) -> bool {
+        self.refreshed.contains(&agent) || self.stale.contains(&agent)
+    }
+
     fn ready(&self, agent: Agent) -> Result<()> {
-        if !self.refreshed.contains(&agent) {
+        if !self.readable(agent) {
             return Err(Error::InvalidArgument(
                 "selected agent must be refreshed under this index lease before querying".into(),
             ));
@@ -197,7 +228,7 @@ impl IndexSession {
     }
 
     pub fn visit_sessions(&self, emit: &mut dyn FnMut(Session) -> Result<()>) -> Result<()> {
-        if self.refreshed.is_empty() {
+        if self.refreshed.is_empty() && self.stale.is_empty() {
             return Err(Error::InvalidArgument(
                 "index must be refreshed under this lease before querying".into(),
             ));
@@ -207,7 +238,7 @@ impl IndexSession {
         let mut rows = statement.query([&self.namespace])?;
         while let Some(row) = rows.next()? {
             let session: Session = decode(&row.get::<_, String>(0)?)?;
-            if self.refreshed.contains(&session.key.agent) {
+            if self.readable(session.key.agent) {
                 emit(session)?;
             }
         }
@@ -289,7 +320,7 @@ impl IndexSession {
         literal_candidate: Option<(&str, bool)>,
         emit: &mut dyn FnMut(Document) -> Result<()>,
     ) -> Result<()> {
-        if self.refreshed.is_empty() {
+        if self.refreshed.is_empty() && self.stale.is_empty() {
             return Err(Error::InvalidArgument(
                 "index must be refreshed under this lease before querying".into(),
             ));
@@ -332,7 +363,7 @@ impl IndexSession {
         ])?;
         while let Some(row) = rows.next()? {
             let agent = row.get::<_, String>(0)?.parse()?;
-            if !self.refreshed.contains(&agent) {
+            if !self.readable(agent) {
                 continue;
             }
             let entry_index: Option<u64> = row.get(2)?;
@@ -358,20 +389,17 @@ impl IndexSession {
     }
 
     pub fn verify_integrity(&self) -> Result<()> {
-        let integrity: String = self
-            .connection
-            .query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
-        if integrity != "ok"
-            || self
-                .connection
-                .prepare("PRAGMA foreign_key_check")?
-                .exists([])?
-        {
+        let _lock = super::lock::writer(&self.context.index_dir, super::REFRESH_WAIT, false)?
+            .ok_or(Error::IndexBusy)?;
+        let connection =
+            super::schema::open(&self.context.index_dir, &self.namespace, &self.roots)?;
+        let integrity: String = connection.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        if integrity != "ok" || connection.prepare("PRAGMA foreign_key_check")?.exists([])? {
             return Err(Error::InvalidArgument(
                 "index integrity check failed".into(),
             ));
         }
-        self.connection.execute(
+        connection.execute(
             "INSERT INTO search_fts(search_fts,rank) VALUES('integrity-check',1)",
             [],
         )?;
@@ -638,15 +666,15 @@ mod tests {
     #[test]
     fn filtered_documents_and_timeline_do_not_hydrate_rejected_text() {
         let (_dir, index, keys) = fixture(2);
-        index
-            .connection
+        let writer =
+            Connection::open(index.context.index_dir.join(super::super::DATABASE)).unwrap();
+        writer
             .execute(
                 "UPDATE entries SET text=x'ff' WHERE id='other' OR entry_index=1",
                 [],
             )
             .unwrap();
-        index
-            .connection
+        writer
             .execute(
                 "UPDATE search_documents SET kind='tool' WHERE id='chosen' AND entry_index=1",
                 [],

@@ -159,73 +159,254 @@ pub(super) fn validate(ctx: &Context) -> Result<PathBuf> {
     Ok(index)
 }
 
+fn lock_file(path: &Path) -> Result<File> {
+    let existed = check_file(path)?;
+    if existed {
+        OpenOptions::new().read(true).write(true).open(path)
+    } else {
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                check_file(path)?;
+                OpenOptions::new().read(true).write(true).open(path)
+            }
+            result => result,
+        }
+    }
+    .map_err(|e| io(path, e))
+}
+
+enum Mode {
+    Exclusive,
+    Shared,
+}
+
+fn poll(file: &File, path: &Path, mode: &Mode, timeout: Duration) -> Result<bool> {
+    let started = Instant::now();
+    loop {
+        let attempt = match mode {
+            Mode::Exclusive => file.try_lock(),
+            Mode::Shared => file.try_lock_shared(),
+        };
+        match attempt {
+            Ok(()) => return Ok(true),
+            Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < timeout => {
+                std::thread::sleep(
+                    Duration::from_millis(10).min(timeout.saturating_sub(started.elapsed())),
+                );
+            }
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::fs::TryLockError::Error(e)) => return Err(io(path, e)),
+        }
+    }
+}
+
 pub(super) struct Lease {
     _file: File,
 }
 
 impl Lease {
-    pub(super) fn acquire(directory: &Path, timeout: Duration) -> Result<Self> {
+    pub(super) fn acquire(
+        directory: &Path,
+        timeout: Duration,
+        alone: impl FnOnce() -> Result<()>,
+    ) -> Result<Self> {
         let path = directory.join("lifecycle.lock");
-        let existed = check_file(&path)?;
-        let file = if existed {
-            OpenOptions::new().read(true).write(true).open(&path)
-        } else {
-            match OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
-            {
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    check_file(&path)?;
-                    OpenOptions::new().read(true).write(true).open(&path)
-                }
-                result => result,
-            }
+        let file = lock_file(&path)?;
+        if poll(&file, &path, &Mode::Exclusive, Duration::ZERO)? {
+            let cleaned = alone();
+            file.unlock().map_err(|e| io(&path, e))?;
+            cleaned?;
         }
-        .map_err(|e| io(&path, e))?;
-        let started = Instant::now();
-        loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(Self { _file: file }),
-                Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < timeout => {
-                    std::thread::sleep(
-                        Duration::from_millis(10).min(timeout.saturating_sub(started.elapsed())),
-                    );
-                }
-                Err(std::fs::TryLockError::WouldBlock) => return Err(Error::IndexBusy),
-                Err(std::fs::TryLockError::Error(e)) => return Err(io(&path, e)),
-            }
+        if poll(&file, &path, &Mode::Shared, timeout)? {
+            Ok(Self { _file: file })
+        } else {
+            Err(Error::IndexBusy)
         }
     }
 }
 
-pub(super) fn cleanup(staging: &Path) -> Result<()> {
-    directory(staging)?;
+pub(super) fn writer(directory: &Path, timeout: Duration, notice: bool) -> Result<Option<File>> {
+    let path = directory.join("writer.lock");
+    let file = lock_file(&path)?;
+    if poll(&file, &path, &Mode::Exclusive, Duration::ZERO)? {
+        return Ok(Some(file));
+    }
+    if notice {
+        eprintln!("waiting for another slimetrail refresh…");
+    }
+    Ok(poll(&file, &path, &Mode::Exclusive, timeout)?.then_some(file))
+}
+
+fn private_entry(path: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(path).map_err(|e| io(path, e))?;
+    if !meta.is_dir() || meta.permissions().mode() & 0o777 != 0o700 {
+        return Err(Error::InvalidArgument(
+            "unsafe index snapshot staging entry".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn remove_tree(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(io(path, e)),
+        _ => Ok(()),
+    }
+}
+
+fn entries(staging: &Path, prefix: &str) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
     for entry in fs::read_dir(staging).map_err(|e| io(staging, e))? {
         let entry = entry.map_err(|e| io(staging, e))?;
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with("slimetrail-snapshot-")
-        {
-            let path = entry.path();
-            let meta = fs::symlink_metadata(&path).map_err(|e| io(&path, e))?;
-            if !meta.is_dir() || meta.permissions().mode() & 0o777 != 0o700 {
-                return Err(Error::InvalidArgument(
-                    "unsafe index snapshot staging entry".into(),
-                ));
-            }
-            fs::remove_dir_all(&path).map_err(|e| io(&path, e))?;
+        if entry.file_name().to_string_lossy().starts_with(prefix) {
+            found.push(entry.path());
+        }
+    }
+    Ok(found)
+}
+
+pub(super) fn cleanup(staging: &Path) -> Result<()> {
+    directory(staging)?;
+    for prefix in ["slimetrail-snapshot-", "tmp-"] {
+        for path in entries(staging, prefix)? {
+            private_entry(&path)?;
+            remove_tree(&path)?;
         }
     }
     Ok(())
 }
 
+pub(super) fn sweep(staging: &Path, own: &Path) -> Result<()> {
+    sweep_listed(entries(staging, "proc-")?, own)
+}
+
+fn sweep_listed(listed: Vec<PathBuf>, own: &Path) -> Result<()> {
+    for path in listed {
+        if path == own {
+            continue;
+        }
+        match private_entry(&path) {
+            Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            other => other?,
+        }
+        let owner = path.join(OWNER);
+        let file = match check_file(&owner) {
+            Ok(true) => match OpenOptions::new().read(true).write(true).open(&owner) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(io(&owner, e)),
+            },
+            Ok(false) => continue,
+            Err(e) => return Err(e),
+        };
+        if poll(&file, &owner, &Mode::Exclusive, Duration::ZERO)? {
+            remove_tree(&path)?;
+        }
+    }
+    Ok(())
+}
+
+const OWNER: &str = "owner.lock";
+
+fn random() -> String {
+    use std::hash::BuildHasher;
+    let seed = (
+        std::process::id(),
+        Instant::now(),
+        std::thread::current().id(),
+    );
+    format!(
+        "{:016x}",
+        std::collections::hash_map::RandomState::new().hash_one(format!("{seed:?}"))
+    )
+}
+
+pub(super) struct Staging {
+    pub(super) path: PathBuf,
+    _owner: File,
+}
+
+impl Staging {
+    pub(super) fn create(staging: &Path) -> Result<Self> {
+        directory(staging)?;
+        let temporary = staging.join(format!("tmp-{}", random()));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&temporary)
+            .map_err(|e| io(&temporary, e))?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700))
+            .map_err(|e| io(&temporary, e))?;
+        let owner = temporary.join(OWNER);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&owner)
+            .map_err(|e| io(&owner, e))?;
+        if !poll(&file, &owner, &Mode::Exclusive, Duration::ZERO)? {
+            return Err(Error::InvalidArgument(
+                "new snapshot staging owner lock is already held".into(),
+            ));
+        }
+        let path = staging.join(format!("proc-{}-{}", std::process::id(), random()));
+        fs::rename(&temporary, &path).map_err(|e| io(&path, e))?;
+        Ok(Self { path, _owner: file })
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let Ok(entries) = fs::read_dir(&self.path) else {
+            return;
+        };
+        let only_owner = entries
+            .filter_map(std::result::Result::ok)
+            .all(|entry| entry.file_name() == OWNER);
+        if only_owner {
+            let _ = fs::remove_file(self.path.join(OWNER));
+            let _ = fs::remove_dir(&self.path);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::hex_digest;
+    use super::{hex_digest, sweep_listed};
+    use std::os::unix::fs::DirBuilderExt;
+
+    #[test]
+    fn sweep_skips_a_listed_directory_that_vanished() {
+        let root = std::env::temp_dir().join(format!("sweep-vanish-{}", super::random()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let gone = root.join("proc-1-gone");
+        let dead = root.join("proc-2-dead");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dead)
+            .unwrap();
+        std::fs::write(dead.join("owner.lock"), b"").unwrap();
+        std::fs::set_permissions(
+            dead.join("owner.lock"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        let own = root.join("proc-3-own");
+        sweep_listed(vec![gone, dead.clone()], &own).unwrap();
+        assert!(!dead.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn hex_digest_is_lowercase_sha256_hex() {

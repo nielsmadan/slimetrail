@@ -1,4 +1,4 @@
-use super::{IndexSession, store};
+use super::{IndexSession, REFRESH_WAIT, Writer, store};
 use crate::{
     Agent, Diagnostic, DiscoveryCache, Envelope, Error, IndexStats, RawSession, Result,
     sources::{self, Source},
@@ -66,7 +66,8 @@ enum Outcome {
 }
 
 fn ingest(
-    index: &mut IndexSession,
+    index: &IndexSession,
+    writer: &mut Writer,
     source: &dyn Source,
     raw: &RawSession,
     generation: i64,
@@ -78,7 +79,7 @@ fn ingest(
         },
         None => None,
     };
-    let transaction = index.connection.savepoint()?;
+    let transaction = writer.connection.savepoint()?;
     store::source(
         &transaction,
         &index.namespace,
@@ -160,21 +161,47 @@ fn ingest(
 pub(super) fn run(
     index: &mut IndexSession,
     agents: &BTreeSet<Agent>,
+    notice: bool,
 ) -> Result<Envelope<IndexStats>> {
-    let readers = sources::registry_in(&index.context, &index.staging);
-    run_sources(index, agents, readers)
+    let readers = sources::registry_in(&index.context, &index.staging.path);
+    run_noting(index, agents, readers, notice)
+}
+
+#[cfg(test)]
+fn run_sources(
+    index: &mut IndexSession,
+    agents: &BTreeSet<Agent>,
+    readers: Vec<Box<dyn Source>>,
+) -> Result<Envelope<IndexStats>> {
+    run_noting(index, agents, readers, false)
+}
+
+fn run_noting(
+    index: &mut IndexSession,
+    agents: &BTreeSet<Agent>,
+    readers: Vec<Box<dyn Source>>,
+    notice: bool,
+) -> Result<Envelope<IndexStats>> {
+    let mut writer = index
+        .writer(REFRESH_WAIT, notice)?
+        .ok_or(Error::IndexBusy)?;
+    let result = write(index, &mut writer, agents, readers)?;
+    index.publish(writer, false)?;
+    Ok(result)
 }
 
 #[expect(
     clippy::too_many_lines,
     reason = "Keep the transaction lifecycle visible"
 )]
-fn run_sources(
+pub(super) fn write(
     index: &mut IndexSession,
+    writer: &mut Writer,
     agents: &BTreeSet<Agent>,
     readers: Vec<Box<dyn Source>>,
 ) -> Result<Envelope<IndexStats>> {
     let started = Instant::now();
+    let seq = store::begin_run(&writer.connection)?;
     let mut stats = IndexStats {
         discovered: 0,
         reused: 0,
@@ -190,7 +217,7 @@ fn run_sources(
     for source in selected {
         let agent = source.agent();
         index.refreshed.remove(&agent);
-        let previous = store::cache(&index.connection, &index.namespace, agent)?;
+        let previous = store::cache(&writer.connection, &index.namespace, agent)?;
         let Ok(discovery) = source.discover(&index.context, &previous) else {
             let failed = [diagnostic(
                 agent,
@@ -198,12 +225,12 @@ fn run_sources(
                 "source_unavailable",
                 "Selected source could not be enumerated",
             )];
-            store::discovery_failed(&index.connection, &index.namespace, agent, &failed)?;
+            store::discovery_failed(&writer.connection, &index.namespace, agent, &failed, seq)?;
             diagnostics.extend(failed);
             index.refreshed.insert(agent);
             continue;
         };
-        let generation = store::next_generation(&index.connection, &index.namespace, agent)?;
+        let generation = store::next_generation(&writer.connection, &index.namespace, agent)?;
         let mut enumeration_complete =
             discovery.complete_agents.contains(&agent) && discovery.diagnostics.is_empty();
         let mut agent_diagnostics = discovery.diagnostics;
@@ -238,11 +265,11 @@ fn run_sources(
                     && cached.fingerprint == raw.fingerprint
             });
             if reusable {
-                index.connection.execute("UPDATE sources SET generation=?1 WHERE namespace=?2 AND agent=?3 AND source=?4 AND status='fresh'",params![generation,index.namespace,agent.to_string(),raw.source])?;
+                writer.connection.execute("UPDATE sources SET generation=?1 WHERE namespace=?2 AND agent=?3 AND source=?4 AND status='fresh'",params![generation,index.namespace,agent.to_string(),raw.source])?;
                 stats.reused += 1;
                 continue;
             }
-            let mut outcome = ingest(index, source.as_ref(), &raw, generation)?;
+            let mut outcome = ingest(index, writer, source.as_ref(), &raw, generation)?;
             if matches!(outcome, Outcome::Changed) {
                 enumeration_complete = false;
                 agent_diagnostics.push(diagnostic(
@@ -263,7 +290,7 @@ fn run_sources(
                 {
                     raw = discovery.sessions.swap_remove(found);
                     seen.insert(raw.source.clone());
-                    outcome = ingest(index, source.as_ref(), &raw, generation)?;
+                    outcome = ingest(index, writer, source.as_ref(), &raw, generation)?;
                 }
             }
             match outcome {
@@ -286,7 +313,7 @@ fn run_sources(
                         "Source could not be parsed consistently; previous entries are excluded",
                     );
                     store::source(
-                        &index.connection,
+                        &writer.connection,
                         &index.namespace,
                         &raw,
                         "failed",
@@ -297,7 +324,7 @@ fn run_sources(
                 }
             }
         }
-        let transaction = index.connection.transaction()?;
+        let transaction = writer.connection.transaction()?;
         if enumeration_complete {
             stats.removed += transaction.execute(
                 "DELETE FROM sources WHERE namespace=?1 AND agent=?2 AND generation<>?3",
@@ -308,10 +335,11 @@ fn run_sources(
         }
         let complete = enumeration_complete && agent_diagnostics.is_empty();
         transaction.execute(
-            "UPDATE refresh_runs SET status=?1,diagnostics=?2 WHERE namespace=?3 AND agent=?4",
+            "UPDATE refresh_runs SET status=?1,diagnostics=?2,published=generation,published_seq=?3 WHERE namespace=?4 AND agent=?5",
             params![
                 if complete { "complete" } else { "incomplete" },
                 store::encode(&agent_diagnostics)?,
+                seq,
                 index.namespace,
                 agent.to_string()
             ],
@@ -679,7 +707,7 @@ mod tests {
     }
 
     fn staged(index: &IndexSession, agent: Agent) -> Box<dyn Source> {
-        sources::registry_in(&index.context, &index.staging)
+        sources::registry_in(&index.context, &index.staging.path)
             .into_iter()
             .find(|s| s.agent() == agent)
             .unwrap()
@@ -978,5 +1006,133 @@ mod tests {
         let result = run_sources(&mut index, &agents, vec![Box::new(reader)]).unwrap();
         assert_eq!(codes(&result), ["duplicate_identity"]);
         assert_eq!(keys(&index), ["claude:one", "claude:three"]);
+    }
+
+    struct StallingSource {
+        reader: Box<dyn Source>,
+        calls: Cell<usize>,
+    }
+
+    impl Source for StallingSource {
+        fn agent(&self) -> Agent {
+            self.reader.agent()
+        }
+        fn discover(&self, ctx: &Context, previous: &DiscoveryCache) -> Result<Discovery> {
+            self.reader.discover(ctx, previous)
+        }
+        fn parse(
+            &self,
+            raw: &RawSession,
+            emit: &mut dyn FnMut(Entry) -> Result<()>,
+        ) -> Result<ParsedSession> {
+            let parsed = self.reader.parse(raw, emit)?;
+            self.calls.set(self.calls.get() + 1);
+            if self.calls.get() == 2 {
+                println!("STALLED {}", raw.key.id);
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                std::io::stdin().read_line(&mut String::new()).unwrap();
+            }
+            Ok(parsed)
+        }
+    }
+
+    struct Killed(std::process::Child);
+
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    #[ignore = "Subprocess worker invoked explicitly by killed_run_keeps_replaced_sources_visible"]
+    fn killed_run_worker() {
+        let Ok(base) = std::env::var("SLIMETRAIL_KILLED_RUN_BASE") else {
+            return;
+        };
+        let ctx = context(Path::new(&base));
+        let mut index = IndexSession::open(&ctx).unwrap();
+        let reader = StallingSource {
+            reader: sources::source_for(&ctx, Agent::Claude).unwrap(),
+            calls: Cell::new(0),
+        };
+        run_sources(
+            &mut index,
+            &BTreeSet::from([Agent::Claude]),
+            vec![Box::new(reader)],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn killed_run_keeps_replaced_sources_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let agents = BTreeSet::from([Agent::Claude]);
+        drop(two_sessions(&ctx));
+        for id in ["one", "two"] {
+            let path = ctx
+                .roots
+                .claude_projects
+                .join(format!("project/{id}.jsonl"));
+            write_session(&path, id, &format!("{id} replaced"));
+        }
+        let mut child = Killed(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "index::refresh::tests::killed_run_worker",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("SLIMETRAIL_KILLED_RUN_BASE", dir.path())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut output = std::io::BufReader::new(child.0.stdout.take().unwrap());
+        let stalled = loop {
+            let mut line = String::new();
+            assert_ne!(
+                std::io::BufRead::read_line(&mut output, &mut line).unwrap(),
+                0,
+                "worker exited before stalling"
+            );
+            if let Some(id) = line.trim().strip_prefix("STALLED ") {
+                break id.to_owned();
+            }
+        };
+        let replaced = if stalled == "one" { "two" } else { "one" };
+        let session = |id: &str| SessionKey {
+            agent: Agent::Claude,
+            id: id.into(),
+        };
+        let mut stale = IndexSession::open(&ctx).unwrap();
+        let result = stale
+            .prepare(&agents, std::time::Duration::from_millis(50))
+            .unwrap();
+        assert_eq!(codes(&result), ["refresh_in_progress"]);
+        assert_eq!(keys(&stale), ["claude:one", "claude:two"]);
+        assert_eq!(
+            texts(&stale, &session(replaced)),
+            [format!("{replaced} replaced")]
+        );
+        assert_eq!(
+            texts(&stale, &session(&stalled)),
+            [format!("{stalled} text")]
+        );
+        drop(stale);
+        drop(child);
+        let mut next = IndexSession::open(&ctx).unwrap();
+        let result = next.refresh_for_query(&agents).unwrap();
+        assert_eq!(codes(&result), [] as [&str; 0]);
+        let stats = result.data.unwrap();
+        assert_eq!((stats.reused, stats.reparsed), (1, 1));
+        for id in ["one", "two"] {
+            assert_eq!(texts(&next, &session(id)), [format!("{id} replaced")]);
+        }
+        next.verify_integrity().unwrap();
     }
 }

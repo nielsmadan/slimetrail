@@ -1,7 +1,7 @@
 use rusqlite::Connection;
 use serde_json::json;
 use slimetrail::{
-    index::{self, DATABASE, IndexSession},
+    index::{self, DATABASE, IndexSession, VERSION},
     *,
 };
 use std::{
@@ -284,32 +284,36 @@ fn permissions_symlinks_and_native_overlap_are_rejected_before_writes() {
 fn private_modes_and_exact_older_version_pruning() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
-    drop(IndexSession::open(&ctx).unwrap());
-    for name in [
+    index::refresh(&ctx, &selected(Agent::Claude)).unwrap();
+    let older = [
         "index-v0.sqlite3",
         "index-v0.sqlite3-wal",
-        "index-v3.sqlite3",
+        "index-v2.sqlite3",
+        "index-v2.sqlite3-wal",
+        "index-v2.sqlite3-shm",
+        "index-v2.sqlite3-journal",
+    ];
+    let kept = [
+        "index-v4.sqlite3",
         "index-v00.sqlite3",
         "index-v0.sqlite3.bak",
-    ] {
+    ];
+    for name in older.iter().chain(&kept) {
         let path = ctx.index_dir.join(name);
         fs::write(&path, "sentinel").unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
     drop(IndexSession::open(&ctx).unwrap());
-    assert!(!ctx.index_dir.join("index-v0.sqlite3").exists());
-    assert!(!ctx.index_dir.join("index-v0.sqlite3-wal").exists());
-    for name in [
-        "index-v3.sqlite3",
-        "index-v00.sqlite3",
-        "index-v0.sqlite3.bak",
-    ] {
+    for name in older {
+        assert!(!ctx.index_dir.join(name).exists(), "{name}");
+    }
+    for name in kept {
         assert_eq!(
             fs::read_to_string(ctx.index_dir.join(name)).unwrap(),
             "sentinel"
         );
     }
-    for name in [DATABASE, "lifecycle.lock"] {
+    for name in [DATABASE, "lifecycle.lock", "writer.lock"] {
         assert_eq!(
             fs::metadata(ctx.index_dir.join(name))
                 .unwrap()
@@ -328,7 +332,31 @@ fn private_modes_and_exact_older_version_pruning() {
 }
 
 #[test]
-fn owned_staging_cleanup_respects_other_index_lease() {
+fn new_index_is_v3_in_wal_mode_with_incremental_auto_vacuum() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    assert_eq!((VERSION, DATABASE), (3, "index-v3.sqlite3"));
+    drop(IndexSession::open(&ctx).unwrap());
+    assert!(!ctx.index_dir.join(DATABASE).exists());
+    index::refresh(&ctx, &selected(Agent::Claude)).unwrap();
+    let db = Connection::open(ctx.index_dir.join(DATABASE)).unwrap();
+    let mode: String = db
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    let vacuum: i64 = db
+        .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+        .unwrap();
+    let settings: (i64, String) = db
+        .query_row("SELECT refresh_seq,coverage FROM settings", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!((mode.as_str(), vacuum), ("wal", 2));
+    assert_eq!(settings, (1, "compact".into()));
+}
+
+#[test]
+fn legacy_staging_is_removed_only_when_no_other_session_is_open() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     let first = IndexSession::open(&ctx).unwrap();
@@ -336,21 +364,40 @@ fn owned_staging_cleanup_respects_other_index_lease() {
     fs::create_dir(&staging).unwrap();
     fs::set_permissions(&staging, fs::Permissions::from_mode(0o700)).unwrap();
     write(&staging.join("snapshot.db"), "sentinel");
-    assert!(matches!(
-        IndexSession::open_with_timeout(&ctx, Duration::ZERO),
-        Err(Error::IndexBusy)
-    ));
-    let mut other = ctx.clone();
-    other.index_dir = dir.path().join("other-index");
-    let second = IndexSession::open(&other).unwrap();
+    let second = IndexSession::open_with_timeout(&ctx, Duration::ZERO).unwrap();
     assert_eq!(
         fs::read_to_string(staging.join("snapshot.db")).unwrap(),
         "sentinel"
     );
     drop(first);
     drop(IndexSession::open(&ctx).unwrap());
-    assert!(!staging.exists());
+    assert!(staging.exists());
     drop(second);
+    drop(IndexSession::open(&ctx).unwrap());
+    assert!(!staging.exists());
+}
+
+#[test]
+fn query_after_another_sessions_refresh_reuses_its_published_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    claude(&ctx, "one", "first text");
+    let agents = selected(Agent::Claude);
+    index::refresh(&ctx, &agents).unwrap();
+    let mut waiting = IndexSession::open(&ctx).unwrap();
+    claude(&ctx, "two", "second text");
+    let mut other = IndexSession::open(&ctx).unwrap();
+    let refreshed = other.refresh_under_lease(&agents).unwrap();
+    assert_eq!(refreshed.data.unwrap().reparsed, 1);
+    let coalesced = waiting.refresh_for_query(&agents).unwrap();
+    assert!(!coalesced.incomplete);
+    assert_eq!(coalesced.data.unwrap().discovered, 0);
+    assert_eq!(texts(&waiting, &key("two")), ["second text"]);
+    claude(&ctx, "three", "third text");
+    let mut fresh = IndexSession::open(&ctx).unwrap();
+    let normal = fresh.refresh_for_query(&agents).unwrap().data.unwrap();
+    assert_eq!((normal.discovered, normal.reparsed), (3, 1));
+    assert_eq!(texts(&fresh, &key("three")), ["third text"]);
 }
 
 #[test]
@@ -465,9 +512,24 @@ fn database_wal_changes_and_partial_cache_preserve_full_inventory() {
         ),
         ["later"]
     );
+    let staged: Vec<_> = fs::read_dir(ctx.index_dir.join("staging"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(staged.len(), 1);
+    assert!(
+        staged[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(&format!("proc-{}-", std::process::id()))
+    );
     assert_eq!(
-        fs::read_dir(ctx.index_dir.join("staging")).unwrap().count(),
-        0
+        fs::read_dir(&staged[0])
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>(),
+        ["owner.lock"]
     );
     lease.verify_integrity().unwrap();
 }

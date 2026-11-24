@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("index is busy: lifecycle lock deadline exceeded")]
+    #[error("index is busy: lock deadline exceeded")]
     IndexBusy,
     #[error("invalid argument: {0}")]
     InvalidArgument(String),

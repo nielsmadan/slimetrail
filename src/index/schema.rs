@@ -1,20 +1,24 @@
 use super::lock::{check_file, io};
 use crate::{Error, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::{
     fs::{self, OpenOptions},
     os::unix::fs::OpenOptionsExt,
     path::Path,
+    time::Duration,
 };
 
-pub const VERSION: u32 = 2;
-pub const DATABASE: &str = "index-v2.sqlite3";
+pub const VERSION: u32 = 3;
+pub const DATABASE: &str = "index-v3.sqlite3";
 
 const SCHEMA: &str = "
+PRAGMA auto_vacuum=INCREMENTAL;
 CREATE TABLE meta(namespace TEXT PRIMARY KEY, version INTEGER NOT NULL, roots TEXT NOT NULL);
+CREATE TABLE settings(id INTEGER PRIMARY KEY CHECK(id=1), refresh_seq INTEGER NOT NULL, coverage TEXT NOT NULL, coverage_pending TEXT);
 CREATE TABLE refresh_runs(
  namespace TEXT NOT NULL REFERENCES meta(namespace), agent TEXT NOT NULL,
  generation INTEGER NOT NULL, status TEXT NOT NULL, diagnostics TEXT NOT NULL,
+ published INTEGER, published_seq INTEGER,
  PRIMARY KEY(namespace,agent)
 );
 CREATE TABLE sources(
@@ -60,7 +64,7 @@ CREATE TRIGGER documents_update AFTER UPDATE ON search_documents BEGIN
  INSERT INTO search_fts(search_fts,rowid,ascii_lower) VALUES('delete',old.document_id,old.ascii_lower);
  INSERT INTO search_fts(rowid,ascii_lower) VALUES(new.document_id,new.ascii_lower);
 END;
-PRAGMA user_version=2;
+PRAGMA user_version=3;
 ";
 
 pub(super) fn preflight(directory: &Path) -> Result<()> {
@@ -68,6 +72,35 @@ pub(super) fn preflight(directory: &Path) -> Result<()> {
         check_file(&directory.join(format!("{DATABASE}{suffix}")))?;
     }
     Ok(())
+}
+
+fn configure(connection: &Connection) -> Result<()> {
+    connection.busy_timeout(Duration::from_secs(30))?;
+    connection.execute_batch(
+        "PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL; PRAGMA journal_size_limit=67108864;",
+    )?;
+    Ok(())
+}
+
+fn version(connection: &Connection) -> Result<u32> {
+    Ok(connection.query_row("PRAGMA user_version", [], |r| r.get(0))?)
+}
+
+fn check_namespace(connection: &Connection, namespace: &str, roots: &str) -> Result<bool> {
+    let stored: Option<(u32, String)> = connection
+        .query_row(
+            "SELECT version,roots FROM meta WHERE namespace=?",
+            [namespace],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match stored {
+        None => Ok(false),
+        Some(stored) if stored == (VERSION, roots.into()) => Ok(true),
+        Some(_) => Err(Error::InvalidArgument(
+            "index namespace metadata is inconsistent".into(),
+        )),
+    }
 }
 
 pub(super) fn open(directory: &Path, namespace: &str, roots: &str) -> Result<Connection> {
@@ -81,36 +114,78 @@ pub(super) fn open(directory: &Path, namespace: &str, roots: &str) -> Result<Con
             .open(&path)
             .map_err(|e| io(&path, e))?;
     }
-    let mut connection = Connection::open(&path)?;
-    connection.execute_batch(
-        "PRAGMA foreign_keys=ON; PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;",
+    let mut connection = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    let version: u32 = connection.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version == 0 {
-        let transaction = connection.transaction()?;
-        transaction.execute_batch(SCHEMA)?;
-        transaction.commit()?;
-    } else if version != VERSION {
-        return Err(Error::InvalidArgument(
-            "index schema version does not match its filename".into(),
-        ));
+    configure(&connection)?;
+    if version(&connection)? == 0 {
+        connection.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")?;
+        let mode: String = connection.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+        if mode != "wal" {
+            return Err(Error::InvalidArgument(
+                "index database could not enter WAL mode".into(),
+            ));
+        }
     }
-    connection.execute("INSERT INTO meta(namespace,version,roots) VALUES(?1,?2,?3) ON CONFLICT(namespace) DO NOTHING", (namespace,VERSION,roots))?;
-    let stored: (u32, String) = connection.query_row(
-        "SELECT version,roots FROM meta WHERE namespace=?",
-        [namespace],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
-    if stored != (VERSION, roots.into()) {
-        return Err(Error::InvalidArgument(
-            "index namespace metadata is inconsistent".into(),
-        ));
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    match version(&transaction)? {
+        0 => transaction.execute_batch(SCHEMA)?,
+        VERSION => {}
+        _ => {
+            return Err(Error::InvalidArgument(
+                "index schema version does not match its filename".into(),
+            ));
+        }
     }
-    prune(directory)?;
+    transaction.execute("INSERT INTO meta(namespace,version,roots) VALUES(?1,?2,?3) ON CONFLICT(namespace) DO NOTHING", (namespace,VERSION,roots))?;
+    // Placeholder until Context gains `coverage`.
+    transaction.execute("INSERT INTO settings(id,refresh_seq,coverage) VALUES(1,0,'compact') ON CONFLICT(id) DO NOTHING", [])?;
+    check_namespace(&transaction, namespace, roots)?;
+    transaction.commit()?;
     Ok(connection)
 }
 
-fn prune(directory: &Path) -> Result<()> {
+fn unbuilt() -> Result<Connection> {
+    let connection = Connection::open_in_memory()?;
+    connection.execute_batch(SCHEMA)?;
+    Ok(connection)
+}
+
+pub(super) fn read(directory: &Path, namespace: &str, roots: &str) -> Result<Connection> {
+    let path = directory.join(DATABASE);
+    preflight(directory)?;
+    if !path.exists() {
+        return unbuilt();
+    }
+    let connection = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    configure(&connection)?;
+    match version(&connection)? {
+        0 => unbuilt(),
+        VERSION => {
+            check_namespace(&connection, namespace, roots)?;
+            Ok(connection)
+        }
+        _ => Err(Error::InvalidArgument(
+            "index schema version does not match its filename".into(),
+        )),
+    }
+}
+
+pub(super) fn refresh_seq(connection: &Connection) -> Result<i64> {
+    Ok(connection
+        .query_row("SELECT refresh_seq FROM settings WHERE id=1", [], |r| {
+            r.get(0)
+        })
+        .optional()?
+        .unwrap_or(0))
+}
+
+pub(super) fn prune(directory: &Path) -> Result<()> {
     for entry in fs::read_dir(directory).map_err(|e| io(directory, e))? {
         let entry = entry.map_err(|e| io(directory, e))?;
         let name = entry.file_name();

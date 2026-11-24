@@ -5,11 +5,13 @@ use crate::{
 };
 use std::{
     collections::BTreeSet,
+    io::IsTerminal,
     path::{Component, Path, PathBuf},
 };
 
 pub fn refresh(ctx: &Context, agents: &BTreeSet<Agent>) -> Result<Envelope<IndexStats>> {
-    index::refresh(ctx, &selected(agents))
+    // Placeholder until Context gains `progress`.
+    index::refresh_noting(ctx, &selected(agents), std::io::stderr().is_terminal())
 }
 
 pub fn sessions(ctx: &Context, filter: &Filter) -> Result<Envelope<Vec<Session>>> {
@@ -77,7 +79,7 @@ fn prepared(
     agents: &BTreeSet<Agent>,
 ) -> Result<(IndexSession, Envelope<IndexStats>)> {
     let mut index = IndexSession::open(ctx)?;
-    let status = index.refresh_under_lease(&selected(agents))?;
+    let status = index.refresh_for_query(&selected(agents))?;
     Ok((index, status))
 }
 
