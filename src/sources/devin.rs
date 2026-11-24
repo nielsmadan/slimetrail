@@ -360,6 +360,7 @@ fn discovery(
             dependencies: dependencies.clone(),
             fingerprint,
             snapshot: (!reusable).then(|| Arc::clone(&snapshot)),
+            resume: None,
         });
     }
     Ok(sessions)
@@ -724,6 +725,7 @@ impl Source for Devin {
             complete: diagnostics.is_empty(),
             diagnostics,
             state: Some(content.finish()),
+            recheck: false,
         })
     }
 }

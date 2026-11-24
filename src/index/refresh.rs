@@ -1,6 +1,7 @@
 use super::{IndexSession, REFRESH_WAIT, Writer, store};
 use crate::{
     Agent, Diagnostic, DiscoveryCache, Envelope, Error, IndexStats, RawSession, Result,
+    SourceState,
     sources::{self, Source},
 };
 use rusqlite::params;
@@ -69,6 +70,22 @@ fn ingest(
     index: &IndexSession,
     writer: &mut Writer,
     source: &dyn Source,
+    raw: &mut RawSession,
+    generation: i64,
+) -> Result<Outcome> {
+    if raw.resume.is_some() {
+        match ingest_once(index, writer, source, raw, generation) {
+            Err(Error::ResumeRejected) => raw.resume = None,
+            outcome => return outcome,
+        }
+    }
+    ingest_once(index, writer, source, raw, generation)
+}
+
+fn ingest_once(
+    index: &IndexSession,
+    writer: &mut Writer,
+    source: &dyn Source,
     raw: &RawSession,
     generation: i64,
 ) -> Result<Outcome> {
@@ -89,17 +106,22 @@ fn ingest(
         generation,
         None,
     )?;
-    transaction.execute(
-        "DELETE FROM sessions WHERE namespace=?1 AND agent=?2 AND (id=?3 OR source=?4)",
-        params![
-            index.namespace,
-            raw.key.agent.to_string(),
-            raw.key.id,
-            raw.source
-        ],
-    )?;
+    let resume = raw.resume.as_ref().map(|state| state.entries);
+    if let Some(entries) = resume {
+        store::truncate(&transaction, &index.namespace, raw, entries)?;
+    } else {
+        transaction.execute(
+            "DELETE FROM sessions WHERE namespace=?1 AND agent=?2 AND (id=?3 OR source=?4)",
+            params![
+                index.namespace,
+                raw.key.agent.to_string(),
+                raw.key.id,
+                raw.source
+            ],
+        )?;
+    }
     let mut write_failed = false;
-    let mut expected_index = 0;
+    let mut expected_index = resume.unwrap_or(0);
     let parsed = source.parse(raw, &mut |entry| {
         if entry.index != expected_index {
             return Err(Error::InvalidArgument(
@@ -115,6 +137,9 @@ fn ingest(
         return Err(parsed.err().unwrap_or_else(|| {
             Error::InvalidArgument("source swallowed an index write failure".into())
         }));
+    }
+    if resume.is_some() && matches!(parsed, Err(Error::ResumeRejected)) {
+        return Err(Error::ResumeRejected);
     }
     if let Some((path, before)) = &before
         && !stable(before, stat(path).as_ref())
@@ -143,12 +168,18 @@ fn ingest(
         ));
     }
     let complete = parsed.complete && parsed.diagnostics.is_empty();
-    store::session(&transaction, &index.namespace, raw, &parsed.session)?;
+    if resume.is_none() {
+        store::session(&transaction, &index.namespace, raw, &parsed.session)?;
+    } else if !store::update_session(&transaction, &index.namespace, raw, &parsed.session)? {
+        return Err(Error::ResumeRejected);
+    }
+    // Partial sources are never reused, so a recent torn final line is rechecked next refresh.
+    let fresh = complete && !parsed.recheck;
     store::source(
         &transaction,
         &index.namespace,
         raw,
-        if complete { "fresh" } else { "partial" },
+        if fresh { "fresh" } else { "partial" },
         &parsed.diagnostics,
         generation,
         parsed.state.as_ref(),
@@ -226,6 +257,7 @@ pub(super) fn write(
             verify,
             ..store::cache(&writer.connection, &index.namespace, agent)?
         };
+        let partial = store::partial(&writer.connection, &index.namespace, agent)?;
         let Ok(discovery) = source.discover(&index.context, &previous) else {
             let failed = [diagnostic(
                 agent,
@@ -278,7 +310,24 @@ pub(super) fn write(
                 stats.reused += 1;
                 continue;
             }
-            let mut outcome = ingest(index, writer, source.as_ref(), &raw, generation)?;
+            if matches!(
+                agent,
+                Agent::Claude | Agent::Codex | Agent::Droid | Agent::Pi
+            ) {
+                raw.resume = previous
+                    .by_source
+                    .get(&raw.source)
+                    .or_else(|| partial.get(&raw.source))
+                    .and_then(|cached| match &cached.state {
+                        Some(SourceState::Append(append))
+                            if cached.key == raw.key && cached.dependencies == raw.dependencies =>
+                        {
+                            Some(append.clone())
+                        }
+                        _ => None,
+                    });
+            }
+            let mut outcome = ingest(index, writer, source.as_ref(), &mut raw, generation)?;
             if matches!(outcome, Outcome::Changed) {
                 enumeration_complete = false;
                 agent_diagnostics.push(diagnostic(
@@ -300,7 +349,7 @@ pub(super) fn write(
                 {
                     raw = discovery.sessions.swap_remove(found);
                     seen.insert(raw.source.clone());
-                    outcome = ingest(index, writer, source.as_ref(), &raw, generation)?;
+                    outcome = ingest(index, writer, source.as_ref(), &mut raw, generation)?;
                 }
             }
             match outcome {
@@ -605,6 +654,116 @@ mod tests {
                 .is_none()
         );
         index.verify_integrity().unwrap();
+    }
+
+    struct RejectedResume {
+        reader: Box<dyn Source>,
+        fallback: bool,
+        resumed: Rc<Cell<bool>>,
+    }
+
+    impl Source for RejectedResume {
+        fn agent(&self) -> Agent {
+            self.reader.agent()
+        }
+        fn discover(&self, ctx: &Context, previous: &DiscoveryCache) -> Result<Discovery> {
+            self.reader.discover(ctx, previous)
+        }
+        fn parse(
+            &self,
+            raw: &RawSession,
+            emit: &mut dyn FnMut(Entry) -> Result<()>,
+        ) -> Result<ParsedSession> {
+            if raw.resume.is_some() {
+                self.resumed.set(true);
+                self.reader.parse(raw, emit)?;
+                return Err(Error::ResumeRejected);
+            }
+            if self.fallback {
+                self.reader.parse(raw, emit)
+            } else {
+                Err(Error::InvalidArgument("synthetic parse failure".into()))
+            }
+        }
+    }
+
+    type Rows = (Vec<(i64, i64, String)>, Vec<(i64, Option<i64>, String)>);
+
+    fn rows(index: &IndexSession) -> Rows {
+        let connection = &index.connection;
+        let entries = connection
+            .prepare("SELECT rowid,entry_index,text FROM entries ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let documents = connection
+            .prepare(
+                "SELECT document_id,entry_index,kind FROM search_documents ORDER BY document_id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        (entries, documents)
+    }
+
+    fn indexed(index: &IndexSession, key: &SessionKey) -> (Option<crate::Session>, Vec<Entry>) {
+        let mut entries = Vec::new();
+        index
+            .visit_entries(key, &mut |e| {
+                entries.push(e);
+                Ok(())
+            })
+            .unwrap();
+        (index.session(key).unwrap(), entries)
+    }
+
+    #[test]
+    fn rejected_resume_rolls_back_its_writes() {
+        for fallback in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = context(dir.path());
+            let path = ctx.roots.claude_projects.join("project/source.jsonl");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let title = serde_json::json!({"type":"custom-title","customTitle":"Native"});
+            fs::write(&path, line("stable", "original") + &format!("{title}\n")).unwrap();
+            let agents = BTreeSet::from([Agent::Claude]);
+            let mut index = IndexSession::open(&ctx).unwrap();
+            index.refresh_under_lease(&agents).unwrap();
+            let before = rows(&index);
+            assert!(before.1.iter().any(|(_, entry, _)| entry.is_none()));
+            fs::write(
+                &path,
+                fs::read_to_string(&path).unwrap() + &line("stable", "appended"),
+            )
+            .unwrap();
+            let resumed = Rc::new(Cell::new(false));
+            let reader = RejectedResume {
+                reader: sources::source_for(&ctx, Agent::Claude).unwrap(),
+                fallback,
+                resumed: Rc::clone(&resumed),
+            };
+            let result = run_sources(&mut index, &agents, vec![Box::new(reader)]).unwrap();
+            assert!(resumed.get());
+            let key = stable_key(Agent::Claude);
+            if fallback {
+                assert_eq!(codes(&result), [] as [&str; 0]);
+                let cold = Context {
+                    index_dir: dir.path().join("cold"),
+                    ..context(dir.path())
+                };
+                let mut other = IndexSession::open(&cold).unwrap();
+                other.refresh_under_lease(&agents).unwrap();
+                assert_eq!(indexed(&index, &key), indexed(&other, &key));
+            } else {
+                assert_eq!(codes(&result), ["source_unavailable"]);
+                assert_eq!(rows(&index), before);
+            }
+            index.verify_integrity().unwrap();
+        }
     }
 
     #[test]

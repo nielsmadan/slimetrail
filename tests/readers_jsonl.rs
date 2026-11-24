@@ -46,6 +46,14 @@ fn write(path: &Path, text: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, text).unwrap();
 }
+fn age(path: &Path) {
+    fs::File::options()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
+}
 fn fixture(agent: Agent) -> String {
     fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -143,6 +151,7 @@ fn malformed_and_truncated_records_preserve_good_entries_and_redact_content() {
                 fixture(agent)
             ),
         );
+        age(&path);
         let source = source_for(&ctx, agent).unwrap();
         let discovery = discover(source.as_ref(), &ctx);
         let (parsed, entries) = parse(source.as_ref(), &discovery.sessions[0]);
@@ -406,6 +415,7 @@ fn completed_last_record_recovers_and_unknown_metadata_stays_searchable() {
         &path,
         "{\"type\":\"user\",\"sessionId\":\"canonical\",\"message\":\"Hello\"}\n{\"type\":\"future_kind\",\"text\":\"Future metadata\"}\n{\"type\":\"assistant\",\"message\":",
     );
+    age(&path);
     let source = source_for(&ctx, Agent::Claude).unwrap();
     let d = discover(source.as_ref(), &ctx);
     let (p, e) = parse(source.as_ref(), &d.sessions[0]);
@@ -639,4 +649,99 @@ fn pi_empty_and_whitespace_names_clear_native_titles() {
         assert_eq!(parsed.session.title, None);
         assert_eq!(parsed.session.title_origin, None);
     }
+}
+
+fn collect(source: &dyn Source, raw: &RawSession) -> (Result<ParsedSession>, Vec<Entry>) {
+    let mut entries = Vec::new();
+    let parsed = source.parse(raw, &mut |entry| {
+        entries.push(entry);
+        Ok(())
+    });
+    (parsed, entries)
+}
+
+fn append_state(parsed: &ParsedSession) -> AppendState {
+    let Some(SourceState::Append(state)) = &parsed.state else {
+        panic!("expected an append state");
+    };
+    state.clone()
+}
+
+#[test]
+fn resume_emits_only_new_entries_and_rejects_rewritten_prefixes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    for agent in [Agent::Claude, Agent::Codex, Agent::Droid, Agent::Pi] {
+        let path = root(&ctx, agent).join("session.jsonl");
+        let fixture = fixture(agent);
+        write(&path, &fixture);
+        let source = source_for(&ctx, agent).unwrap();
+        let mut discovery = discover(source.as_ref(), &ctx);
+        let (first, entries) = parse(source.as_ref(), &discovery.sessions[0]);
+        let state = append_state(&first);
+        assert_eq!(state.consumed, fixture.len() as u64);
+        assert_eq!(state.lines, fixture.lines().count() as u64);
+        assert_eq!(state.entries, entries.len() as u64);
+        assert_eq!(state.malformed, 0);
+        let added = match agent {
+            Agent::Claude => {
+                json!({"type":"user","timestamp":"2026-08-10T13:00:00Z","message":"resumed prompt"})
+            }
+            Agent::Codex => {
+                json!({"type":"response_item","timestamp":"2026-08-10T13:00:00Z","payload":{"type":"message","role":"user","content":"resumed prompt"}})
+            }
+            _ => {
+                json!({"type":"message","timestamp":"2026-08-10T13:00:00Z","message":{"role":"user","content":"resumed prompt"}})
+            }
+        };
+        writeln!(
+            OpenOptions::new().append(true).open(&path).unwrap(),
+            "{added}"
+        )
+        .unwrap();
+        let (cold, all) = parse(source.as_ref(), &discovery.sessions[0]);
+        discovery.sessions[0].resume = Some(state.clone());
+        let (resumed, tail) = collect(source.as_ref(), &discovery.sessions[0]);
+        let resumed = resumed.unwrap();
+        assert_eq!(tail, all[entries.len()..], "{agent}");
+        assert_eq!(resumed, cold, "{agent}");
+        let original = fs::read_to_string(&path).unwrap();
+        let rewritten = original.replacen("Unicode", "Unicodf", 1);
+        assert_eq!(rewritten.len(), original.len());
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all(rewritten.as_bytes())
+            .unwrap();
+        let (rejected, emitted) = collect(source.as_ref(), &discovery.sessions[0]);
+        assert!(matches!(rejected, Err(Error::ResumeRejected)), "{agent}");
+        assert_eq!(emitted, [] as [Entry; 0]);
+    }
+}
+
+#[test]
+fn torn_final_line_is_excluded_from_state_and_malformed_only_when_old() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let path = ctx.roots.claude_projects.join("project/session.jsonl");
+    let fixture = fixture(Agent::Claude);
+    write(&path, &format!("{fixture}{{\"type\":\"assistant\",\"mess"));
+    let source = source_for(&ctx, Agent::Claude).unwrap();
+    let raw = &discover(source.as_ref(), &ctx).sessions[0];
+    let (parsed, _) = parse(source.as_ref(), raw);
+    assert!(parsed.complete);
+    assert!(parsed.recheck);
+    assert_eq!(parsed.diagnostics, []);
+    let state = append_state(&parsed);
+    assert_eq!(state.consumed, fixture.len() as u64);
+    assert_eq!(state.malformed, 0);
+    age(&path);
+    let (parsed, _) = parse(source.as_ref(), raw);
+    assert_eq!(
+        parsed.diagnostics[0].message,
+        "1 nonempty records were not valid JSON objects"
+    );
+    assert!(!parsed.recheck);
+    assert_eq!(append_state(&parsed).malformed, 0);
 }

@@ -11,6 +11,7 @@ use std::{
     os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, SystemTime},
 };
 
 fn context(base: &Path) -> Context {
@@ -551,6 +552,12 @@ fn cursor_partial_transcripts_and_metadata_errors_are_sanitized() {
             include_str!("fixtures/jsonl/cursor.jsonl")
         ),
     );
+    fs::File::options()
+        .append(true)
+        .open(&transcript)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
     let source = source_for(&ctx, Agent::Cursor).unwrap();
     let discovery = discover(source.as_ref(), &ctx);
     let (parsed, entries) = parse(source.as_ref(), &discovery.sessions[0]);

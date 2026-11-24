@@ -109,6 +109,7 @@ fn discovery(
             } else {
                 Some(Arc::clone(&snapshot))
             },
+            resume: None,
         });
     }
     Ok(sessions)
@@ -281,6 +282,7 @@ impl Source for Opencode {
             complete: diagnostics.is_empty(),
             diagnostics,
             state: None,
+            recheck: false,
         })
     }
 }

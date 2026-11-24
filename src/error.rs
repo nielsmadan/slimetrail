@@ -18,6 +18,8 @@ pub enum Error {
     Time(#[from] jiff::Error),
     #[error("SQLite operation failed")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("append resume state no longer matches the source")]
+    ResumeRejected,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

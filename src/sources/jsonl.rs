@@ -1,20 +1,22 @@
 use crate::{
-    Agent, Context, Diagnostic, Discovery, DiscoveryCache, Entry, Error, Fingerprint, Kind,
-    ParsedSession, RawSession, Result, Session, SessionKey, TitleOrigin,
+    Agent, AppendState, Context, Diagnostic, Discovery, DiscoveryCache, Entry, Error, Fingerprint,
+    Kind, ParsedSession, RawSession, Result, Session, SessionKey, SourceState, TitleOrigin,
 };
 use ruzstd::decoding::{
     BlockDecodingStrategy, FrameDecoder,
     errors::{FrameDecoderError, ReadFrameHeaderError},
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, SystemTime},
 };
 
 pub struct FileReader {
@@ -28,6 +30,7 @@ pub struct FileReader {
 struct Titles {
     names: BTreeMap<String, Option<String>>,
     diagnostics: Vec<Diagnostic>,
+    recheck: bool,
 }
 
 fn read_titles(path: &Path) -> Titles {
@@ -41,8 +44,9 @@ fn read_titles(path: &Path) -> Titles {
         }
         Ok(true)
     });
+    let recheck = status.as_ref().is_ok_and(|tally| tally.recheck);
     let diagnostic = match status {
-        Ok(0) => None,
+        Ok(Tally { malformed: 0, .. }) => None,
         Ok(_) => Some(diagnostic(
             Agent::Codex,
             path,
@@ -60,6 +64,7 @@ fn read_titles(path: &Path) -> Titles {
     Titles {
         names,
         diagnostics: diagnostic.into_iter().collect(),
+        recheck,
     }
 }
 
@@ -147,26 +152,56 @@ fn walk(root: &Path, files: &mut Vec<PathBuf>, zst: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn records(path: &Path, visit: &mut dyn FnMut(u64, &Value) -> Result<bool>) -> Result<u64> {
-    let metadata = fs::symlink_metadata(path).map_err(|e| io(path, e))?;
-    if !metadata.is_file() {
-        return Err(Error::InvalidArgument(
-            "transcript must be a regular file".into(),
-        ));
+const RECENT: Duration = Duration::from_secs(600);
+
+struct Scan {
+    consumed: u64,
+    lines: u64,
+    malformed: u64,
+    hasher: Option<Sha256>,
+    recent: bool,
+    torn: bool,
+    recheck: bool,
+}
+
+pub struct Tally {
+    pub malformed: u64,
+    pub recheck: bool,
+}
+
+impl Scan {
+    const fn new(recent: bool, hasher: Option<Sha256>) -> Self {
+        Self {
+            consumed: 0,
+            lines: 0,
+            malformed: 0,
+            hasher,
+            recent,
+            torn: false,
+            recheck: false,
+        }
     }
-    let file = BufReader::new(File::open(path).map_err(|e| io(path, e))?);
-    let mut reader: Box<dyn BufRead> = if compressed(path) {
-        Box::new(BufReader::new(Frames {
-            source: file,
-            decoder: FrameDecoder::new(),
-            active: false,
-        }))
-    } else {
-        Box::new(file)
-    };
+
+    const fn malformed(&self) -> u64 {
+        self.malformed + self.torn as u64
+    }
+}
+
+fn recent(metadata: &fs::Metadata) -> bool {
+    metadata.modified().is_ok_and(|modified| {
+        SystemTime::now()
+            .duration_since(modified)
+            .map_or(true, |age| age < RECENT)
+    })
+}
+
+fn scan(
+    reader: &mut dyn BufRead,
+    path: &Path,
+    state: &mut Scan,
+    visit: &mut dyn FnMut(u64, &Value, bool) -> Result<bool>,
+) -> Result<()> {
     let mut bytes = Vec::new();
-    let mut line = 0;
-    let mut malformed = 0;
     loop {
         bytes.clear();
         if reader
@@ -176,20 +211,96 @@ pub fn records(path: &Path, visit: &mut dyn FnMut(u64, &Value) -> Result<bool>) 
         {
             break;
         }
-        line += 1;
+        let line = state.lines + 1;
+        let terminated = bytes.last() == Some(&b'\n');
+        if terminated {
+            state.lines = line;
+            state.consumed += bytes.len() as u64;
+            if let Some(hasher) = &mut state.hasher {
+                hasher.update(&bytes);
+            }
+        }
         if bytes.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
         match serde_json::from_slice::<Value>(&bytes) {
             Ok(value) if value.is_object() => {
-                if !visit(line, &value)? {
+                if !visit(line, &value, terminated)? {
                     break;
                 }
             }
-            _ => malformed += 1,
+            _ if terminated => state.malformed += 1,
+            _ if state.recent => state.recheck = true,
+            _ => state.torn = true,
         }
     }
-    Ok(malformed)
+    Ok(())
+}
+
+fn open_regular(path: &Path) -> Result<File> {
+    let metadata = fs::symlink_metadata(path).map_err(|e| io(path, e))?;
+    if !metadata.is_file() {
+        return Err(Error::InvalidArgument(
+            "transcript must be a regular file".into(),
+        ));
+    }
+    File::open(path).map_err(|e| io(path, e))
+}
+
+pub fn records(path: &Path, visit: &mut dyn FnMut(u64, &Value) -> Result<bool>) -> Result<Tally> {
+    let file = open_regular(path)?;
+    let zst = compressed(path);
+    let mut state = Scan::new(
+        !zst && recent(&file.metadata().map_err(|e| io(path, e))?),
+        None,
+    );
+    let file = BufReader::new(file);
+    let mut reader: Box<dyn BufRead> = if zst {
+        Box::new(BufReader::new(Frames {
+            source: file,
+            decoder: FrameDecoder::new(),
+            active: false,
+        }))
+    } else {
+        Box::new(file)
+    };
+    scan(&mut *reader, path, &mut state, &mut |line, record, _| {
+        visit(line, record)
+    })?;
+    Ok(Tally {
+        malformed: state.malformed(),
+        recheck: state.recheck,
+    })
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut hex, byte| {
+        std::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"))
+            .expect("writing to a String cannot fail");
+        hex
+    })
+}
+
+fn hash_prefix(
+    reader: &mut dyn BufRead,
+    path: &Path,
+    hasher: &mut Sha256,
+    length: u64,
+) -> Result<bool> {
+    let mut remaining = length;
+    while remaining > 0 {
+        let buffer = reader.fill_buf().map_err(|e| io(path, e))?;
+        if buffer.is_empty() {
+            return Ok(false);
+        }
+        let take = buffer
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        hasher.update(&buffer[..take]);
+        reader.consume(take);
+        remaining -= take as u64;
+    }
+    Ok(true)
 }
 
 struct Frames<R> {
@@ -261,74 +372,74 @@ struct Header {
     automated: bool,
 }
 
-fn header(agent: Agent, path: &Path) -> Result<Header> {
-    let mut header = Header::default();
-    records(path, &mut |_, record| {
-        let kind = record["type"].as_str().unwrap_or("");
-        let payload = &record["payload"];
-        match agent {
-            Agent::Claude => {
-                if let Some(id) = string(record, "sessionId") {
-                    if path
-                        .parent()
-                        .is_some_and(|p| p.file_name().is_some_and(|n| n == "subagents"))
-                    {
-                        header.id = string(record, "agentId")
-                            .or_else(|| path.file_stem().map(|s| s.to_string_lossy().into_owned()));
-                        header.parent = Some(id);
-                        header.automated = true;
-                    } else {
-                        header.id = Some(id);
-                    }
-                    header.cwd = string(record, "cwd").map(PathBuf::from);
-                    header.automated |= record["isSidechain"].as_bool().unwrap_or(false);
-                    return Ok(false);
+fn header_record(agent: Agent, path: &Path, header: &mut Header, record: &Value) -> bool {
+    let kind = record["type"].as_str().unwrap_or("");
+    let payload = &record["payload"];
+    match agent {
+        Agent::Claude => {
+            if let Some(id) = string(record, "sessionId") {
+                if path
+                    .parent()
+                    .is_some_and(|p| p.file_name().is_some_and(|n| n == "subagents"))
+                {
+                    header.id = string(record, "agentId")
+                        .or_else(|| path.file_stem().map(|s| s.to_string_lossy().into_owned()));
+                    header.parent = Some(id);
+                    header.automated = true;
+                } else {
+                    header.id = Some(id);
                 }
-            }
-            Agent::Codex if kind == "session_meta" => {
-                header.id = string(payload, "id").or_else(|| string(payload, "session_id"));
-                header.parent = string(payload, "parent_thread_id")
-                    .or_else(|| string(payload, "forked_from_id"))
-                    .or_else(|| {
-                        string(
-                            &payload["source"]["subagent"]["thread_spawn"],
-                            "parent_thread_id",
-                        )
-                    })
-                    .or_else(|| {
-                        string(payload, "session_id").filter(|s| Some(s) != header.id.as_ref())
-                    });
-                header.cwd = string(payload, "cwd").map(PathBuf::from);
-                header.branch = string(&payload["git"], "branch");
-                header.automated = !payload["source"].is_null()
-                    && payload["source"] != "cli"
-                    && payload["source"] != "vscode";
-                return Ok(false);
-            }
-            Agent::Droid if kind == "session_start" => {
-                header.id = string(record, "id");
-                header.parent = string(record, "callingSessionId");
                 header.cwd = string(record, "cwd").map(PathBuf::from);
-                header.automated = header.parent.is_some();
-                return Ok(false);
+                header.automated |= record["isSidechain"].as_bool().unwrap_or(false);
+                return false;
             }
-            Agent::Pi if kind == "session" => {
-                header.id = string(record, "id");
-                header.parent = string(record, "parentSessionId").or_else(|| {
-                    string(record, "parentSession").map(|s| fallback_id(agent, Path::new(&s)))
-                });
-                header.cwd = string(record, "cwd").map(PathBuf::from);
-                header.automated = record["isSubagent"].as_bool().unwrap_or(false)
-                    || record["automated"].as_bool().unwrap_or(false)
-                    || path
-                        .components()
-                        .any(|part| part.as_os_str() == "subagents");
-                return Ok(false);
-            }
-            _ => {}
         }
-        Ok(true)
-    })?;
+        Agent::Codex if kind == "session_meta" => {
+            header.id = string(payload, "id").or_else(|| string(payload, "session_id"));
+            header.parent = string(payload, "parent_thread_id")
+                .or_else(|| string(payload, "forked_from_id"))
+                .or_else(|| {
+                    string(
+                        &payload["source"]["subagent"]["thread_spawn"],
+                        "parent_thread_id",
+                    )
+                })
+                .or_else(|| {
+                    string(payload, "session_id").filter(|s| Some(s) != header.id.as_ref())
+                });
+            header.cwd = string(payload, "cwd").map(PathBuf::from);
+            header.branch = string(&payload["git"], "branch");
+            header.automated = !payload["source"].is_null()
+                && payload["source"] != "cli"
+                && payload["source"] != "vscode";
+            return false;
+        }
+        Agent::Droid if kind == "session_start" => {
+            header.id = string(record, "id");
+            header.parent = string(record, "callingSessionId");
+            header.cwd = string(record, "cwd").map(PathBuf::from);
+            header.automated = header.parent.is_some();
+            return false;
+        }
+        Agent::Pi if kind == "session" => {
+            header.id = string(record, "id");
+            header.parent = string(record, "parentSessionId").or_else(|| {
+                string(record, "parentSession").map(|s| fallback_id(agent, Path::new(&s)))
+            });
+            header.cwd = string(record, "cwd").map(PathBuf::from);
+            header.automated = record["isSubagent"].as_bool().unwrap_or(false)
+                || record["automated"].as_bool().unwrap_or(false)
+                || path
+                    .components()
+                    .any(|part| part.as_os_str() == "subagents");
+            return false;
+        }
+        _ => {}
+    }
+    true
+}
+
+fn finish_header(agent: Agent, path: &Path, mut header: Header) -> Header {
     if agent == Agent::Claude
         && path
             .parent()
@@ -342,7 +453,28 @@ fn header(agent: Agent, path: &Path) -> Result<Header> {
                 .map(|s| s.to_string_lossy().into_owned())
         });
     }
-    Ok(header)
+    header
+}
+
+fn header(agent: Agent, path: &Path) -> Result<Header> {
+    let mut header = Header::default();
+    records(path, &mut |_, record| {
+        Ok(header_record(agent, path, &mut header, record))
+    })?;
+    Ok(finish_header(agent, path, header))
+}
+
+fn header_in(agent: Agent, path: &Path, file: &File) -> Result<Header> {
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(0)).map_err(|e| io(path, e))?;
+    let mut header = Header::default();
+    scan(
+        &mut reader,
+        path,
+        &mut Scan::new(true, None),
+        &mut |_, record, _| Ok(header_record(agent, path, &mut header, record)),
+    )?;
+    Ok(finish_header(agent, path, header))
 }
 
 fn fallback_id(agent: Agent, path: &Path) -> String {
@@ -534,6 +666,7 @@ impl FileReader {
                         dependencies,
                         fingerprint,
                         snapshot: None,
+                        resume: None,
                     },
                 ))
             })();
@@ -574,6 +707,87 @@ impl FileReader {
         })
     }
 
+    fn others(&self, raw: &RawSession) -> Result<String> {
+        let rest: Vec<PathBuf> = raw
+            .dependencies
+            .iter()
+            .skip(1)
+            .filter(|path| self.names.as_ref() != Some(*path))
+            .cloned()
+            .collect();
+        Ok(if rest.is_empty() {
+            String::new()
+        } else {
+            fingerprint(&rest)?.signature
+        })
+    }
+
+    fn settings(
+        &self,
+        path: &Path,
+        automated: &mut bool,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Result<()> {
+        let settings = path.with_extension("settings.json");
+        fingerprint(std::slice::from_ref(&settings))?;
+        match File::open(&settings) {
+            Ok(file) => match serde_json::from_reader::<_, Value>(BufReader::new(file)) {
+                Ok(value) if value.is_object() => {
+                    *automated |= value["tags"]
+                        .as_array()
+                        .is_some_and(|tags| tags.iter().any(|tag| tag["name"] == "exec"));
+                }
+                _ => diagnostics.push(diagnostic(
+                    self.agent,
+                    &settings,
+                    "malformed_metadata",
+                    "Settings are not a JSON object",
+                )),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => diagnostics.push(diagnostic(
+                self.agent,
+                &settings,
+                "source_unavailable",
+                "Settings could not be read",
+            )),
+        }
+        Ok(())
+    }
+
+    fn title(
+        &self,
+        id: &str,
+        diagnostics: &mut Vec<Diagnostic>,
+        recheck: &mut bool,
+    ) -> Result<Option<String>> {
+        let Some(names) = &self.names else {
+            return Ok(None);
+        };
+        let signature = fingerprint(std::slice::from_ref(names))?;
+        let cached = self
+            .titles
+            .borrow()
+            .as_ref()
+            .filter(|(old, _)| *old == signature)
+            .map(|(_, titles)| Arc::clone(titles));
+        let titles = if let Some(titles) = cached {
+            titles
+        } else {
+            let titles = Arc::new(read_titles(names));
+            if fingerprint(std::slice::from_ref(names))? != signature {
+                return Err(Error::InvalidArgument(
+                    "Session names changed during parsing".into(),
+                ));
+            }
+            *self.titles.borrow_mut() = Some((signature, Arc::clone(&titles)));
+            titles
+        };
+        diagnostics.extend(titles.diagnostics.iter().cloned());
+        *recheck |= titles.recheck;
+        Ok(titles.names.get(id).cloned().flatten())
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "Keep the ordered parsing states together"
@@ -584,82 +798,70 @@ impl FileReader {
         emit: &mut dyn FnMut(Entry) -> Result<()>,
     ) -> Result<ParsedSession> {
         let path = Path::new(&raw.source);
-        let h = header(self.agent, path)?;
+        let resume = raw.resume.as_ref();
+        let file = if compressed(path) {
+            if resume.is_some() {
+                return Err(Error::ResumeRejected);
+            }
+            None
+        } else {
+            Some(open_regular(path)?)
+        };
+        let h = match &file {
+            Some(file) => header_in(self.agent, path, file)?,
+            None => header(self.agent, path)?,
+        };
         let key = SessionKey {
             agent: self.agent,
             id: h.id.unwrap_or_else(|| fallback_id(self.agent, path)),
         };
-        let metadata = fs::metadata(path).map_err(|e| io(path, e))?;
-        let mut session = Session {
-            key,
-            title: None,
-            title_origin: None,
-            source_updated_at: Some(metadata.mtime() * 1000 + metadata.mtime_nsec() / 1_000_000),
-            cwd: h.cwd,
-            branch: h.branch,
-            started_at: None,
-            updated_at: None,
-            parent: h.parent.map(|id| SessionKey {
-                agent: self.agent,
-                id,
-            }),
-            source: raw.source.clone(),
-            archived: self.archives.iter().any(|a| path.starts_with(a)),
-        };
+        let metadata = file
+            .as_ref()
+            .map_or_else(|| fs::metadata(path), File::metadata)
+            .map_err(|e| io(path, e))?;
+        let others = self.others(raw)?;
+        if let Some(resume) = resume
+            && ((resume.dev, resume.ino) != (metadata.dev(), metadata.ino())
+                || metadata.len() < resume.consumed
+                || resume.others != others
+                || resume.session.key != key)
+        {
+            return Err(Error::ResumeRejected);
+        }
+        let mut session = resume.map_or_else(
+            || Session {
+                key,
+                title: None,
+                title_origin: None,
+                source_updated_at: None,
+                cwd: h.cwd,
+                branch: h.branch,
+                started_at: None,
+                updated_at: None,
+                parent: h.parent.map(|id| SessionKey {
+                    agent: self.agent,
+                    id,
+                }),
+                source: raw.source.clone(),
+                archived: self.archives.iter().any(|a| path.starts_with(a)),
+            },
+            |resume| resume.session.clone(),
+        );
+        session.source_updated_at =
+            Some(metadata.mtime() * 1000 + metadata.mtime_nsec() / 1_000_000);
         let mut automated = h.automated;
         let mut diagnostics = Vec::new();
         if self.agent == Agent::Droid {
-            let settings = path.with_extension("settings.json");
-            fingerprint(std::slice::from_ref(&settings))?;
-            match File::open(&settings) {
-                Ok(file) => match serde_json::from_reader::<_, Value>(BufReader::new(file)) {
-                    Ok(value) if value.is_object() => {
-                        automated |= value["tags"]
-                            .as_array()
-                            .is_some_and(|tags| tags.iter().any(|tag| tag["name"] == "exec"));
-                    }
-                    _ => diagnostics.push(diagnostic(
-                        self.agent,
-                        &settings,
-                        "malformed_metadata",
-                        "Settings are not a JSON object",
-                    )),
-                },
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => diagnostics.push(diagnostic(
-                    self.agent,
-                    &settings,
-                    "source_unavailable",
-                    "Settings could not be read",
-                )),
+            self.settings(path, &mut automated, &mut diagnostics)?;
+        }
+        let mut recheck = false;
+        let title = self.title(&session.key.id, &mut diagnostics, &mut recheck)?;
+        let mut index = resume.map_or(0, |resume| resume.entries);
+        let mut checkpoint = None;
+        let mut visit = |line: u64, record: &Value, terminated: bool| {
+            if !terminated {
+                checkpoint = Some((session.clone(), index));
             }
-        }
-        if let Some(names) = &self.names {
-            let signature = fingerprint(std::slice::from_ref(names))?;
-            let cached = self
-                .titles
-                .borrow()
-                .as_ref()
-                .filter(|(old, _)| *old == signature)
-                .map(|(_, titles)| Arc::clone(titles));
-            let titles = if let Some(titles) = cached {
-                titles
-            } else {
-                let titles = Arc::new(read_titles(names));
-                if fingerprint(std::slice::from_ref(names))? != signature {
-                    return Err(Error::InvalidArgument(
-                        "Session names changed during parsing".into(),
-                    ));
-                }
-                *self.titles.borrow_mut() = Some((signature, Arc::clone(&titles)));
-                titles
-            };
-            session.title = titles.names.get(&session.key.id).cloned().flatten();
-            session.title_origin = session.title.as_ref().map(|_| TitleOrigin::Native);
-            diagnostics.extend(titles.diagnostics.iter().cloned());
-        }
-        let mut index = 0;
-        let malformed = records(path, &mut |line, record| {
             update_metadata(&mut session, record);
             let mut found = normalize(self.agent, record);
             let base = string(record, "uuid")
@@ -676,7 +878,47 @@ impl FileReader {
                 emit(item.clone())?;
             }
             Ok(true)
-        })?;
+        };
+        let (malformed, state) = if let Some(file) = &file {
+            let mut reader = BufReader::new(file);
+            reader.seek(SeekFrom::Start(0)).map_err(|e| io(path, e))?;
+            let mut hasher = Sha256::new();
+            let mut scanned = Scan::new(recent(&metadata), None);
+            if let Some(resume) = resume {
+                if !hash_prefix(&mut reader, path, &mut hasher, resume.consumed)?
+                    || hex(&hasher.clone().finalize()) != resume.prefix_sha256
+                {
+                    return Err(Error::ResumeRejected);
+                }
+                scanned.consumed = resume.consumed;
+                scanned.lines = resume.lines;
+                scanned.malformed = resume.malformed;
+            }
+            scanned.hasher = Some(hasher);
+            scan(&mut reader, path, &mut scanned, &mut visit)?;
+            let (boundary, entries) = checkpoint.unwrap_or_else(|| (session.clone(), index));
+            let state = AppendState {
+                consumed: scanned.consumed,
+                prefix_sha256: hex(&scanned.hasher.take().unwrap_or_default().finalize()),
+                lines: scanned.lines,
+                entries,
+                malformed: scanned.malformed,
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                others,
+                session: boundary,
+            };
+            recheck |= scanned.recheck;
+            (scanned.malformed(), Some(SourceState::Append(state)))
+        } else {
+            let tally = records(path, &mut |line, record| visit(line, record, true))?;
+            recheck |= tally.recheck;
+            (tally.malformed, None)
+        };
+        if let Some(title) = title {
+            session.title = Some(title);
+            session.title_origin = Some(TitleOrigin::Native);
+        }
         if malformed > 0 {
             diagnostics.push(diagnostic(
                 self.agent,
@@ -689,7 +931,8 @@ impl FileReader {
             session,
             complete: diagnostics.is_empty(),
             diagnostics,
-            state: None,
+            state,
+            recheck,
         })
     }
 }

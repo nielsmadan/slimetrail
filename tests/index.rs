@@ -7,9 +7,10 @@ use slimetrail::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    os::unix::fs::{PermissionsExt, symlink},
+    io::Write,
+    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 fn context(base: &Path) -> Context {
@@ -53,6 +54,15 @@ fn claude(ctx: &Context, id: &str, text: &str) -> PathBuf {
         ),
     );
     path
+}
+
+fn age(path: &Path) {
+    fs::File::options()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
 }
 
 fn selected(agent: Agent) -> BTreeSet<Agent> {
@@ -107,6 +117,7 @@ fn stable_partial_records_remain_incomplete_until_corrected() {
     let path = claude(&ctx, "one", "good record");
     let good = fs::read_to_string(&path).unwrap();
     write(&path, &format!("{good}{{\"type\":"));
+    age(&path);
     let mut lease = IndexSession::open(&ctx).unwrap();
     for _ in 0..2 {
         let result = lease.refresh_under_lease(&selected(Agent::Claude)).unwrap();
@@ -818,4 +829,615 @@ fn long_session_replacement_preserves_entries_foreign_keys_and_fts() {
         assert_eq!(documents, count);
         index.verify_integrity().unwrap();
     }
+}
+
+const APPENDABLE: [Agent; 4] = [Agent::Claude, Agent::Codex, Agent::Droid, Agent::Pi];
+
+fn jsonl_fixture(agent: Agent) -> String {
+    fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("tests/fixtures/jsonl/{agent}.jsonl")),
+    )
+    .unwrap()
+}
+
+fn transcript(ctx: &Context, agent: Agent, name: &str) -> PathBuf {
+    let root = match agent {
+        Agent::Claude => &ctx.roots.claude_projects,
+        Agent::Codex => &ctx.roots.codex_sessions,
+        Agent::Droid => &ctx.roots.droid_sessions,
+        Agent::Pi => &ctx.roots.pi_sessions,
+        _ => unreachable!("not a JSONL transcript agent"),
+    };
+    root.join(format!("project/{name}.jsonl"))
+}
+
+fn canonical(agent: Agent) -> SessionKey {
+    SessionKey {
+        agent,
+        id: format!("{agent}-canonical"),
+    }
+}
+
+fn with_companion(ctx: &Context, agent: Agent) -> PathBuf {
+    let path = transcript(ctx, agent, "session");
+    write(&path, &jsonl_fixture(agent));
+    write(
+        &transcript(ctx, agent, "zz-companion"),
+        &jsonl_fixture(agent).replace(&format!("{agent}-canonical"), "zz-companion"),
+    );
+    path
+}
+
+fn append(path: &Path, text: &str) {
+    fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
+}
+
+fn appended_records(agent: Agent) -> String {
+    let records = match agent {
+        Agent::Claude => vec![
+            json!({"type":"user","uuid":"u9","timestamp":"2026-08-10T13:00:00Z","gitBranch":"later","message":{"content":"appended prompt"}}),
+            json!({"type":"custom-title","customTitle":"Renamed"}),
+            json!({"type":"assistant","timestamp":"2026-08-10T13:01:00Z","message":{"content":[{"type":"thinking","thinking":"appended thought"},{"type":"text","text":"appended reply"}]}}),
+        ],
+        Agent::Codex => vec![
+            json!({"type":"response_item","timestamp":"2026-08-10T13:00:00Z","payload":{"type":"message","role":"assistant","content":"appended reply"}}),
+            json!({"type":"response_item","timestamp":"2026-08-10T13:01:00Z","payload":{"type":"function_call","name":"exec","arguments":"{}"}}),
+        ],
+        Agent::Droid => vec![
+            json!({"type":"message","timestamp":"2026-08-10T13:00:00Z","message":{"role":"user","content":"appended prompt"}}),
+            json!({"type":"message","message":{"role":"tool","toolName":"Shell","content":"appended result"}}),
+        ],
+        _ => vec![
+            json!({"type":"session_info","name":"Renamed"}),
+            json!({"type":"message","timestamp":"2026-08-10T13:00:00Z","message":{"role":"user","content":"appended prompt"}}),
+        ],
+    };
+    records.iter().map(|r| r.to_string() + "\n").collect()
+}
+
+fn refreshed(ctx: &Context, agents: &BTreeSet<Agent>) -> (IndexSession, Envelope<IndexStats>) {
+    let mut lease = IndexSession::open(ctx).unwrap();
+    let result = lease.refresh_under_lease(agents).unwrap();
+    lease.verify_integrity().unwrap();
+    (lease, result)
+}
+
+fn snapshot(lease: &IndexSession, key: &SessionKey) -> (Session, Vec<Entry>) {
+    let mut entries = Vec::new();
+    lease
+        .visit_entries(key, &mut |entry| {
+            entries.push(entry);
+            Ok(())
+        })
+        .unwrap();
+    (lease.session(key).unwrap().unwrap(), entries)
+}
+
+fn cold(ctx: &Context, key: &SessionKey) -> (Session, Vec<Entry>) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut other = ctx.clone();
+    other.index_dir = dir.path().join("index");
+    let (lease, result) = refreshed(&other, &selected(key.agent));
+    assert_eq!(result.diagnostics, []);
+    snapshot(&lease, key)
+}
+
+fn source_state(ctx: &Context, path: &Path) -> Option<SourceState> {
+    let db = Connection::open(ctx.index_dir.join(DATABASE)).unwrap();
+    db.query_row(
+        "SELECT state FROM sources WHERE source=?1",
+        [path.to_string_lossy()],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .unwrap()
+    .map(|state| serde_json::from_str(&state).unwrap())
+}
+
+fn append_state(ctx: &Context, path: &Path) -> AppendState {
+    let Some(SourceState::Append(state)) = source_state(ctx, path) else {
+        panic!("expected an append state for {}", path.display());
+    };
+    state
+}
+
+fn rowids(ctx: &Context, key: &SessionKey) -> Vec<i64> {
+    let db = Connection::open(ctx.index_dir.join(DATABASE)).unwrap();
+    let mut statement = db
+        .prepare("SELECT rowid FROM entries WHERE agent=?1 AND id=?2 ORDER BY entry_index")
+        .unwrap();
+    statement
+        .query_map([key.agent.to_string(), key.id.clone()], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+#[test]
+fn appended_records_resume_and_match_a_cold_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let agents = BTreeSet::from(APPENDABLE);
+    let paths = APPENDABLE.map(|agent| with_companion(&ctx, agent));
+    let (lease, result) = refreshed(&ctx, &agents);
+    assert_eq!(result.diagnostics, []);
+    drop(lease);
+    let before = APPENDABLE.map(|agent| {
+        let path = transcript(&ctx, agent, "session");
+        (append_state(&ctx, &path), rowids(&ctx, &canonical(agent)))
+    });
+    for (agent, path) in APPENDABLE.iter().zip(&paths) {
+        append(path, &appended_records(*agent));
+    }
+    let (lease, result) = refreshed(&ctx, &agents);
+    assert_eq!(result.diagnostics, []);
+    let counts = result.data.unwrap();
+    assert_eq!((counts.reparsed, counts.reused), (4, 4));
+    for ((agent, path), (old_state, old_rowids)) in APPENDABLE.iter().zip(&paths).zip(&before) {
+        let key = canonical(*agent);
+        let state = append_state(&ctx, path);
+        assert!(state.consumed > old_state.consumed, "{agent}");
+        assert_eq!(state.consumed, fs::metadata(path).unwrap().len(), "{agent}");
+        let rowids = rowids(&ctx, &key);
+        assert!(rowids.len() > old_rowids.len(), "{agent}");
+        assert_eq!(
+            &rowids[..old_rowids.len()],
+            old_rowids.as_slice(),
+            "{agent}"
+        );
+        let (session, entries) = snapshot(&lease, &key);
+        assert_eq!(state.entries, entries.len() as u64, "{agent}");
+        assert_eq!((session, entries), cold(&ctx, &key), "{agent}");
+    }
+}
+
+#[test]
+fn unterminated_final_record_is_searchable_then_completed_without_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let path = with_companion(&ctx, Agent::Claude);
+    let key = canonical(Agent::Claude);
+    let prefix = fs::metadata(&path).unwrap().len();
+    append(
+        &path,
+        &json!({"type":"custom-title","customTitle":"Torn title"}).to_string(),
+    );
+    let (lease, result) = refreshed(&ctx, &selected(Agent::Claude));
+    assert_eq!(result.diagnostics, []);
+    let mut found = Vec::new();
+    lease
+        .visit_documents(&key, Some(("torn title", false)), &mut |doc| {
+            found.push((doc.kind, doc.text));
+            Ok(())
+        })
+        .unwrap();
+    assert!(found.contains(&("title".to_string(), "Torn title".to_string())));
+    drop(lease);
+    let state = append_state(&ctx, &path);
+    assert_eq!(state.consumed, prefix);
+    assert_eq!(state.session.title.as_deref(), Some("Native title"));
+    let before = rowids(&ctx, &key);
+    append(
+        &path,
+        &format!(
+            "\n{}\n",
+            json!({"type":"user","timestamp":"2026-08-10T13:00:00Z","message":"torn needle follow-up"})
+        ),
+    );
+    let (lease, result) = refreshed(&ctx, &selected(Agent::Claude));
+    assert_eq!(result.diagnostics, []);
+    let (session, entries) = snapshot(&lease, &key);
+    assert_eq!(session.title.as_deref(), Some("Torn title"));
+    assert_eq!(&rowids(&ctx, &key)[..before.len()], before.as_slice());
+    let ids: BTreeSet<_> = entries.iter().map(|e| e.source_id.clone()).collect();
+    assert_eq!(ids.len(), entries.len());
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|e| e.text == "torn needle follow-up")
+            .count(),
+        1
+    );
+    assert_eq!(
+        append_state(&ctx, &path).consumed,
+        fs::metadata(&path).unwrap().len()
+    );
+    assert_eq!((session, entries), cold(&ctx, &key));
+}
+
+#[test]
+fn recent_torn_final_line_is_not_malformed_and_old_one_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let path = with_companion(&ctx, Agent::Claude);
+    let key = canonical(Agent::Claude);
+    append(&path, "{\"type\":\"assistant\",\"message\":\"half");
+    let (lease, result) = refreshed(&ctx, &selected(Agent::Claude));
+    assert_eq!(result.diagnostics, []);
+    assert!(!result.incomplete);
+    drop(lease);
+    let before = rowids(&ctx, &key);
+    append(&path, " written\"}\n");
+    let (lease, result) = refreshed(&ctx, &selected(Agent::Claude));
+    assert_eq!(result.diagnostics, []);
+    let (session, entries) = snapshot(&lease, &key);
+    assert_eq!(entries.last().unwrap().text, "half written");
+    assert_eq!(&rowids(&ctx, &key)[..before.len()], before.as_slice());
+    assert_eq!((session, entries), cold(&ctx, &key));
+    drop(lease);
+    append(&path, "{\"type\":\"assistant\",\"message\":\"stalled");
+    age(&path);
+    let (_, result) = refreshed(&ctx, &selected(Agent::Claude));
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.as_str(), d.message.as_str()))
+            .collect::<Vec<_>>(),
+        [(
+            "malformed_records",
+            "1 nonempty records were not valid JSON objects"
+        )]
+    );
+}
+
+#[test]
+fn rewritten_prefix_falls_back_to_a_full_reparse() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let path = with_companion(&ctx, Agent::Claude);
+    let key = canonical(Agent::Claude);
+    refreshed(&ctx, &selected(Agent::Claude));
+    let companion = rowids(
+        &ctx,
+        &SessionKey {
+            agent: Agent::Claude,
+            id: "zz-companion".into(),
+        },
+    );
+    let original = fs::read_to_string(&path).unwrap();
+    let rewritten = original.replace("\"Done\"", "\"Dune\"");
+    assert_eq!(rewritten.len(), original.len());
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .write_all(rewritten.as_bytes())
+        .unwrap();
+    append(&path, &appended_records(Agent::Claude));
+    let (lease, result) = refreshed(&ctx, &selected(Agent::Claude));
+    assert_eq!(result.diagnostics, []);
+    let (session, entries) = snapshot(&lease, &key);
+    assert!(entries.iter().any(|e| e.text == "Dune"));
+    let max = companion.iter().max().unwrap();
+    assert!(rowids(&ctx, &key).iter().all(|id| id > max));
+    assert_eq!(
+        append_state(&ctx, &path).consumed,
+        fs::metadata(&path).unwrap().len()
+    );
+    assert_eq!((session, entries), cold(&ctx, &key));
+}
+
+#[test]
+fn truncation_and_replacement_fully_reparse() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let path = with_companion(&ctx, Agent::Pi);
+    let key = canonical(Agent::Pi);
+    append(&path, &appended_records(Agent::Pi));
+    refreshed(&ctx, &selected(Agent::Pi));
+    let inode = append_state(&ctx, &path).ino;
+    let fixture = jsonl_fixture(Agent::Pi);
+    let shorter: String = fixture
+        .lines()
+        .take(2)
+        .map(|l| l.to_owned() + "\n")
+        .collect();
+    fs::write(&path, &shorter).unwrap();
+    let (lease, result) = refreshed(&ctx, &selected(Agent::Pi));
+    assert_eq!(result.diagnostics, []);
+    let state = append_state(&ctx, &path);
+    assert_eq!((state.consumed, state.ino), (shorter.len() as u64, inode));
+    let (session, entries) = snapshot(&lease, &key);
+    assert_eq!(session.title.as_deref(), Some("Native title"));
+    assert_eq!((session, entries), cold(&ctx, &key));
+    drop(lease);
+    let replacement = dir.path().join("replacement.jsonl");
+    write(
+        &replacement,
+        &format!("{fixture}{}", appended_records(Agent::Pi)),
+    );
+    fs::rename(&replacement, &path).unwrap();
+    let (lease, result) = refreshed(&ctx, &selected(Agent::Pi));
+    assert_eq!(result.diagnostics, []);
+    let state = append_state(&ctx, &path);
+    assert_eq!(state.ino, fs::metadata(&path).unwrap().ino());
+    assert_ne!(state.ino, inode);
+    let (session, entries) = snapshot(&lease, &key);
+    assert_eq!(session.title.as_deref(), Some("Renamed"));
+    assert_eq!((session, entries), cold(&ctx, &key));
+}
+
+#[test]
+fn compressed_rollouts_always_fully_reparse() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let path = transcript(&ctx, Agent::Codex, "rollout").with_extension("jsonl.zst");
+    let compress = |text: &str| {
+        ruzstd::encoding::compress_to_vec(
+            text.as_bytes(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        )
+    };
+    let fixture = jsonl_fixture(Agent::Codex);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, compress(&fixture)).unwrap();
+    let key = canonical(Agent::Codex);
+    refreshed(&ctx, &selected(Agent::Codex));
+    assert_eq!(source_state(&ctx, &path), None);
+    fs::write(
+        &path,
+        compress(&format!("{fixture}{}", appended_records(Agent::Codex))),
+    )
+    .unwrap();
+    let (lease, result) = refreshed(&ctx, &selected(Agent::Codex));
+    assert_eq!(result.diagnostics, []);
+    assert_eq!(source_state(&ctx, &path), None);
+    let (session, entries) = snapshot(&lease, &key);
+    assert_eq!(entries.last().unwrap().text, "exec\n{}");
+    assert_eq!((session, entries), cold(&ctx, &key));
+}
+
+#[test]
+fn droid_settings_change_reparses_and_codex_title_change_resumes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let droid = with_companion(&ctx, Agent::Droid);
+    let codex = with_companion(&ctx, Agent::Codex);
+    let names = &ctx.roots.codex_session_index;
+    write(
+        names,
+        "{\"id\":\"codex-canonical\",\"thread_name\":\"First\"}\n",
+    );
+    let agents = BTreeSet::from([Agent::Codex, Agent::Droid]);
+    refreshed(&ctx, &agents);
+    let companion = rowids(
+        &ctx,
+        &SessionKey {
+            agent: Agent::Droid,
+            id: "zz-companion".into(),
+        },
+    );
+    let codex_state = append_state(&ctx, &codex);
+    let codex_rowids = rowids(&ctx, &canonical(Agent::Codex));
+    write(
+        &droid.with_extension("settings.json"),
+        "{\"tags\":[{\"name\":\"exec\"}]}",
+    );
+    append(&droid, &appended_records(Agent::Droid));
+    write(
+        names,
+        "{\"id\":\"codex-canonical\",\"thread_name\":\"Second\"}\n",
+    );
+    let (lease, result) = refreshed(&ctx, &agents);
+    assert_eq!(result.diagnostics, []);
+    let max = companion.iter().max().unwrap();
+    assert!(
+        rowids(&ctx, &canonical(Agent::Droid))
+            .iter()
+            .all(|id| id > max)
+    );
+    let (session, entries) = snapshot(&lease, &canonical(Agent::Droid));
+    assert!(entries.iter().all(|e| e.automated));
+    assert_eq!((session, entries), cold(&ctx, &canonical(Agent::Droid)));
+    assert_eq!(append_state(&ctx, &codex), codex_state);
+    assert_eq!(rowids(&ctx, &canonical(Agent::Codex)), codex_rowids);
+    let (session, entries) = snapshot(&lease, &canonical(Agent::Codex));
+    assert_eq!(
+        (session.title.as_deref(), session.title_origin),
+        (Some("Second"), Some(TitleOrigin::Native))
+    );
+    let mut titles = Vec::new();
+    lease
+        .visit_documents(
+            &canonical(Agent::Codex),
+            Some(("second", false)),
+            &mut |doc| {
+                titles.push((doc.kind, doc.text));
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        titles
+            .iter()
+            .filter(|(kind, _)| kind == "title")
+            .collect::<Vec<_>>(),
+        [&("title".to_string(), "Second".to_string())]
+    );
+    assert_eq!((session, entries), cold(&ctx, &canonical(Agent::Codex)));
+}
+
+#[test]
+fn cursor_appends_still_fully_reparse() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let fixture = include_str!("fixtures/jsonl/cursor.jsonl");
+    let transcript = |id: &str| {
+        let path = ctx
+            .roots
+            .cursor_projects
+            .join(format!("slug/agent-transcripts/{id}/{id}.jsonl"));
+        write(&path, fixture);
+        write(
+            &ctx.roots.cursor_chats.join(format!("hash/{id}/meta.json")),
+            &json!({"cwd":"/fixture/project","title":"Cursor title","createdAtMs":1_786_356_360_000_i64,"updatedAtMs":1_786_356_480_000_i64}).to_string(),
+        );
+        path
+    };
+    let path = transcript("main");
+    transcript("zz-companion");
+    let key = SessionKey {
+        agent: Agent::Cursor,
+        id: "main".into(),
+    };
+    let (_, result) = refreshed(&ctx, &selected(Agent::Cursor));
+    assert_eq!(result.diagnostics, []);
+    assert_eq!(source_state(&ctx, &path), None);
+    let companion = rowids(
+        &ctx,
+        &SessionKey {
+            agent: Agent::Cursor,
+            id: "zz-companion".into(),
+        },
+    );
+    append(
+        &path,
+        &format!(
+            "{}\n",
+            json!({"role":"assistant","message":{"content":[{"type":"text","text":"appended cursor reply"}]}})
+        ),
+    );
+    let (lease, result) = refreshed(&ctx, &selected(Agent::Cursor));
+    assert_eq!(result.diagnostics, []);
+    assert_eq!(source_state(&ctx, &path), None);
+    let max = companion.iter().max().unwrap();
+    assert!(rowids(&ctx, &key).iter().all(|id| id > max));
+    let (session, entries) = snapshot(&lease, &key);
+    assert_eq!(entries.last().unwrap().text, "appended cursor reply");
+    assert_eq!((session, entries), cold(&ctx, &key));
+}
+
+fn codes(result: &Envelope<IndexStats>) -> Vec<&str> {
+    result.diagnostics.iter().map(|d| d.code.as_str()).collect()
+}
+
+const fn counts(result: &Envelope<IndexStats>) -> (u64, u64) {
+    let stats = result.data.as_ref().unwrap();
+    (stats.reparsed, stats.reused)
+}
+
+#[test]
+fn unchanged_recent_torn_final_line_is_rechecked_until_it_counts_as_malformed() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let path = with_companion(&ctx, Agent::Claude);
+    let key = canonical(Agent::Claude);
+    append(&path, "{\"type\":\"assistant\",\"message\":\"half");
+    let (_, result) = refreshed(&ctx, &selected(Agent::Claude));
+    assert_eq!(result.diagnostics, []);
+    let before = rowids(&ctx, &key);
+    let (_, result) = refreshed(&ctx, &selected(Agent::Claude));
+    assert_eq!(result.diagnostics, []);
+    assert_eq!(counts(&result), (1, 1));
+    assert_eq!(rowids(&ctx, &key), before);
+    age(&path);
+    let (_, result) = refreshed(&ctx, &selected(Agent::Claude));
+    assert_eq!(codes(&result), ["malformed_records"]);
+    assert!(result.incomplete);
+    assert_eq!(rowids(&ctx, &key), before);
+}
+
+#[test]
+fn unchanged_recent_torn_title_index_line_is_rechecked_until_it_counts_as_malformed() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    with_companion(&ctx, Agent::Codex);
+    let names = &ctx.roots.codex_session_index;
+    write(
+        names,
+        "{\"id\":\"codex-canonical\",\"thread_name\":\"First\"}\n{\"id\":\"zz-companion\",\"thr",
+    );
+    let (_, result) = refreshed(&ctx, &selected(Agent::Codex));
+    assert_eq!(result.diagnostics, []);
+    let (lease, result) = refreshed(&ctx, &selected(Agent::Codex));
+    assert_eq!(result.diagnostics, []);
+    assert_eq!(counts(&result), (2, 0));
+    let session = lease.session(&canonical(Agent::Codex)).unwrap().unwrap();
+    assert_eq!(session.title.as_deref(), Some("First"));
+    drop(lease);
+    age(names);
+    let (_, result) = refreshed(&ctx, &selected(Agent::Codex));
+    assert_eq!(codes(&result), ["malformed_metadata", "malformed_metadata"]);
+}
+
+#[test]
+fn unchanged_recent_torn_cursor_line_is_rechecked_until_it_counts_as_malformed() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let path = ctx
+        .roots
+        .cursor_projects
+        .join("slug/agent-transcripts/main/main.jsonl");
+    write(
+        &path,
+        &format!(
+            "{}{{\"role\":\"assistant\",\"mess",
+            include_str!("fixtures/jsonl/cursor.jsonl")
+        ),
+    );
+    write(
+        &ctx.roots.cursor_chats.join("hash/main/meta.json"),
+        &json!({"cwd":"/fixture/project","title":"Cursor title","createdAtMs":1_786_356_360_000_i64}).to_string(),
+    );
+    let (_, result) = refreshed(&ctx, &selected(Agent::Cursor));
+    assert_eq!(result.diagnostics, []);
+    let (_, result) = refreshed(&ctx, &selected(Agent::Cursor));
+    assert_eq!(result.diagnostics, []);
+    assert_eq!(counts(&result), (1, 0));
+    age(&path);
+    let (_, result) = refreshed(&ctx, &selected(Agent::Cursor));
+    assert_eq!(codes(&result), ["malformed_records"]);
+}
+
+#[test]
+fn partial_source_resumes_and_keeps_its_diagnostic() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let path = with_companion(&ctx, Agent::Claude);
+    let key = canonical(Agent::Claude);
+    append(&path, "not json\n");
+    let (_, result) = refreshed(&ctx, &selected(Agent::Claude));
+    assert_eq!(codes(&result), ["malformed_records"]);
+    let before = rowids(&ctx, &key);
+    let old_state = append_state(&ctx, &path);
+    assert_eq!(old_state.malformed, 1);
+    append(&path, &appended_records(Agent::Claude));
+    let (lease, result) = refreshed(&ctx, &selected(Agent::Claude));
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.as_str(), d.message.as_str()))
+            .collect::<Vec<_>>(),
+        [(
+            "malformed_records",
+            "1 nonempty records were not valid JSON objects"
+        )]
+    );
+    assert_eq!(counts(&result), (1, 1));
+    let state = append_state(&ctx, &path);
+    assert!(state.consumed > old_state.consumed);
+    assert_eq!(state.consumed, fs::metadata(&path).unwrap().len());
+    assert_eq!(state.malformed, 1);
+    let resumed = rowids(&ctx, &key);
+    assert!(resumed.len() > before.len());
+    assert_eq!(&resumed[..before.len()], before.as_slice());
+    let resumed_snapshot = snapshot(&lease, &key);
+    drop(lease);
+    let cold_dir = tempfile::tempdir().unwrap();
+    let mut other = ctx.clone();
+    other.index_dir = cold_dir.path().join("index");
+    let (cold, result) = refreshed(&other, &selected(Agent::Claude));
+    assert_eq!(codes(&result), ["malformed_records"]);
+    assert_eq!(resumed_snapshot, snapshot(&cold, &key));
+    let (_, result) = refreshed(&ctx, &selected(Agent::Claude));
+    assert_eq!(codes(&result), ["malformed_records"]);
+    assert_eq!(counts(&result), (1, 1));
+    assert_eq!(rowids(&ctx, &key), resumed);
 }

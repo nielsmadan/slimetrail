@@ -49,8 +49,28 @@ pub(super) fn cache(
     namespace: &str,
     agent: Agent,
 ) -> Result<DiscoveryCache> {
-    let mut statement = connection.prepare("SELECT s.id,s.source,s.dependencies,s.fingerprint,s.state FROM sources s JOIN sessions t ON t.namespace=s.namespace AND t.agent=s.agent AND t.id=s.id AND t.source=s.source WHERE s.namespace=?1 AND s.agent=?2 AND s.status='fresh'")?;
-    let mut rows = statement.query((namespace, agent.to_string()))?;
+    Ok(DiscoveryCache {
+        by_source: cached(connection, namespace, agent, "fresh")?,
+        verify: false,
+    })
+}
+
+pub(super) fn partial(
+    connection: &Connection,
+    namespace: &str,
+    agent: Agent,
+) -> Result<BTreeMap<String, CachedSource>> {
+    cached(connection, namespace, agent, "partial")
+}
+
+fn cached(
+    connection: &Connection,
+    namespace: &str,
+    agent: Agent,
+    status: &str,
+) -> Result<BTreeMap<String, CachedSource>> {
+    let mut statement = connection.prepare("SELECT s.id,s.source,s.dependencies,s.fingerprint,s.state FROM sources s JOIN sessions t ON t.namespace=s.namespace AND t.agent=s.agent AND t.id=s.id AND t.source=s.source WHERE s.namespace=?1 AND s.agent=?2 AND s.status=?3")?;
+    let mut rows = statement.query((namespace, agent.to_string(), status))?;
     let mut by_source = BTreeMap::new();
     while let Some(row) = rows.next()? {
         let source: String = row.get(1)?;
@@ -72,10 +92,7 @@ pub(super) fn cache(
             },
         );
     }
-    Ok(DiscoveryCache {
-        by_source,
-        verify: false,
-    })
+    Ok(by_source)
 }
 
 pub(super) fn next_generation(
@@ -212,6 +229,62 @@ pub(super) fn session(
             encode(session)?
         ],
     )?;
+    title(connection, namespace, raw, session)
+}
+
+pub(super) fn truncate(
+    connection: &Connection,
+    namespace: &str,
+    raw: &RawSession,
+    from: u64,
+) -> Result<()> {
+    let from = i64::try_from(from)
+        .map_err(|_| Error::InvalidArgument("entry index exceeds SQLite range".into()))?;
+    let key = params![
+        namespace,
+        raw.key.agent.to_string(),
+        raw.key.id,
+        raw.source,
+        from
+    ];
+    connection.execute("DELETE FROM search_documents WHERE namespace=?1 AND agent=?2 AND id=?3 AND source=?4 AND (entry_index IS NULL OR entry_index>=?5)", key)?;
+    connection.execute("DELETE FROM entries WHERE namespace=?1 AND agent=?2 AND id=?3 AND source=?4 AND entry_index>=?5", key)?;
+    Ok(())
+}
+
+pub(super) fn update_session(
+    connection: &Connection,
+    namespace: &str,
+    raw: &RawSession,
+    session: &Session,
+) -> Result<bool> {
+    if session.key != raw.key || session.source != raw.source {
+        return Err(Error::InvalidArgument(
+            "source changed its session identity during parsing".into(),
+        ));
+    }
+    let updated = connection.execute(
+        "UPDATE sessions SET metadata=?5 WHERE namespace=?1 AND agent=?2 AND id=?3 AND source=?4",
+        params![
+            namespace,
+            raw.key.agent.to_string(),
+            raw.key.id,
+            raw.source,
+            encode(session)?
+        ],
+    )?;
+    if updated == 1 {
+        title(connection, namespace, raw, session)?;
+    }
+    Ok(updated == 1)
+}
+
+fn title(
+    connection: &Connection,
+    namespace: &str,
+    raw: &RawSession,
+    session: &Session,
+) -> Result<()> {
     if session.title_origin == Some(TitleOrigin::Native)
         && let Some(title) = &session.title
     {

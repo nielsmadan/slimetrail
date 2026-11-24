@@ -116,6 +116,7 @@ pub struct RawSession {
     pub dependencies: Vec<PathBuf>,
     pub fingerprint: Fingerprint,
     pub snapshot: Option<Arc<PrivateSnapshot>>,
+    pub resume: Option<AppendState>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppendState {
@@ -164,6 +165,7 @@ pub struct ParsedSession {
     pub diagnostics: Vec<Diagnostic>,
     pub complete: bool,
     pub state: Option<SourceState>,
+    pub recheck: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexStats {

@@ -473,6 +473,7 @@ impl Source for Cursor {
                         dependencies,
                         fingerprint: signature,
                         snapshot,
+                        resume: None,
                     },
                 ))
             })();
@@ -602,7 +603,7 @@ impl Source for Cursor {
         };
         let mut pending = None;
         let mut index = 0;
-        let malformed = records(path, &mut |line, record| {
+        let tally = records(path, &mut |line, record| {
             for (part, mut entry) in normalize(record).into_iter().enumerate() {
                 entry.session = session.key.clone();
                 entry.index = index;
@@ -630,7 +631,7 @@ impl Source for Cursor {
             }
             emit(entry)?;
         }
-        if malformed > 0 {
+        if tally.malformed > 0 {
             diagnostics.push(diagnostic(
                 Agent::Cursor,
                 path,
@@ -643,6 +644,7 @@ impl Source for Cursor {
             complete: diagnostics.is_empty(),
             diagnostics,
             state: None,
+            recheck: tally.recheck,
         })
     }
 }
