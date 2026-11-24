@@ -87,6 +87,7 @@ fn ingest(
         "pending",
         &[],
         generation,
+        None,
     )?;
     transaction.execute(
         "DELETE FROM sessions WHERE namespace=?1 AND agent=?2 AND (id=?3 OR source=?4)",
@@ -150,6 +151,7 @@ fn ingest(
         if complete { "fresh" } else { "partial" },
         &parsed.diagnostics,
         generation,
+        parsed.state.as_ref(),
     )?;
     transaction.commit()?;
     Ok(Outcome::Stable {
@@ -162,9 +164,10 @@ pub(super) fn run(
     index: &mut IndexSession,
     agents: &BTreeSet<Agent>,
     notice: bool,
+    verify: bool,
 ) -> Result<Envelope<IndexStats>> {
     let readers = sources::registry_in(&index.context, &index.staging.path);
-    run_noting(index, agents, readers, notice)
+    run_noting(index, agents, readers, notice, verify)
 }
 
 #[cfg(test)]
@@ -173,7 +176,7 @@ fn run_sources(
     agents: &BTreeSet<Agent>,
     readers: Vec<Box<dyn Source>>,
 ) -> Result<Envelope<IndexStats>> {
-    run_noting(index, agents, readers, false)
+    run_noting(index, agents, readers, false, false)
 }
 
 fn run_noting(
@@ -181,11 +184,12 @@ fn run_noting(
     agents: &BTreeSet<Agent>,
     readers: Vec<Box<dyn Source>>,
     notice: bool,
+    verify: bool,
 ) -> Result<Envelope<IndexStats>> {
     let mut writer = index
         .writer(REFRESH_WAIT, notice)?
         .ok_or(Error::IndexBusy)?;
-    let result = write(index, &mut writer, agents, readers)?;
+    let result = write(index, &mut writer, agents, readers, verify)?;
     index.publish(writer, false)?;
     Ok(result)
 }
@@ -199,6 +203,7 @@ pub(super) fn write(
     writer: &mut Writer,
     agents: &BTreeSet<Agent>,
     readers: Vec<Box<dyn Source>>,
+    verify: bool,
 ) -> Result<Envelope<IndexStats>> {
     let started = Instant::now();
     let seq = store::begin_run(&writer.connection)?;
@@ -217,7 +222,10 @@ pub(super) fn write(
     for source in selected {
         let agent = source.agent();
         index.refreshed.remove(&agent);
-        let previous = store::cache(&writer.connection, &index.namespace, agent)?;
+        let previous = DiscoveryCache {
+            verify,
+            ..store::cache(&writer.connection, &index.namespace, agent)?
+        };
         let Ok(discovery) = source.discover(&index.context, &previous) else {
             let failed = [diagnostic(
                 agent,
@@ -259,11 +267,12 @@ pub(super) fn write(
                 ));
                 continue;
             }
-            let reusable = previous.by_source.get(&raw.source).is_some_and(|cached| {
-                cached.key == raw.key
-                    && cached.dependencies == raw.dependencies
-                    && cached.fingerprint == raw.fingerprint
-            });
+            let reusable = raw.snapshot.is_none()
+                && previous.by_source.get(&raw.source).is_some_and(|cached| {
+                    cached.key == raw.key
+                        && cached.dependencies == raw.dependencies
+                        && cached.fingerprint == raw.fingerprint
+                });
             if reusable {
                 writer.connection.execute("UPDATE sources SET generation=?1 WHERE namespace=?2 AND agent=?3 AND source=?4 AND status='fresh'",params![generation,index.namespace,agent.to_string(),raw.source])?;
                 stats.reused += 1;
@@ -280,6 +289,7 @@ pub(super) fn write(
                 ));
                 let empty = DiscoveryCache {
                     by_source: BTreeMap::new(),
+                    verify: false,
                 };
                 if let Ok(mut discovery) = source.discover(&index.context, &empty)
                     && let Some(found) = discovery
@@ -319,6 +329,7 @@ pub(super) fn write(
                         "failed",
                         std::slice::from_ref(&failed),
                         generation,
+                        None,
                     )?;
                     agent_diagnostics.push(failed);
                 }
@@ -810,6 +821,7 @@ mod tests {
         let reader = staged(&index, Agent::Cursor);
         let empty = DiscoveryCache {
             by_source: BTreeMap::new(),
+            verify: false,
         };
         let discovery = reader.discover(&index.context, &empty).unwrap();
         assert!(discovery.sessions[0].snapshot.is_some());

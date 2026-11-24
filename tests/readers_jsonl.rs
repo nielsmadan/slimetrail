@@ -59,6 +59,7 @@ fn discover(source: &dyn Source, ctx: &Context) -> Discovery {
             ctx,
             &DiscoveryCache {
                 by_source: BTreeMap::new(),
+                verify: false,
             },
         )
         .unwrap()
@@ -356,8 +357,10 @@ fn changed_header_invalidates_cached_identity() {
                 source: raw.source,
                 dependencies: raw.dependencies,
                 fingerprint: raw.fingerprint,
+                state: None,
             },
         )]),
+        verify: false,
     };
     let same = source.discover(&ctx, &cache).unwrap();
     assert_eq!(same.sessions[0].key.id, "pi-canonical");

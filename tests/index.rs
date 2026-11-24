@@ -82,10 +82,10 @@ fn unchanged_touch_and_removal_are_incremental() {
     let first = claude(&ctx, "one", "old content");
     claude(&ctx, "two", "other content");
     let agents = selected(Agent::Claude);
-    let first_run = index::refresh(&ctx, &agents).unwrap();
+    let first_run = index::refresh(&ctx, &agents, false).unwrap();
     assert!(!first_run.incomplete);
     assert_eq!(first_run.data.unwrap().reparsed, 2);
-    let unchanged = index::refresh(&ctx, &agents).unwrap().data.unwrap();
+    let unchanged = index::refresh(&ctx, &agents, false).unwrap().data.unwrap();
     assert_eq!((unchanged.reparsed, unchanged.reused), (0, 2));
     claude(&ctx, "one", "replacement content");
     let mut lease = IndexSession::open(&ctx).unwrap();
@@ -139,7 +139,7 @@ fn unavailable_inventory_keeps_old_rows_visible_and_incomplete() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     claude(&ctx, "one", "prior text");
-    index::refresh(&ctx, &selected(Agent::Claude)).unwrap();
+    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
     let moved = dir.path().join("temporarily-moved");
     fs::rename(&ctx.roots.claude_projects, &moved).unwrap();
     let mut lease = IndexSession::open(&ctx).unwrap();
@@ -171,7 +171,7 @@ fn replacement_changes_identity_and_truncation_replaces_all_entries() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     let path = claude(&ctx, "one", "first");
-    index::refresh(&ctx, &selected(Agent::Claude)).unwrap();
+    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
     let other = dir.path().join("replacement");
     write(
         &other,
@@ -227,7 +227,7 @@ fn root_and_agent_changes_cannot_reuse_or_delete_other_rows() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     claude(&ctx, "one", "first root");
-    index::refresh(&ctx, &selected(Agent::Claude)).unwrap();
+    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
     let mut other = ctx.clone();
     other.roots.claude_projects = dir.path().join("second-root");
     claude(&other, "one", "second root");
@@ -243,7 +243,7 @@ fn root_and_agent_changes_cannot_reuse_or_delete_other_rows() {
     );
     assert_eq!(texts(&lease, &key("one")), ["second root"]);
     drop(lease);
-    index::refresh(&ctx, &selected(Agent::Pi)).unwrap();
+    index::refresh(&ctx, &selected(Agent::Pi), false).unwrap();
     let mut lease = IndexSession::open(&ctx).unwrap();
     lease.refresh_under_lease(&selected(Agent::Claude)).unwrap();
     assert_eq!(texts(&lease, &key("one")), ["first root"]);
@@ -284,7 +284,7 @@ fn permissions_symlinks_and_native_overlap_are_rejected_before_writes() {
 fn private_modes_and_exact_older_version_pruning() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
-    index::refresh(&ctx, &selected(Agent::Claude)).unwrap();
+    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
     let older = [
         "index-v0.sqlite3",
         "index-v0.sqlite3-wal",
@@ -338,7 +338,7 @@ fn new_index_is_v3_in_wal_mode_with_incremental_auto_vacuum() {
     assert_eq!((VERSION, DATABASE), (3, "index-v3.sqlite3"));
     drop(IndexSession::open(&ctx).unwrap());
     assert!(!ctx.index_dir.join(DATABASE).exists());
-    index::refresh(&ctx, &selected(Agent::Claude)).unwrap();
+    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
     let db = Connection::open(ctx.index_dir.join(DATABASE)).unwrap();
     let mode: String = db
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
@@ -383,7 +383,7 @@ fn query_after_another_sessions_refresh_reuses_its_published_runs() {
     let ctx = context(dir.path());
     claude(&ctx, "one", "first text");
     let agents = selected(Agent::Claude);
-    index::refresh(&ctx, &agents).unwrap();
+    index::refresh(&ctx, &agents, false).unwrap();
     let mut waiting = IndexSession::open(&ctx).unwrap();
     claude(&ctx, "two", "second text");
     let mut other = IndexSession::open(&ctx).unwrap();
@@ -462,7 +462,7 @@ fn database_wal_changes_and_partial_cache_preserve_full_inventory() {
     writer.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE session(id TEXT,directory TEXT,title TEXT,time_created INTEGER,time_updated INTEGER); CREATE TABLE message(id TEXT,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT,message_id TEXT,time_created INTEGER,data TEXT); INSERT INTO session VALUES('one','/fixture','Title',1,2),('two','/fixture','Other',1,2); INSERT INTO message VALUES('m','one',1,'{\"role\":\"user\"}'); INSERT INTO part VALUES('p','m',1,'{\"type\":\"text\",\"text\":\"first\"}');").unwrap();
     let agents = selected(Agent::Opencode);
     assert_eq!(
-        index::refresh(&ctx, &agents)
+        index::refresh(&ctx, &agents, false)
             .unwrap()
             .data
             .unwrap()
@@ -470,14 +470,18 @@ fn database_wal_changes_and_partial_cache_preserve_full_inventory() {
         2
     );
     assert_eq!(
-        index::refresh(&ctx, &agents).unwrap().data.unwrap().reused,
+        index::refresh(&ctx, &agents, false)
+            .unwrap()
+            .data
+            .unwrap()
+            .reused,
         2
     );
     let db = Connection::open(ctx.index_dir.join(DATABASE)).unwrap();
     db.execute_batch("PRAGMA foreign_keys=ON; DELETE FROM sources WHERE id='two';")
         .unwrap();
     drop(db);
-    let recovered = index::refresh(&ctx, &agents).unwrap();
+    let recovered = index::refresh(&ctx, &agents, false).unwrap();
     assert!(!recovered.incomplete);
     assert_eq!(
         (
@@ -575,7 +579,7 @@ fn foreign_keys_reject_cross_namespace_and_cross_source_links() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     claude(&ctx, "one", "content");
-    index::refresh(&ctx, &selected(Agent::Claude)).unwrap();
+    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
     let db = Connection::open(ctx.index_dir.join(DATABASE)).unwrap();
     db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
     for column in ["namespace", "source"] {
@@ -629,7 +633,7 @@ fn codex_native_title_dependency_invalidates_unchanged_transcript() {
         "{\"id\":\"one\",\"thread_name\":\"First title\"}\n",
     );
     let agents = selected(Agent::Codex);
-    index::refresh(&ctx, &agents).unwrap();
+    index::refresh(&ctx, &agents, false).unwrap();
     write(
         &ctx.roots.codex_session_index,
         "{\"id\":\"one\",\"thread_name\":\"Later title\"}\n",
@@ -660,7 +664,7 @@ fn namespace_canonicalization_does_not_bypass_reader_symlink_guards() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     let path = claude(&ctx, "one", "original");
-    index::refresh(&ctx, &selected(Agent::Claude)).unwrap();
+    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
     let moved = dir.path().join("other-store");
     fs::rename(&ctx.roots.claude_projects, &moved).unwrap();
     symlink(&moved, &ctx.roots.claude_projects).unwrap();

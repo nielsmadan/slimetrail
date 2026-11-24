@@ -9,9 +9,18 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-pub fn refresh(ctx: &Context, agents: &BTreeSet<Agent>) -> Result<Envelope<IndexStats>> {
+pub fn refresh(
+    ctx: &Context,
+    agents: &BTreeSet<Agent>,
+    verify: bool,
+) -> Result<Envelope<IndexStats>> {
     // Placeholder until Context gains `progress`.
-    index::refresh_noting(ctx, &selected(agents), std::io::stderr().is_terminal())
+    index::refresh_noting(
+        ctx,
+        &selected(agents),
+        std::io::stderr().is_terminal(),
+        verify,
+    )
 }
 
 pub fn sessions(ctx: &Context, filter: &Filter) -> Result<Envelope<Vec<Session>>> {

@@ -119,6 +119,7 @@ fn opencode(ctx: &Context) -> Connection {
 const fn empty_cache() -> DiscoveryCache {
     DiscoveryCache {
         by_source: BTreeMap::new(),
+        verify: false,
     }
 }
 
@@ -135,10 +136,12 @@ fn cached(discovery: &Discovery) -> DiscoveryCache {
                         source: r.source.clone(),
                         dependencies: r.dependencies.clone(),
                         fingerprint: r.fingerprint.clone(),
+                        state: None,
                     },
                 )
             })
             .collect(),
+        verify: false,
     }
 }
 
@@ -612,6 +615,7 @@ fn cursor_companion_directory_symlink_reports_incomplete() {
             &ctx,
             &DiscoveryCache {
                 by_source: BTreeMap::new(),
+                verify: false,
             },
         )
         .unwrap();

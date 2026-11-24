@@ -24,7 +24,7 @@ CREATE TABLE refresh_runs(
 CREATE TABLE sources(
  namespace TEXT NOT NULL, agent TEXT NOT NULL, source TEXT NOT NULL,
  id TEXT NOT NULL, dependencies TEXT NOT NULL, fingerprint TEXT NOT NULL,
- status TEXT NOT NULL, diagnostics TEXT NOT NULL, generation INTEGER NOT NULL,
+ status TEXT NOT NULL, diagnostics TEXT NOT NULL, generation INTEGER NOT NULL, state TEXT,
  PRIMARY KEY(namespace,agent,source),
  FOREIGN KEY(namespace,agent) REFERENCES refresh_runs(namespace,agent)
 );

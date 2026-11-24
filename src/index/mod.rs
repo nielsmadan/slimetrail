@@ -94,7 +94,7 @@ impl IndexSession {
         &mut self,
         agents: &BTreeSet<Agent>,
     ) -> Result<Envelope<IndexStats>> {
-        refresh::run(self, agents, false)
+        refresh::run(self, agents, false, false)
     }
 
     pub fn refresh_for_query(&mut self, agents: &BTreeSet<Agent>) -> Result<Envelope<IndexStats>> {
@@ -127,7 +127,7 @@ impl IndexSession {
             skipped(diagnostics, started)
         } else {
             let readers = crate::sources::registry_in(&self.context, &self.staging.path);
-            refresh::write(self, &mut writer, agents, readers)?
+            refresh::write(self, &mut writer, agents, readers, false)?
         };
         self.publish(writer, true)?;
         self.seen_seq = schema::refresh_seq(&self.connection)?;
@@ -190,16 +190,21 @@ fn skipped(diagnostics: Vec<Diagnostic>, started: Instant) -> Envelope<IndexStat
     }
 }
 
-pub fn refresh(ctx: &Context, agents: &BTreeSet<Agent>) -> Result<Envelope<IndexStats>> {
-    IndexSession::open(ctx)?.refresh_under_lease(agents)
+pub fn refresh(
+    ctx: &Context,
+    agents: &BTreeSet<Agent>,
+    verify: bool,
+) -> Result<Envelope<IndexStats>> {
+    refresh::run(&mut IndexSession::open(ctx)?, agents, false, verify)
 }
 
 pub(crate) fn refresh_noting(
     ctx: &Context,
     agents: &BTreeSet<Agent>,
     notice: bool,
+    verify: bool,
 ) -> Result<Envelope<IndexStats>> {
-    refresh::run(&mut IndexSession::open(ctx)?, agents, notice)
+    refresh::run(&mut IndexSession::open(ctx)?, agents, notice, verify)
 }
 
 #[cfg(test)]
@@ -231,6 +236,7 @@ mod tests {
                 &index.context,
                 &DiscoveryCache {
                     by_source: BTreeMap::new(),
+                    verify: false,
                 },
             )
             .unwrap();

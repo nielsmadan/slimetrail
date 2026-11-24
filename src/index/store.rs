@@ -1,7 +1,7 @@
 use super::IndexSession;
 use crate::{
     Agent, CachedSource, Diagnostic, DiscoveryCache, Entry, Error, Kind, RawSession, Result,
-    Session, SessionKey, TitleOrigin,
+    Session, SessionKey, SourceState, TitleOrigin,
 };
 use rusqlite::{Connection, Row, params};
 use std::collections::{BTreeMap, BTreeSet};
@@ -49,7 +49,7 @@ pub(super) fn cache(
     namespace: &str,
     agent: Agent,
 ) -> Result<DiscoveryCache> {
-    let mut statement = connection.prepare("SELECT s.id,s.source,s.dependencies,s.fingerprint FROM sources s JOIN sessions t ON t.namespace=s.namespace AND t.agent=s.agent AND t.id=s.id AND t.source=s.source WHERE s.namespace=?1 AND s.agent=?2 AND s.status='fresh'")?;
+    let mut statement = connection.prepare("SELECT s.id,s.source,s.dependencies,s.fingerprint,s.state FROM sources s JOIN sessions t ON t.namespace=s.namespace AND t.agent=s.agent AND t.id=s.id AND t.source=s.source WHERE s.namespace=?1 AND s.agent=?2 AND s.status='fresh'")?;
     let mut rows = statement.query((namespace, agent.to_string()))?;
     let mut by_source = BTreeMap::new();
     while let Some(row) = rows.next()? {
@@ -64,10 +64,18 @@ pub(super) fn cache(
                 source,
                 dependencies: decode(&row.get::<_, String>(2)?)?,
                 fingerprint: decode(&row.get::<_, String>(3)?)?,
+                state: row
+                    .get::<_, Option<String>>(4)?
+                    .as_deref()
+                    .map(decode)
+                    .transpose()?,
             },
         );
     }
-    Ok(DiscoveryCache { by_source })
+    Ok(DiscoveryCache {
+        by_source,
+        verify: false,
+    })
 }
 
 pub(super) fn next_generation(
@@ -138,9 +146,10 @@ pub(super) fn source(
     status: &str,
     diagnostics: &[Diagnostic],
     generation: i64,
+    state: Option<&SourceState>,
 ) -> Result<()> {
-    connection.execute("INSERT INTO sources(namespace,agent,source,id,dependencies,fingerprint,status,diagnostics,generation) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(namespace,agent,source) DO UPDATE SET id=excluded.id,dependencies=excluded.dependencies,fingerprint=excluded.fingerprint,status=excluded.status,diagnostics=excluded.diagnostics,generation=excluded.generation",
-        params![namespace,raw.key.agent.to_string(),raw.source,raw.key.id,encode(&raw.dependencies)?,encode(&raw.fingerprint)?,status,encode(&diagnostics)?,generation])?;
+    connection.execute("INSERT INTO sources(namespace,agent,source,id,dependencies,fingerprint,status,diagnostics,generation,state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(namespace,agent,source) DO UPDATE SET id=excluded.id,dependencies=excluded.dependencies,fingerprint=excluded.fingerprint,status=excluded.status,diagnostics=excluded.diagnostics,generation=excluded.generation,state=excluded.state",
+        params![namespace,raw.key.agent.to_string(),raw.source,raw.key.id,encode(&raw.dependencies)?,encode(&raw.fingerprint)?,status,encode(&diagnostics)?,generation,state.map(encode).transpose()?])?;
     Ok(())
 }
 

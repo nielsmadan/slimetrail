@@ -118,11 +118,34 @@ pub struct RawSession {
     pub snapshot: Option<Arc<PrivateSnapshot>>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppendState {
+    pub consumed: u64,
+    pub prefix_sha256: String,
+    pub lines: u64,
+    pub entries: u64,
+    pub malformed: u64,
+    pub dev: u64,
+    pub ino: u64,
+    pub others: String,
+    pub session: Session,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Stored once per source; the shared interface keeps AppendState inline"
+)]
+pub enum SourceState {
+    Append(AppendState),
+    Content { sha256: String },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CachedSource {
     pub key: SessionKey,
     pub source: String,
     pub dependencies: Vec<PathBuf>,
     pub fingerprint: Fingerprint,
+    pub state: Option<SourceState>,
 }
 #[derive(Debug)]
 pub struct Discovery {
@@ -133,12 +156,14 @@ pub struct Discovery {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveryCache {
     pub by_source: BTreeMap<String, CachedSource>,
+    pub verify: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedSession {
     pub session: Session,
     pub diagnostics: Vec<Diagnostic>,
     pub complete: bool,
+    pub state: Option<SourceState>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexStats {

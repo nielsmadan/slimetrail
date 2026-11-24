@@ -169,7 +169,7 @@ fn default_selection_refreshes_all_and_callbacks_can_stop() {
     let ctx = context(dir.path());
     six(&ctx);
     assert_eq!(
-        refresh(&ctx, &BTreeSet::new())
+        refresh(&ctx, &BTreeSet::new(), false)
             .unwrap()
             .data
             .unwrap()

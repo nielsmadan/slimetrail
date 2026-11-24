@@ -280,6 +280,7 @@ impl Source for Opencode {
             session,
             complete: diagnostics.is_empty(),
             diagnostics,
+            state: None,
         })
     }
 }

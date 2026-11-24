@@ -689,6 +689,7 @@ impl FileReader {
             session,
             complete: diagnostics.is_empty(),
             diagnostics,
+            state: None,
         })
     }
 }
@@ -1044,6 +1045,7 @@ mod tests {
                 &ctx,
                 &DiscoveryCache {
                     by_source: BTreeMap::new(),
+                    verify: false,
                 },
             )
             .unwrap();

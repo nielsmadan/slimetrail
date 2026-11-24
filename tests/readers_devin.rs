@@ -1,10 +1,15 @@
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use slimetrail::{
+    index::{self, IndexSession},
     sources::{Source, source_for},
     *,
 };
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 fn context(base: &Path) -> Context {
     Context {
@@ -201,6 +206,7 @@ fn discover(source: &dyn Source, ctx: &Context) -> Discovery {
             ctx,
             &DiscoveryCache {
                 by_source: BTreeMap::new(),
+                verify: false,
             },
         )
         .unwrap()
@@ -417,10 +423,12 @@ fn devin_reuses_unchanged_snapshot_and_rereads_changes() {
                         source: r.source.clone(),
                         dependencies: r.dependencies.clone(),
                         fingerprint: r.fingerprint.clone(),
+                        state: None,
                     },
                 )
             })
             .collect(),
+        verify: false,
     };
     let unchanged = source.discover(&ctx, &cache).unwrap();
     assert!(unchanged.sessions.iter().all(|r| r.snapshot.is_none()));
@@ -541,4 +549,270 @@ fn devin_subagent_child_is_searchable_but_excluded_from_timeline() {
         ["main"]
     );
     assert_eq!(result.sessions[0].spans[0].human_prompts, 2);
+}
+
+fn devin() -> BTreeSet<Agent> {
+    BTreeSet::from([Agent::Devin])
+}
+
+fn refreshed(ctx: &Context, verify: bool) -> (u64, u64, u64, u64) {
+    let result = index::refresh(ctx, &devin(), verify).unwrap();
+    assert_eq!(result.diagnostics, []);
+    let stats = result.data.unwrap();
+    (
+        stats.discovered,
+        stats.reused,
+        stats.reparsed,
+        stats.removed,
+    )
+}
+
+fn queried(ctx: &Context) -> (IndexSession, IndexStats) {
+    let mut index = IndexSession::open(ctx).unwrap();
+    let result = index.refresh_for_query(&devin()).unwrap();
+    assert_eq!(result.diagnostics, []);
+    (index, result.data.unwrap())
+}
+
+fn texts(index: &IndexSession, id: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    index
+        .visit_entries(
+            &SessionKey {
+                agent: Agent::Devin,
+                id: id.into(),
+            },
+            &mut |entry| {
+                found.push(entry.text);
+                Ok(())
+            },
+        )
+        .unwrap();
+    found
+}
+
+fn visible(index: &IndexSession) -> Vec<String> {
+    let mut found = Vec::new();
+    index
+        .visit_sessions(&mut |session| {
+            found.push(session.key.id);
+            Ok(())
+        })
+        .unwrap();
+    found
+}
+
+fn two_sessions(ctx: &Context) -> Connection {
+    let connection = store(ctx);
+    main_session(&connection, "a");
+    main_session(&connection, "b");
+    connection
+        .execute(
+            "INSERT INTO subagent_heads VALUES('a', 'agent1', 22, 1786356250)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(refreshed(ctx, false), (3, 0, 3, 0));
+    connection
+}
+
+#[test]
+fn devin_added_nodes_reparse_only_their_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let connection = two_sessions(&ctx);
+    node(
+        &connection,
+        "b",
+        30,
+        Some(14),
+        &message("user", "user", "Unlinked addition"),
+        &json!({}),
+    );
+    assert_eq!(refreshed(&ctx, false), (3, 2, 1, 0));
+    connection
+        .execute("UPDATE sessions SET main_chain_id=30 WHERE id='b'", [])
+        .unwrap();
+    let (index, stats) = queried(&ctx);
+    assert_eq!((stats.reused, stats.reparsed), (2, 1));
+    assert_eq!(texts(&index, "b").last().unwrap(), "Unlinked addition");
+    assert_eq!(texts(&index, "a").last().unwrap(), "Canceled");
+}
+
+#[test]
+fn devin_deleted_session_is_removed_by_the_next_complete_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let connection = two_sessions(&ctx);
+    connection
+        .execute_batch(
+            "DELETE FROM message_nodes WHERE session_id='b'; DELETE FROM sessions WHERE id='b';",
+        )
+        .unwrap();
+    assert_eq!(refreshed(&ctx, false), (2, 2, 0, 1));
+    let (index, _) = queried(&ctx);
+    assert_eq!(visible(&index), ["a", "a/agent1"]);
+}
+
+#[test]
+fn devin_in_place_edit_is_found_only_by_the_verification_sweep() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let connection = two_sessions(&ctx);
+    assert_eq!(refreshed(&ctx, true), (3, 3, 0, 0));
+    connection
+        .execute(
+            "UPDATE message_nodes SET chat_message=? WHERE session_id='b' AND node_id=9",
+            [message("user", "user", "Rewritten prompt").to_string()],
+        )
+        .unwrap();
+    let (index, stats) = queried(&ctx);
+    assert_eq!((stats.reused, stats.reparsed), (3, 0));
+    assert!(texts(&index, "b").contains(&"Second prompt".to_string()));
+    drop(index);
+    assert_eq!(refreshed(&ctx, true), (3, 2, 1, 0));
+    let (index, stats) = queried(&ctx);
+    assert_eq!((stats.reused, stats.reparsed), (3, 0));
+    let found = texts(&index, "b");
+    assert!(found.contains(&"Rewritten prompt".to_string()));
+    assert!(!found.contains(&"Second prompt".to_string()));
+    assert!(texts(&index, "a").contains(&"Second prompt".to_string()));
+    drop(index);
+    assert_eq!(refreshed(&ctx, true), (3, 3, 0, 0));
+    let stored = Connection::open(ctx.index_dir.join(index::DATABASE))
+        .unwrap()
+        .prepare("SELECT json_extract(state,'$.kind'), length(json_extract(state,'$.sha256')) FROM sources WHERE agent='devin'")
+        .unwrap()
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(stored, vec![("content".to_string(), 64); 3]);
+}
+
+#[test]
+fn devin_moved_child_head_reparses_parent_and_children_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let connection = two_sessions(&ctx);
+    node(
+        &connection,
+        "a",
+        23,
+        Some(22),
+        &message("assistant", "assistant", "child follow-up"),
+        &json!({}),
+    );
+    connection
+        .execute(
+            "UPDATE subagent_heads SET chain_node_id=23, updated_at=1786356260 WHERE session_id='a'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(refreshed(&ctx, false), (3, 1, 2, 0));
+    let (index, _) = queried(&ctx);
+    assert_eq!(
+        texts(&index, "a/agent1"),
+        ["Read notes.txt", "child answer needle", "child follow-up"]
+    );
+    assert_eq!(texts(&index, "a"), texts(&index, "b"));
+}
+
+#[test]
+fn devin_head_moved_back_to_an_existing_node_reparses_only_that_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let connection = two_sessions(&ctx);
+    connection
+        .execute(
+            "UPDATE subagent_heads SET chain_node_id=14 WHERE session_id='a'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(refreshed(&ctx, false), (3, 2, 1, 0));
+}
+
+#[test]
+fn devin_sweep_hash_covers_every_node_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let connection = two_sessions(&ctx);
+    for assignment in [
+        "parent_node_id=coalesce(parent_node_id, 0)+1000",
+        "chat_message=chat_message||' '",
+        "created_at=created_at+1",
+        "metadata=metadata||' '",
+    ] {
+        assert_eq!(refreshed(&ctx, true), (3, 3, 0, 0), "{assignment}");
+        connection
+            .execute(
+                &format!(
+                    "UPDATE message_nodes SET {assignment} WHERE session_id='b' AND node_id=9"
+                ),
+                [],
+            )
+            .unwrap();
+        let stats = index::refresh(&ctx, &devin(), true).unwrap().data.unwrap();
+        assert_eq!(
+            (
+                stats.discovered,
+                stats.reused,
+                stats.reparsed,
+                stats.removed
+            ),
+            (3, 2, 1, 0),
+            "{assignment}"
+        );
+        connection
+            .execute(
+                "UPDATE message_nodes SET parent_node_id=(SELECT parent_node_id FROM message_nodes WHERE session_id='a' AND node_id=9) WHERE session_id='b' AND node_id=9",
+                [],
+            )
+            .unwrap();
+        index::refresh(&ctx, &devin(), true).unwrap();
+    }
+}
+
+#[test]
+fn devin_minimal_schema_without_head_timestamps_or_unique_indexes_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    fs::create_dir_all(ctx.roots.devin_sessions_db.parent().unwrap()).unwrap();
+    let connection = Connection::open(&ctx.roots.devin_sessions_db).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+            CREATE TABLE sessions(id TEXT, working_directory TEXT, title TEXT, created_at INTEGER, last_activity_at INTEGER, main_chain_id INTEGER, hidden INTEGER);
+            CREATE TABLE message_nodes(session_id TEXT, node_id INTEGER, parent_node_id INTEGER, chat_message TEXT, created_at INTEGER, metadata TEXT);
+            CREATE TABLE subagent_heads(session_id TEXT, agent_id TEXT, chain_node_id INTEGER);
+            INSERT INTO subagent_heads VALUES('main', 'agent1', 22);",
+        )
+        .unwrap();
+    main_session(&connection, "main");
+    assert_eq!(refreshed(&ctx, false), (2, 0, 2, 0));
+    let (index, _) = queried(&ctx);
+    assert_eq!(
+        texts(&index, "main/agent1"),
+        ["Read notes.txt", "child answer needle"]
+    );
+    assert_eq!(texts(&index, "main")[0], "needle devin café 🦀");
+    drop(index);
+    assert_eq!(refreshed(&ctx, true), (2, 2, 0, 0));
+    node(
+        &connection,
+        "main",
+        23,
+        Some(22),
+        &message("assistant", "assistant", "child follow-up"),
+        &json!({}),
+    );
+    connection
+        .execute("UPDATE subagent_heads SET chain_node_id=23", [])
+        .unwrap();
+    assert_eq!(refreshed(&ctx, false), (2, 0, 2, 0));
+    let (index, _) = queried(&ctx);
+    assert_eq!(
+        texts(&index, "main/agent1").last().unwrap(),
+        "child follow-up"
+    );
 }

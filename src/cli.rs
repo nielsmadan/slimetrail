@@ -289,7 +289,7 @@ fn execute(cli: &Cli, env: &BTreeMap<String, String>, out: &mut dyn Write) -> Re
                 is_json,
             )
         }
-        Command::Index => emit(out, &refresh(&ctx, &filter.agents)?, is_json),
+        Command::Index => emit(out, &refresh(&ctx, &filter.agents, true)?, is_json),
         Command::Sessions => emit(
             out,
             &convert(sessions(&ctx, &filter)?, |s| {

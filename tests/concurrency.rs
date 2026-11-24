@@ -206,7 +206,7 @@ fn query_during_another_write_answers_from_the_published_index() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     session(&ctx, "one");
-    index::refresh(&ctx, &BTreeSet::from([Agent::Claude])).unwrap();
+    index::refresh(&ctx, &BTreeSet::from([Agent::Claude]), false).unwrap();
     let mut child = worker(&ctx, "writer");
     ready(&mut child);
     let started = Instant::now();
@@ -233,7 +233,7 @@ fn concurrent_searches_on_a_built_index_both_complete() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     session(&ctx, "one");
-    index::refresh(&ctx, &BTreeSet::from([Agent::Claude])).unwrap();
+    index::refresh(&ctx, &BTreeSet::from([Agent::Claude]), false).unwrap();
     let mut first = worker(&ctx, "search");
     let mut second = worker(&ctx, "search");
     ready(&mut first);
