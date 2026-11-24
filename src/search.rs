@@ -25,14 +25,40 @@ pub(crate) fn pattern(options: &SearchOptions) -> Result<Regex> {
             "max_results must be positive".into(),
         ));
     }
-    RegexBuilder::new(&if options.regex {
+    let build = |pattern: &str| {
+        RegexBuilder::new(pattern)
+            .case_insensitive(!options.case_sensitive)
+            .build()
+            .map_err(|_| Error::InvalidArgument("invalid or unsupported regular expression".into()))
+    };
+    let body = if options.regex {
+        if options.word {
+            build(&options.query)?;
+        }
         options.query.clone()
     } else {
         regex::escape(&options.query)
-    })
-    .case_insensitive(!options.case_sensitive)
-    .build()
-    .map_err(|_| Error::InvalidArgument("invalid or unsupported regular expression".into()))
+    };
+    if !options.word {
+        return build(&body);
+    }
+    let tail = if options.regex && ends_in_comment(&body) {
+        "\n"
+    } else {
+        ""
+    };
+    build(&format!(r"\b{{start-half}}(?:{body}{tail})\b{{end-half}}"))
+}
+
+fn ends_in_comment(pattern: &str) -> bool {
+    regex_syntax::ast::parse::Parser::new()
+        .parse_with_comments(pattern)
+        .is_ok_and(|parsed| {
+            parsed
+                .comments
+                .iter()
+                .any(|comment| comment.span.end.offset == pattern.len())
+        })
 }
 
 pub(crate) fn run(

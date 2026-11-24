@@ -66,7 +66,7 @@ fn indexed_literals_equal_independent_scalar_matcher() {
                 .iter()
                 .enumerate()
                 .filter_map(|(i, text)| {
-                    let count = brute(text, query, sensitive);
+                    let count = brute(text, query, sensitive, false);
                     (count > 0).then_some((format!("s{i}"), count))
                 })
                 .collect();
@@ -80,12 +80,12 @@ fn indexed_literals_equal_independent_scalar_matcher() {
     }
 }
 
-fn brute(text: &str, query: &str, sensitive: bool) -> u64 {
+fn brute(text: &str, query: &str, sensitive: bool, word: bool) -> u64 {
     fn fold(c: char) -> char {
         match c {
             'İ' => 'İ',
             'ſ' => 's',
-            'K' => 'k',
+            '\u{212a}' => 'k',
             'Σ' | 'ς' => 'σ',
             _ => c.to_lowercase().next().unwrap(),
         }
@@ -95,19 +95,198 @@ fn brute(text: &str, query: &str, sensitive: bool) -> u64 {
             .map(|c| if sensitive { c } else { fold(c) })
             .collect::<Vec<_>>()
     };
+    let word_char = regex::Regex::new(r"\w").unwrap();
+    let is_word = |c: Option<&char>| c.is_some_and(|c| word_char.is_match(&c.to_string()));
+    let original = text.chars().collect::<Vec<_>>();
     let text = convert(text);
     let query = convert(query);
     let mut position = 0;
     let mut count = 0;
     while position + query.len() <= text.len() {
-        if text[position..position + query.len()] == query {
+        let end = position + query.len();
+        if text[position..end] == query
+            && (!word
+                || (!is_word(position.checked_sub(1).and_then(|i| original.get(i)))
+                    && !is_word(original.get(end))))
+        {
             count += 1;
-            position += query.len();
+            position = end;
         } else {
             position += 1;
         }
     }
     count
+}
+
+fn session_matches(ctx: &Context, opt: &SearchOptions) -> std::collections::BTreeMap<String, u64> {
+    search(ctx, opt, &RefreshOptions::QUERY)
+        .unwrap()
+        .data
+        .unwrap()
+        .results
+        .into_iter()
+        .map(|h| (h.session.key.id, h.matches))
+        .collect()
+}
+
+fn word_texts(ctx: &Context) -> [&'static str; 7] {
+    let texts = [
+        "ABC abc abab a.b a*b \"quoted\" 100% under_score /a/b c:\\path",
+        "ſearch \u{212a}elvin Σ σ ς café CAFÉ cafés",
+        "prefix\0needle suffix needle2 needle_x 2needle NEEDLE",
+        "x---- a.ba.b aaa aaaa aa",
+        "naïve 🐌needle🐌 🐌 use Result<T> here Result<T>x",
+        "no matches",
+        "\"quoted\"x x\"quoted\" 100%5 a/a/b /a/b/ --- ---",
+    ];
+    for (i, text) in texts.iter().enumerate() {
+        claude(
+            ctx,
+            &format!("s{i}"),
+            None,
+            None,
+            &[event("user", text, None)],
+        );
+    }
+    texts
+}
+
+#[test]
+fn word_literals_equal_independent_matcher() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let texts = word_texts(&ctx);
+    for query in [
+        "\"quoted\"",
+        "/a/b",
+        "100%",
+        "a.b",
+        "Result<T>",
+        "---",
+        "needle",
+        "kelvin",
+        "aa",
+        "abc",
+        "search",
+        "café",
+        "naïve",
+        "σ",
+        "🐌",
+        "under_score",
+    ] {
+        for sensitive in [false, true] {
+            let mut opt = options(query);
+            opt.case_sensitive = sensitive;
+            opt.word = true;
+            let expected: std::collections::BTreeMap<_, _> = texts
+                .iter()
+                .enumerate()
+                .filter_map(|(i, text)| {
+                    let count = brute(text, query, sensitive, true);
+                    (count > 0).then_some((format!("s{i}"), count))
+                })
+                .collect();
+            assert_eq!(
+                session_matches(&ctx, &opt),
+                expected,
+                "{query:?}, case_sensitive={sensitive}"
+            );
+        }
+    }
+    assert_eq!(brute("x----", "---", true, true), 1);
+}
+
+#[test]
+fn word_regex_equals_word_literal() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    word_texts(&ctx);
+    for query in [
+        "needle",
+        "abc",
+        "a.b",
+        "Result<T>",
+        "---",
+        "kelvin",
+        "café",
+        "aa",
+        "σ",
+        "/a/b",
+    ] {
+        for sensitive in [false, true] {
+            let mut literal = options(query);
+            literal.case_sensitive = sensitive;
+            literal.word = true;
+            let mut pattern = literal.clone();
+            pattern.regex = true;
+            pattern.query = regex::escape(query);
+            let literal = search(&ctx, &literal, &RefreshOptions::QUERY)
+                .unwrap()
+                .data
+                .unwrap();
+            let pattern = search(&ctx, &pattern, &RefreshOptions::QUERY)
+                .unwrap()
+                .data
+                .unwrap();
+            assert_eq!(literal.count, pattern.count, "{query:?}, {sensitive}");
+            assert_eq!(literal.results, pattern.results, "{query:?}, {sensitive}");
+        }
+    }
+}
+
+#[test]
+fn word_with_invalid_regex_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let mut opt = options("(");
+    opt.regex = true;
+    opt.word = true;
+    assert!(matches!(
+        search(&ctx, &opt, &RefreshOptions::QUERY),
+        Err(Error::InvalidArgument(message)) if message == "invalid or unsupported regular expression"
+    ));
+}
+
+#[test]
+fn word_regex_wrapping_is_safe() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    claude(
+        &ctx,
+        "one",
+        None,
+        None,
+        &[event("user", "foo food xfoo foo bar", None)],
+    );
+    let mut opt = options("(?x)foo # tail");
+    opt.regex = true;
+    opt.word = true;
+    assert_eq!(session_matches(&ctx, &opt), [("one".into(), 2)].into());
+    opt.query = "foo)|(?:bar".into();
+    assert!(matches!(
+        search(&ctx, &opt, &RefreshOptions::QUERY),
+        Err(Error::InvalidArgument(message)) if message == "invalid or unsupported regular expression"
+    ));
+}
+
+#[test]
+fn word_spot_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    for (id, text) in [
+        ("code", "rust code"),
+        ("trust", "trust"),
+        ("rusty", "rusty"),
+        ("underscore", "rust_"),
+        ("generic", "use Result<T> here"),
+    ] {
+        claude(&ctx, id, None, None, &[event("user", text, None)]);
+    }
+    let mut opt = options("rust");
+    opt.word = true;
+    assert_eq!(session_matches(&ctx, &opt), [("code".into(), 1)].into());
+    opt.query = "Result<T>".into();
+    assert_eq!(session_matches(&ctx, &opt), [("generic".into(), 1)].into());
 }
 
 #[test]

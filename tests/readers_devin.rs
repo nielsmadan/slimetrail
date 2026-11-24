@@ -511,6 +511,7 @@ fn devin_subagent_child_is_searchable_but_excluded_from_timeline() {
             query: "child answer".into(),
             regex: false,
             case_sensitive: false,
+            word: false,
             sort: Sort::Score,
             max_results: 10,
             max_snippets: 1,

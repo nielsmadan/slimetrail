@@ -73,7 +73,7 @@ impl Fixture {
 fn search_complete_empty_partial_and_fatal_envelopes() {
     let fixture = Fixture::new();
     fixture.write("Unicode café 🐌 and a.b");
-    let complete = fixture.json(&["search", "A.B", "--codex", "--scope", "all"], 0);
+    let complete = fixture.json(&["search", "A.B", "-i", "--codex", "--scope", "all"], 0);
     assert_eq!(complete["incomplete"], false);
     assert_eq!(complete["diagnostics"].as_array().unwrap().len(), 1);
     assert_eq!(complete["diagnostics"][0]["code"], "search_coverage");
@@ -404,6 +404,102 @@ fn literal_regex_case_and_kind_options_reach_api() {
         0,
     );
     assert_eq!(tools["data"]["count"], 0);
+}
+
+fn occurrences(fixture: &Fixture, args: &[&str]) -> u64 {
+    let value = fixture.json(
+        &[&["search"], args, &["--codex", "--scope", "all"]].concat(),
+        0,
+    );
+    value["data"]["results"][0]["matches"].as_u64().unwrap_or(0)
+}
+
+#[test]
+fn case_flags_follow_smart_case_and_last_flag_wins() {
+    let fixture = Fixture::new();
+    fixture.write("a.b NEEDLE Needle");
+    for (args, expected) in [
+        (&["needle"][..], 2),
+        (&["Needle"], 1),
+        (&["-s", "needle"], 0),
+        (&["--case-sensitive", "needle"], 0),
+        (&["--case-sensitive", "NEEDLE"], 1),
+        (&["-i", "Needle"], 2),
+        (&["--ignore-case", "Needle"], 2),
+        (&["-s", "-i", "Needle"], 2),
+        (&["-i", "-s", "Needle"], 1),
+        (&["-i", "-S", "Needle"], 1),
+        (&["-i", "--smart-case", "needle"], 2),
+    ] {
+        assert_eq!(occurrences(&fixture, args), expected, "{args:?}");
+    }
+}
+
+#[test]
+fn regex_queries_use_smart_case_end_to_end() {
+    let fixture = Fixture::new();
+    fixture.write("a.b NEEDLE Needle");
+    for (args, expected) in [
+        (&["--regex", "Needle|zzz"][..], 1),
+        (&["--regex", "needle|zzz"], 2),
+        (&["-ii", "Needle"], 2),
+        (&["-isS", "Needle"], 1),
+    ] {
+        assert_eq!(occurrences(&fixture, args), expected, "{args:?}");
+    }
+}
+
+#[test]
+fn fixed_strings_and_regex_last_wins() {
+    let fixture = Fixture::new();
+    fixture.write("axb");
+    assert_eq!(occurrences(&fixture, &["--regex", "-F", "a.b"]), 0);
+    assert_eq!(occurrences(&fixture, &["--fixed-strings", "a.b"]), 0);
+    assert_eq!(occurrences(&fixture, &["-F", "--regex", "a.b"]), 1);
+}
+
+#[test]
+fn word_flag_reaches_api() {
+    let fixture = Fixture::new();
+    fixture.write("trust rust_ rust");
+    assert_eq!(occurrences(&fixture, &["rust"]), 3);
+    assert_eq!(occurrences(&fixture, &["-w", "rust"]), 1);
+    assert_eq!(occurrences(&fixture, &["--word-regexp", "rust"]), 1);
+}
+
+#[test]
+fn refs_only_with_json_is_invalid_argument() {
+    let fixture = Fixture::new();
+    fixture.write("needle");
+    for flag in ["-l", "--refs-only"] {
+        let value = fixture.json(&["search", "needle", flag, "--codex", "--scope", "all"], 2);
+        assert_eq!(value["data"], Value::Null);
+        assert_eq!(value["incomplete"], true);
+        assert_eq!(value["diagnostics"][0]["code"], "fatal");
+        assert_eq!(
+            value["diagnostics"][0]["message"],
+            "invalid argument: --refs-only applies to text output; JSON results already include ref"
+        );
+    }
+}
+
+#[test]
+fn search_help_lists_flags() {
+    let fixture = Fixture::new();
+    let help = fixture.run(&["search", "--help"]);
+    assert!(help.status.success());
+    let text = String::from_utf8(help.stdout).unwrap();
+    for flag in [
+        "-i, --ignore-case",
+        "-s, --case-sensitive",
+        "-S, --smart-case",
+        "-F, --fixed-strings",
+        "--regex",
+        "-w, --word-regexp",
+        "-l, --refs-only",
+    ] {
+        assert!(text.contains(flag), "{flag}\n{text}");
+    }
 }
 
 #[test]

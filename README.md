@@ -20,9 +20,11 @@ Run `just` to list commands. `just setup` installs pinned analysis tools and Git
 
 ```sh
 slimetrail search 'connection refused' --scope all
-slimetrail search 'Result<T>' --codex --case-sensitive
+slimetrail search -i 'Result<T>' --codex
+slimetrail search -w rust --scope all
 slimetrail search 'timeout|retry' --regex --claude --pi --days 7
 slimetrail search 'migration' --app slimetrail --kind message,meta --sort recent
+slimetrail search -l 'flaky test' --scope all | head -n 1 | xargs slimetrail read --mode log
 slimetrail sessions --scope all --format json
 slimetrail read codex:SESSION_ID --mode log --max-chars 4000 --format json
 slimetrail read codex:SESSION_ID --mode log --offset 4000 --max-chars 4000 --format json
@@ -35,13 +37,13 @@ Use a returned `ref` as the exact `agent:id` for `read` or `entries`. `read` def
 
 No selector means all seven agents. Named selectors combine; `--all` selects all; `--current` adds the agent named by `AGENT_HARNESS` and requires one of `claude`, `codex`, `cursor`, `devin`, `droid`, `opencode`, `pi`. Missing or inaccessible selected stores make a response incomplete; stderr identifies their agent and source. Unselected unavailable stores do not abort a healthy selection. Select the agents installed on your machine to avoid those diagnostics.
 
-Search defaults to case-insensitive **literal substring** matching. `--regex` opts into Rust regular expressions; look-around and backreferences are unsupported. There is no fuzzy or semantic search. Results are grouped by session and ranked by non-overlapping occurrences: title 5, message 3, metadata 2, tool 1. Only native titles contribute title matches; a title derived from a prompt is display-only. See [search and compatibility details](docs/compatibility.md).
+Search defaults to **literal substring** matching with smart case: a query without uppercase letters matches case-insensitively, and one containing an uppercase letter matches case-sensitively; with `--regex` only literal characters count, so `\W` stays case-insensitive and `\x41` is case-sensitive. `-i`/`--ignore-case` and `-s`/`--case-sensitive` force either mode, `-S`/`--smart-case` selects the default explicitly, and the last of the three wins. `-F`/`--fixed-strings` selects literal matching and `--regex` opts into Rust regular expressions (the last of the two wins); look-around and backreferences are unsupported. `-w`/`--word-regexp` counts only matches whose neighbouring characters are not word characters, so `-w rust` skips `trust` and `rust_` while `-w 'Result<T>'` still matches. `-l`/`--refs-only` prints only the returned refs. Put `--` before a query that starts with `-`, as in `slimetrail search -w -- '-foo'`. There is no fuzzy or semantic search. Results are grouped by session and ranked by non-overlapping occurrences: title 5, message 3, metadata 2, tool 1. Only native titles contribute title matches; a title derived from a prompt is display-only. See [search and compatibility details](docs/compatibility.md).
 
 The default scope is `siblings`: the current directory and sessions whose cwd has the same parent. `--scope current` requires the same cwd; `--scope all` includes sessions with unknown cwd. `--cwd` changes the target directory, with `~` expanded at the CLI boundary. `--app` is a case-insensitive substring of stored cwd and overrides scope selection. Search and sessions `--days` filters by source freshness, not conversation timestamps.
 
 Search defaults: `--max-results 50`, `--max-snippets 3`, `--context 160`, `--sort score`, `--kind all`. Read defaults: `--mode lite`, `--offset 0`, `--max-chars 200000`. Timeline requires `--since` or positive `--days`, accepts `--until`, and defaults to `--idle-minutes 30`. Global flags are accepted around the subcommand, but cwd/app/date/kind filters do not narrow an explicit `read`/`entries` reference; agent selectors still must agree with that reference. `index` refreshes selected agents without applying those query filters.
 
-Search text output shows one block per returned session: its full reference, available title and cwd, occurrence count, score and labelled snippets. The header counts returned sessions after the result limit. Empty searches say `No matches.`; partial searches explicitly say `search incomplete`, including when no matches were found in available sources. Terminal controls and bidirectional formatting controls are escaped for display, with ordinary Unicode preserved. Use `--format json` for automation and original unescaped field values; its version-1 protocol is unchanged.
+Search text output shows one block per returned session: its full reference, available title and cwd, occurrence count, score and labelled snippets. The header counts returned sessions after the result limit. Empty searches say `No matches.`; partial searches explicitly say `search incomplete`, including when no matches were found in available sources. Terminal controls and bidirectional formatting controls are escaped for display, with ordinary Unicode preserved. With `-l`/`--refs-only`, stdout holds only each returned session's ref on its own line in result order, escaped the same way, with no header and nothing at all when there are no matches; stderr diagnostics and exit codes are unchanged, and it cannot be combined with `--format json`. Use `--format json` for automation and original unescaped field values; its version-1 protocol is unchanged.
 
 ## Stores and index
 

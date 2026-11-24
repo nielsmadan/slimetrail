@@ -582,6 +582,7 @@ dependencies = [
  "clap",
  "jiff",
  "regex",
+ "regex-syntax",
  "rusqlite",
  "ruzstd",
  "serde",

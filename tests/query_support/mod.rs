@@ -29,6 +29,7 @@ pub(crate) fn options(query: &str) -> SearchOptions {
         query: query.into(),
         regex: false,
         case_sensitive: false,
+        word: false,
         sort: Sort::Score,
         max_results: 50,
         max_snippets: 3,

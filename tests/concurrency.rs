@@ -78,6 +78,7 @@ fn options() -> SearchOptions {
         query: "content".into(),
         regex: false,
         case_sensitive: false,
+        word: false,
         sort: Sort::Score,
         max_results: 10,
         max_snippets: 1,

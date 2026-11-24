@@ -208,6 +208,44 @@ fn search_text_escapes_terminal_controls_while_json_preserves_source_values() {
 }
 
 #[test]
+fn refs_only_prints_one_ref_per_line() {
+    let fixture = Fixture::new();
+    let empty = fixture.run(&["-l"], 0);
+    assert_eq!(empty.stdout, b"");
+    assert_eq!(empty.stderr, b"");
+    fixture.session("a-second", None, None, &[("assistant", "needle")]);
+    fixture.session("z-first", Some("needle"), None, &[("user", "a needle")]);
+    let output = fixture.run(&["-l"], 0);
+    assert_eq!(output.stdout, b"codex:z-first\ncodex:a-second\n");
+    assert_eq!(output.stderr, b"");
+    assert_eq!(fixture.run(&["--refs-only"], 0).stdout, output.stdout);
+    let capped = fixture.run(&["-l", "--max-results", "1"], 0);
+    assert_eq!(capped.stdout, b"codex:z-first\n");
+    let partial = fixture.run(&["-l", "--claude"], 1);
+    assert_eq!(partial.stdout, output.stdout);
+    assert_eq!(partial.stderr, fixture.run(&["--claude"], 1).stderr);
+    assert_ne!(partial.stderr, b"");
+}
+
+#[test]
+fn refs_only_escapes_terminal_controls_like_the_full_renderer() {
+    let fixture = Fixture::new();
+    let id = "unsafe\u{1b}[2J\r\n\t\u{7}\u{8}\u{7f}\u{9b}\u{202e}";
+    fixture.session(id, None, None, &[("assistant", "needle")]);
+    let refs = String::from_utf8(fixture.run(&["-l"], 0).stdout).unwrap();
+    let full = String::from_utf8(fixture.run(&[], 0).stdout).unwrap();
+    let escaped = full
+        .lines()
+        .find_map(|line| line.strip_prefix("Ref: "))
+        .unwrap();
+    assert_eq!(
+        refs,
+        "codex:unsafe\\u{1b}[2J\\r\\n\\t\\u{7}\\u{8}\\u{7f}\\u{9b}\\u{202e}\n"
+    );
+    assert_eq!(refs, format!("{escaped}\n"));
+}
+
+#[test]
 fn search_text_handles_a_closed_stdout_pipe_quietly() {
     let fixture = Fixture::new();
     fixture.session("sample", None, None, &[("assistant", "needle")]);

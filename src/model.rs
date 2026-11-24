@@ -282,6 +282,8 @@ pub struct SearchOptions {
     pub query: String,
     pub regex: bool,
     pub case_sensitive: bool,
+    #[serde(default)]
+    pub word: bool,
     pub sort: Sort,
     pub max_results: usize,
     pub max_snippets: usize,

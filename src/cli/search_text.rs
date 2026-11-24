@@ -48,6 +48,14 @@ pub(super) fn render(out: &mut dyn Write, result: &Envelope<SearchDataDto>) -> i
     Ok(())
 }
 
+pub(super) fn render_refs(out: &mut dyn Write, result: &Envelope<SearchDataDto>) -> io::Result<()> {
+    result
+        .data
+        .iter()
+        .flat_map(|data| &data.results)
+        .try_for_each(|hit| writeln!(out, "{}", DisplayText(&hit.session.r#ref)))
+}
+
 struct DisplayText<'a>(&'a str);
 
 impl fmt::Display for DisplayText<'_> {
