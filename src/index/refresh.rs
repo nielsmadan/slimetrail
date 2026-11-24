@@ -1,11 +1,14 @@
 use super::{IndexSession, store};
 use crate::{
     Agent, Diagnostic, DiscoveryCache, Envelope, Error, IndexStats, RawSession, Result,
-    sources::{self, Source, jsonl::fingerprint},
+    sources::{self, Source},
 };
 use rusqlite::params;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs,
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
     time::Instant,
 };
 
@@ -15,6 +18,41 @@ fn diagnostic(agent: Agent, source: Option<String>, code: &str, message: &str) -
         source,
         code: code.into(),
         message: message.into(),
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct Stat {
+    identity: (u64, u64),
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+fn stat(path: &Path) -> Option<Stat> {
+    fs::symlink_metadata(path)
+        .ok()
+        .filter(fs::Metadata::is_file)
+        .map(|m| Stat {
+            identity: (m.dev(), m.ino()),
+            size: m.len(),
+            modified: (m.mtime(), m.mtime_nsec()),
+            changed: (m.ctime(), m.ctime_nsec()),
+        })
+}
+
+fn stable(before: &Stat, after: Option<&Stat>) -> bool {
+    after.is_some_and(|after| {
+        before.identity == after.identity && (after.size > before.size || after == before)
+    })
+}
+
+fn live_transcript(raw: &RawSession) -> Option<&Path> {
+    match raw.key.agent {
+        Agent::Claude | Agent::Codex | Agent::Cursor | Agent::Droid | Agent::Pi => {
+            raw.dependencies.first().map(PathBuf::as_path)
+        }
+        Agent::Devin | Agent::Opencode => None,
     }
 }
 
@@ -33,9 +71,13 @@ fn ingest(
     raw: &RawSession,
     generation: i64,
 ) -> Result<Outcome> {
-    if fingerprint(&raw.dependencies).ok().as_ref() != Some(&raw.fingerprint) {
-        return Ok(Outcome::Changed);
-    }
+    let before = match live_transcript(raw) {
+        Some(path) => match stat(path) {
+            Some(before) => Some((path, before)),
+            None => return Ok(Outcome::Changed),
+        },
+        None => None,
+    };
     let transaction = index.connection.savepoint()?;
     store::source(
         &transaction,
@@ -72,14 +114,23 @@ fn ingest(
             Error::InvalidArgument("source swallowed an index write failure".into())
         }));
     }
-    if fingerprint(&raw.dependencies).ok().as_ref() != Some(&raw.fingerprint) {
+    if let Some((path, before)) = &before
+        && !stable(before, stat(path).as_ref())
+    {
         return Ok(Outcome::Changed);
     }
     let Ok(mut parsed) = parsed else {
         return Ok(Outcome::Failed);
     };
     if parsed.session.key != raw.key || parsed.session.source != raw.source {
-        return Ok(Outcome::Failed);
+        let drifted = before.is_some()
+            && sources::jsonl::fingerprint(&raw.dependencies)
+                .map_or(true, |current| current != raw.fingerprint);
+        return Ok(if drifted {
+            Outcome::Changed
+        } else {
+            Outcome::Failed
+        });
     }
     if !parsed.complete && parsed.diagnostics.is_empty() {
         parsed.diagnostics.push(diagnostic(
@@ -139,29 +190,24 @@ fn run_sources(
     for source in selected {
         let agent = source.agent();
         index.refreshed.remove(&agent);
-        index.connection.execute("INSERT INTO refresh_runs(namespace,agent,generation,status,diagnostics) VALUES(?1,?2,1,'incomplete','[]') ON CONFLICT(namespace,agent) DO UPDATE SET generation=generation+1,status='incomplete',diagnostics='[]'", (&index.namespace,agent.to_string()))?;
-        let generation: i64 = index.connection.query_row(
-            "SELECT generation FROM refresh_runs WHERE namespace=?1 AND agent=?2",
-            (&index.namespace, agent.to_string()),
-            |r| r.get(0),
-        )?;
         let previous = store::cache(&index.connection, &index.namespace, agent)?;
-        let discovered = source.discover(&index.context, &previous);
-        let mut agent_diagnostics = Vec::new();
-        let (sessions, mut enumeration_complete) = if let Ok(discovery) = discovered {
-            let complete =
-                discovery.complete_agents.contains(&agent) && discovery.diagnostics.is_empty();
-            agent_diagnostics.extend(discovery.diagnostics);
-            (discovery.sessions, complete)
-        } else {
-            agent_diagnostics.push(diagnostic(
+        let Ok(discovery) = source.discover(&index.context, &previous) else {
+            let failed = [diagnostic(
                 agent,
                 None,
                 "source_unavailable",
                 "Selected source could not be enumerated",
-            ));
-            (Vec::new(), false)
+            )];
+            store::discovery_failed(&index.connection, &index.namespace, agent, &failed)?;
+            diagnostics.extend(failed);
+            index.refreshed.insert(agent);
+            continue;
         };
+        let generation = store::next_generation(&index.connection, &index.namespace, agent)?;
+        let mut enumeration_complete =
+            discovery.complete_agents.contains(&agent) && discovery.diagnostics.is_empty();
+        let mut agent_diagnostics = discovery.diagnostics;
+        let sessions = discovery.sessions;
         if !enumeration_complete && agent_diagnostics.is_empty() {
             agent_diagnostics.push(diagnostic(
                 agent,
@@ -172,7 +218,9 @@ fn run_sources(
         }
         stats.discovered += sessions.len() as u64;
         let mut identities = BTreeSet::new();
+        let mut seen = BTreeSet::new();
         for mut raw in sessions {
+            seen.insert(raw.source.clone());
             if raw.key.agent != agent || !identities.insert(raw.key.id.clone()) {
                 enumeration_complete = false;
                 stats.failed += 1;
@@ -189,7 +237,7 @@ fn run_sources(
                     && cached.dependencies == raw.dependencies
                     && cached.fingerprint == raw.fingerprint
             });
-            if reusable && fingerprint(&raw.dependencies).ok().as_ref() == Some(&raw.fingerprint) {
+            if reusable {
                 index.connection.execute("UPDATE sources SET generation=?1 WHERE namespace=?2 AND agent=?3 AND source=?4 AND status='fresh'",params![generation,index.namespace,agent.to_string(),raw.source])?;
                 stats.reused += 1;
                 continue;
@@ -214,6 +262,7 @@ fn run_sources(
                         .or_else(|| discovery.sessions.iter().position(|s| s.key == raw.key))
                 {
                     raw = discovery.sessions.swap_remove(found);
+                    seen.insert(raw.source.clone());
                     outcome = ingest(index, source.as_ref(), &raw, generation)?;
                 }
             }
@@ -254,6 +303,8 @@ fn run_sources(
                 "DELETE FROM sources WHERE namespace=?1 AND agent=?2 AND generation<>?3",
                 params![index.namespace, agent.to_string(), generation],
             )? as u64;
+        } else {
+            store::carry_forward(&transaction, &index.namespace, agent, generation, &seen)?;
         }
         let complete = enumeration_complete && agent_diagnostics.is_empty();
         transaction.execute(
@@ -349,6 +400,27 @@ mod tests {
         }
     }
 
+    struct EditedDiscovery {
+        reader: Box<dyn Source>,
+        edit: Box<dyn Fn(Result<Discovery>) -> Result<Discovery>>,
+    }
+
+    impl Source for EditedDiscovery {
+        fn agent(&self) -> Agent {
+            self.reader.agent()
+        }
+        fn discover(&self, ctx: &Context, previous: &DiscoveryCache) -> Result<Discovery> {
+            (self.edit)(self.reader.discover(ctx, previous))
+        }
+        fn parse(
+            &self,
+            raw: &RawSession,
+            emit: &mut dyn FnMut(Entry) -> Result<()>,
+        ) -> Result<ParsedSession> {
+            self.reader.parse(raw, emit)
+        }
+    }
+
     fn rollout(text: &str) -> String {
         [
             serde_json::json!({"type":"session_meta","payload":{"id":"stable","source":"cli"}}),
@@ -385,13 +457,16 @@ mod tests {
     }
 
     fn write(path: &Path, text: &str) {
+        write_session(path, "stable", text);
+    }
+
+    fn line(id: &str, text: &str) -> String {
+        serde_json::json!({"type":"user","sessionId":id,"message":text}).to_string() + "\n"
+    }
+
+    fn write_session(path: &Path, id: &str, text: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            path,
-            serde_json::json!({"type":"user","sessionId":"stable","message":text}).to_string()
-                + "\n",
-        )
-        .unwrap();
+        fs::write(path, line(id, text)).unwrap();
     }
 
     fn context(base: &Path) -> Context {
@@ -570,5 +645,338 @@ mod tests {
         assert_eq!(session.source, moved.to_string_lossy());
         assert!(!session.archived);
         assert_eq!(texts(&index, &key), ["live text"]);
+    }
+
+    fn hooked(
+        index: &mut IndexSession,
+        reader: Box<dyn Source>,
+        hook: Box<dyn Fn()>,
+    ) -> (Envelope<IndexStats>, usize) {
+        let agents = BTreeSet::from([reader.agent()]);
+        let calls = Rc::new(Cell::new(0));
+        let reader = HookedSource {
+            reader,
+            hook,
+            calls: Rc::clone(&calls),
+        };
+        let result = run_sources(index, &agents, vec![Box::new(reader)]).unwrap();
+        (result, calls.get())
+    }
+
+    fn codes(result: &Envelope<IndexStats>) -> Vec<&str> {
+        result.diagnostics.iter().map(|d| d.code.as_str()).collect()
+    }
+
+    fn keys(index: &IndexSession) -> Vec<String> {
+        let mut keys = Vec::new();
+        index
+            .visit_sessions(&mut |s| {
+                keys.push(format!("{}:{}", s.key.agent, s.key.id));
+                Ok(())
+            })
+            .unwrap();
+        keys
+    }
+
+    fn staged(index: &IndexSession, agent: Agent) -> Box<dyn Source> {
+        sources::registry_in(&index.context, &index.staging)
+            .into_iter()
+            .find(|s| s.agent() == agent)
+            .unwrap()
+    }
+
+    fn stable_key(agent: Agent) -> SessionKey {
+        SessionKey {
+            agent,
+            id: "stable".into(),
+        }
+    }
+
+    fn replace(path: &Path, contents: &str) {
+        let replacement = path.with_extension("replacement");
+        fs::write(&replacement, contents).unwrap();
+        fs::rename(replacement, path).unwrap();
+    }
+
+    #[test]
+    fn transcript_appended_during_parse_is_stored_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let path = ctx.roots.claude_projects.join("project/source.jsonl");
+        write(&path, "original");
+        let mut index = IndexSession::open(&ctx).unwrap();
+        let (result, calls) = hooked(
+            &mut index,
+            sources::source_for(&ctx, Agent::Claude).unwrap(),
+            Box::new(move || {
+                let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+                std::io::Write::write_all(&mut file, line("stable", "appended").as_bytes())
+                    .unwrap();
+            }),
+        );
+        assert_eq!(codes(&result), [] as [&str; 0]);
+        assert_eq!(calls, 1);
+        let key = stable_key(Agent::Claude);
+        assert_eq!(texts(&index, &key), ["original"]);
+        let status: String = index
+            .connection
+            .query_row("SELECT status FROM sources", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "fresh");
+        let next = index
+            .refresh_under_lease(&BTreeSet::from([Agent::Claude]))
+            .unwrap();
+        assert_eq!(next.data.unwrap().reparsed, 1);
+        assert_eq!(texts(&index, &key), ["original", "appended"]);
+    }
+
+    #[test]
+    fn transcript_replaced_during_parse_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let path = ctx.roots.claude_projects.join("project/source.jsonl");
+        write(&path, "original");
+        let mut index = IndexSession::open(&ctx).unwrap();
+        let (result, calls) = hooked(
+            &mut index,
+            sources::source_for(&ctx, Agent::Claude).unwrap(),
+            Box::new(move || replace(&path, &line("stable", "original"))),
+        );
+        assert_eq!(codes(&result), ["source_changed"]);
+        assert_eq!(calls, 2);
+        assert_eq!(result.data.unwrap().failed, 0);
+        assert_eq!(texts(&index, &stable_key(Agent::Claude)), ["original"]);
+    }
+
+    #[test]
+    fn cursor_transcript_replaced_during_parse_retries_despite_its_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let transcript = ctx
+            .roots
+            .cursor_projects
+            .join("lossy-slug/agent-transcripts/stable/stable.jsonl");
+        let contents = include_str!("../../tests/fixtures/jsonl/cursor.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(&transcript, contents).unwrap();
+        let meta = ctx.roots.cursor_chats.join("hash/stable/meta.json");
+        fs::create_dir_all(meta.parent().unwrap()).unwrap();
+        fs::write(&meta, r#"{"cwd":"/fixture","title":"Cursor title"}"#).unwrap();
+        let store = rusqlite::Connection::open(meta.with_file_name("store.db")).unwrap();
+        let value = serde_json::json!({"name":"Store title"})
+            .to_string()
+            .bytes()
+            .fold(String::new(), |mut hex, byte| {
+                std::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}")).unwrap();
+                hex
+            });
+        store
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);",
+            )
+            .unwrap();
+        store
+            .execute("INSERT INTO meta VALUES('0', ?)", [value])
+            .unwrap();
+        let mut index = IndexSession::open(&ctx).unwrap();
+        let reader = staged(&index, Agent::Cursor);
+        let empty = DiscoveryCache {
+            by_source: BTreeMap::new(),
+        };
+        let discovery = reader.discover(&index.context, &empty).unwrap();
+        assert!(discovery.sessions[0].snapshot.is_some());
+        drop(discovery);
+        let (result, calls) = hooked(
+            &mut index,
+            reader,
+            Box::new(move || replace(&transcript, contents)),
+        );
+        assert_eq!(codes(&result), ["source_changed"]);
+        assert_eq!(calls, 2);
+        assert_eq!(result.data.unwrap().failed, 0);
+        assert_eq!(
+            texts(&index, &stable_key(Agent::Cursor))
+                .first()
+                .map(String::as_str),
+            Some("needle cursor café 🦀")
+        );
+    }
+
+    #[test]
+    fn devin_database_written_after_snapshot_ingests_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        fs::create_dir_all(ctx.roots.devin_sessions_db.parent().unwrap()).unwrap();
+        let store = rusqlite::Connection::open(&ctx.roots.devin_sessions_db).unwrap();
+        store
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                CREATE TABLE sessions(id TEXT PRIMARY KEY, working_directory TEXT, title TEXT, created_at INTEGER, last_activity_at INTEGER, main_chain_id INTEGER, hidden INTEGER);
+                CREATE TABLE message_nodes(row_id INTEGER PRIMARY KEY, session_id TEXT, node_id INTEGER, parent_node_id INTEGER, chat_message TEXT, created_at INTEGER, metadata TEXT);
+                CREATE TABLE subagent_heads(session_id TEXT, agent_id TEXT, chain_node_id INTEGER, updated_at INTEGER, PRIMARY KEY(session_id, agent_id)) WITHOUT ROWID;
+                INSERT INTO sessions VALUES('stable', '/fixture', 'Devin title', 1786356000, 1786356300, 1, 0);",
+            )
+            .unwrap();
+        let node = |id: i64, parent: Option<i64>, text: &str| {
+            let chat = serde_json::json!({"role":"user","content":text,"metadata":{"created_at":"2026-08-10T10:00:00Z","is_user_input":true,"telemetry":{"source":"user"}}});
+            (id, parent, chat.to_string())
+        };
+        let insert = "INSERT INTO message_nodes(session_id, node_id, parent_node_id, chat_message, created_at, metadata) VALUES('stable',?1,?2,?3,1786356000,'{}')";
+        store.execute(insert, node(1, None, "first")).unwrap();
+        let mut index = IndexSession::open(&ctx).unwrap();
+        let reader = EditedDiscovery {
+            reader: staged(&index, Agent::Devin),
+            edit: Box::new(move |discovery| {
+                store.execute(insert, node(2, Some(1), "second")).unwrap();
+                store
+                    .execute("UPDATE sessions SET main_chain_id=2", [])
+                    .unwrap();
+                discovery
+            }),
+        };
+        let agents = BTreeSet::from([Agent::Devin]);
+        let result = run_sources(&mut index, &agents, vec![Box::new(reader)]).unwrap();
+        assert_eq!(codes(&result), [] as [&str; 0]);
+        assert_eq!(result.data.unwrap().reparsed, 1);
+        let key = stable_key(Agent::Devin);
+        assert_eq!(texts(&index, &key), ["first"]);
+        index.refresh_under_lease(&agents).unwrap();
+        assert_eq!(texts(&index, &key), ["first", "second"]);
+    }
+
+    fn two_sessions(ctx: &Context) -> IndexSession {
+        for id in ["one", "two"] {
+            write_session(
+                &ctx.roots
+                    .claude_projects
+                    .join(format!("project/{id}.jsonl")),
+                id,
+                &format!("{id} text"),
+            );
+        }
+        let mut index = IndexSession::open(ctx).unwrap();
+        let result = index
+            .refresh_under_lease(&BTreeSet::from([Agent::Claude]))
+            .unwrap();
+        assert_eq!(codes(&result), [] as [&str; 0]);
+        index
+    }
+
+    fn run_row(index: &IndexSession) -> (i64, String) {
+        index
+            .connection
+            .query_row(
+                "SELECT generation,status FROM refresh_runs WHERE agent='claude'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn failed_discovery_keeps_the_previous_sessions_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let mut index = two_sessions(&ctx);
+        let visible = keys(&index);
+        let (generation, _) = run_row(&index);
+        let reader = EditedDiscovery {
+            reader: sources::source_for(&ctx, Agent::Claude).unwrap(),
+            edit: Box::new(|_| Err(Error::InvalidArgument("synthetic discovery failure".into()))),
+        };
+        let agents = BTreeSet::from([Agent::Claude]);
+        let result = run_sources(&mut index, &agents, vec![Box::new(reader)]).unwrap();
+        assert!(result.incomplete);
+        assert_eq!(codes(&result), ["source_unavailable"]);
+        assert_eq!(keys(&index), visible);
+        assert_eq!(visible, ["claude:one", "claude:two"]);
+        assert_eq!(run_row(&index), (generation, "incomplete".into()));
+    }
+
+    #[test]
+    fn partial_discovery_keeps_an_omitted_session_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let mut index = two_sessions(&ctx);
+        let (generation, _) = run_row(&index);
+        let reader = EditedDiscovery {
+            reader: sources::source_for(&ctx, Agent::Claude).unwrap(),
+            edit: Box::new(|discovery| {
+                discovery.map(|mut d| {
+                    d.sessions.retain(|s| s.key.id != "two");
+                    d.complete_agents.clear();
+                    d
+                })
+            }),
+        };
+        let agents = BTreeSet::from([Agent::Claude]);
+        let result = run_sources(&mut index, &agents, vec![Box::new(reader)]).unwrap();
+        assert!(result.incomplete);
+        assert_eq!(codes(&result), ["incomplete_inventory"]);
+        assert_eq!(run_row(&index), (generation + 1, "incomplete".into()));
+        assert_eq!(keys(&index), ["claude:one", "claude:two"]);
+        let two = SessionKey {
+            agent: Agent::Claude,
+            id: "two".into(),
+        };
+        assert_eq!(texts(&index, &two), ["two text"]);
+    }
+
+    #[test]
+    fn failed_first_discovery_records_generation_zero_then_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        write_session(
+            &ctx.roots.claude_projects.join("project/one.jsonl"),
+            "one",
+            "one text",
+        );
+        let mut index = IndexSession::open(&ctx).unwrap();
+        let reader = EditedDiscovery {
+            reader: sources::source_for(&ctx, Agent::Claude).unwrap(),
+            edit: Box::new(|_| Err(Error::InvalidArgument("synthetic discovery failure".into()))),
+        };
+        let agents = BTreeSet::from([Agent::Claude]);
+        let result = run_sources(&mut index, &agents, vec![Box::new(reader)]).unwrap();
+        assert_eq!(codes(&result), ["source_unavailable"]);
+        assert_eq!(run_row(&index), (0, "incomplete".into()));
+        assert_eq!(keys(&index), [] as [&str; 0]);
+        let result = index.refresh_under_lease(&agents).unwrap();
+        assert_eq!(codes(&result), [] as [&str; 0]);
+        assert_eq!(run_row(&index), (1, "complete".into()));
+        assert_eq!(keys(&index), ["claude:one"]);
+        index.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn incomplete_run_carries_forward_only_unlisted_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        write_session(
+            &ctx.roots.claude_projects.join("project/three.jsonl"),
+            "three",
+            "three text",
+        );
+        let mut index = two_sessions(&ctx);
+        assert_eq!(keys(&index), ["claude:one", "claude:three", "claude:two"]);
+        let reader = EditedDiscovery {
+            reader: sources::source_for(&ctx, Agent::Claude).unwrap(),
+            edit: Box::new(|discovery| {
+                discovery.map(|mut d| {
+                    d.sessions.retain(|s| s.key.id != "three");
+                    d.sessions.sort_by(|a, b| a.source.cmp(&b.source));
+                    for s in &mut d.sessions {
+                        if s.key.id == "two" {
+                            s.key.id = "one".into();
+                        }
+                    }
+                    d
+                })
+            }),
+        };
+        let agents = BTreeSet::from([Agent::Claude]);
+        let result = run_sources(&mut index, &agents, vec![Box::new(reader)]).unwrap();
+        assert_eq!(codes(&result), ["duplicate_identity"]);
+        assert_eq!(keys(&index), ["claude:one", "claude:three"]);
     }
 }

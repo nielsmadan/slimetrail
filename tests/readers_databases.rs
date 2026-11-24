@@ -254,6 +254,27 @@ fn wal_snapshot_preserves_sources_and_restricts_private_files() {
 }
 
 #[test]
+fn snapshot_copies_are_private_and_byte_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let _writer = opencode(&ctx);
+    let sources = sqlite::dependencies(&ctx.roots.opencode_db);
+    assert!(fs::metadata(&sources[1]).unwrap().len() > 0);
+    let (snapshot, _) = sqlite::snapshot(&ctx.roots.opencode_db).unwrap();
+    for (source, copy) in sources
+        .iter()
+        .zip(sqlite::dependencies(&snapshot.database))
+        .take(2)
+    {
+        assert_eq!(fs::read(&copy).unwrap(), fs::read(source).unwrap());
+        assert_eq!(
+            fs::metadata(&copy).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[test]
 fn snapshots_support_wal_without_source_shm_and_readonly_sidecars() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());

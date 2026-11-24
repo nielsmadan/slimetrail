@@ -135,7 +135,7 @@ fn stable_partial_records_remain_incomplete_until_corrected() {
 }
 
 #[test]
-fn unavailable_inventory_excludes_and_retains_old_rows() {
+fn unavailable_inventory_keeps_old_rows_visible_and_incomplete() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     claude(&ctx, "one", "prior text");
@@ -146,7 +146,7 @@ fn unavailable_inventory_excludes_and_retains_old_rows() {
     let result = lease.refresh_under_lease(&selected(Agent::Claude)).unwrap();
     assert!(result.incomplete);
     assert_eq!(result.data.unwrap().removed, 0);
-    assert_eq!(texts(&lease, &key("one")), [] as [std::string::String; 0]);
+    assert_eq!(texts(&lease, &key("one")), ["prior text"]);
     drop(lease);
     let db = Connection::open(ctx.index_dir.join(DATABASE)).unwrap();
     assert_eq!(

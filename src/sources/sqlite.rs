@@ -2,9 +2,8 @@ use super::jsonl::fingerprint;
 use crate::{Error, Fingerprint, PrivateSnapshot, Result};
 use rusqlite::{Connection, OpenFlags};
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    fs::{self, File},
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -87,14 +86,9 @@ fn unchanged(captured: &Captured) -> Result<bool> {
     Ok(path == captured.stamp && handle == captured.stamp)
 }
 
-fn copy_captured(
-    reader: impl Read,
-    writer: &mut impl Write,
-    length: u64,
-    target: &Path,
-) -> Result<()> {
-    let count = std::io::copy(&mut reader.take(length), writer).map_err(|e| io(target, e))?;
-    writer.flush().map_err(|e| io(target, e))?;
+fn copy_captured(source: &Path, target: &Path, length: u64) -> Result<()> {
+    let count = fs::copy(source, target).map_err(|e| io(target, e))?;
+    fs::set_permissions(target, fs::Permissions::from_mode(0o600)).map_err(|e| io(target, e))?;
     if count != length {
         return Err(Error::InvalidArgument(
             "SQLite source changed during copy".into(),
@@ -137,16 +131,10 @@ fn attempt(
     let private_db = directory.path().join("snapshot.db");
     let destinations = dependencies(&private_db);
     for (source, target) in captured.iter().zip(&destinations).take(2) {
-        if let (Some(file), Some(meta)) = (&source.file, source.stamp) {
-            let mut writer = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(target)
-                .map_err(|e| io(target, e))?;
+        if let (Some(_), Some(meta)) = (&source.file, source.stamp) {
             let length = u64::try_from(meta[2])
                 .map_err(|_| Error::InvalidArgument("SQLite file is too large".into()))?;
-            copy_captured(file, &mut writer, length, target)?;
+            copy_captured(&source.path, target, length)?;
         }
     }
     copied()?;
@@ -219,59 +207,52 @@ pub fn open(snapshot: &PrivateSnapshot) -> Result<Connection> {
 mod tests {
     use super::*;
 
-    struct ChangingReader<'a> {
-        file: &'a File,
-        change: Option<Box<dyn FnOnce()>>,
-    }
-
-    impl Read for ChangingReader<'_> {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            let length = buffer.len().min(2);
-            let count = self.file.read(&mut buffer[..length])?;
-            if let Some(change) = self.change.take() {
-                change();
-            }
-            Ok(count)
-        }
-    }
-
     #[test]
-    fn during_copy_append_is_bounded_and_truncation_is_rejected() {
+    fn copy_rejects_appends_and_truncations_after_capture() {
         for append in [true, false] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("source.db");
             fs::write(&path, b"original").unwrap();
             let captured = capture(&path).unwrap();
-            let changed_path = path.clone();
-            let reader = ChangingReader {
-                file: captured.file.as_ref().unwrap(),
-                change: Some(Box::new(move || {
-                    let mut writer = OpenOptions::new()
-                        .write(true)
-                        .append(append)
-                        .open(changed_path)
-                        .unwrap();
-                    if append {
-                        writer.write_all(b"appended").unwrap();
-                    } else {
-                        writer.set_len(2).unwrap();
-                    }
-                })),
-            };
-            let mut output = Vec::new();
-            let result = copy_captured(reader, &mut output, 8, &dir.path().join("private.db"));
+            let writer = fs::OpenOptions::new()
+                .append(append)
+                .write(true)
+                .open(&path)
+                .unwrap();
             if append {
-                result.unwrap();
-                assert_eq!(output, b"original");
-                assert_eq!(fs::read(&path).unwrap(), b"originalappended");
+                std::io::Write::write_all(&mut &writer, b"appended").unwrap();
             } else {
-                assert!(
-                    matches!(result, Err(Error::InvalidArgument(message)) if message == "SQLite source changed during copy")
-                );
-                assert_eq!(output, b"or");
+                writer.set_len(2).unwrap();
             }
+            let target = dir.path().join("private.db");
+            let result = copy_captured(&path, &target, 8);
+            assert!(
+                matches!(result, Err(Error::InvalidArgument(message)) if message == "SQLite source changed during copy")
+            );
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
             assert!(!unchanged(&captured).unwrap());
         }
+    }
+
+    #[test]
+    fn a_change_after_the_copy_rejects_the_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.db");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "PRAGMA journal_mode=WAL; CREATE TABLE events(value); INSERT INTO events VALUES(1);",
+        )
+        .unwrap();
+        let result = attempt(&path, None, &mut || {
+            db.execute("INSERT INTO events VALUES(2)", [])?;
+            Ok(())
+        });
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(message)) if message == "SQLite source changed during copy")
+        );
     }
 
     #[test]

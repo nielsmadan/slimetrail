@@ -70,6 +70,40 @@ pub(super) fn cache(
     Ok(DiscoveryCache { by_source })
 }
 
+pub(super) fn next_generation(
+    connection: &Connection,
+    namespace: &str,
+    agent: Agent,
+) -> Result<i64> {
+    connection.execute("INSERT INTO refresh_runs(namespace,agent,generation,status,diagnostics) VALUES(?1,?2,1,'incomplete','[]') ON CONFLICT(namespace,agent) DO UPDATE SET generation=generation+1,status='incomplete',diagnostics='[]'", (namespace, agent.to_string()))?;
+    Ok(connection.query_row(
+        "SELECT generation FROM refresh_runs WHERE namespace=?1 AND agent=?2",
+        (namespace, agent.to_string()),
+        |r| r.get(0),
+    )?)
+}
+
+pub(super) fn discovery_failed(
+    connection: &Connection,
+    namespace: &str,
+    agent: Agent,
+    diagnostics: &[Diagnostic],
+) -> Result<()> {
+    connection.execute("INSERT INTO refresh_runs(namespace,agent,generation,status,diagnostics) VALUES(?1,?2,0,'incomplete',?3) ON CONFLICT(namespace,agent) DO UPDATE SET status='incomplete',diagnostics=excluded.diagnostics", (namespace, agent.to_string(), encode(&diagnostics)?))?;
+    Ok(())
+}
+
+pub(super) fn carry_forward(
+    connection: &Connection,
+    namespace: &str,
+    agent: Agent,
+    generation: i64,
+    seen: &BTreeSet<String>,
+) -> Result<()> {
+    connection.execute("UPDATE sources SET generation=?1 WHERE namespace=?2 AND agent=?3 AND status IN ('fresh','partial') AND generation<?1 AND source NOT IN (SELECT value FROM json_each(?4))", params![generation, namespace, agent.to_string(), encode(seen)?])?;
+    Ok(())
+}
+
 pub(super) fn source(
     connection: &Connection,
     namespace: &str,
