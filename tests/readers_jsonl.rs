@@ -32,6 +32,8 @@ fn context(base: &Path) -> Context {
         cwd: "/fixture/project".into(),
         time_zone: "UTC".into(),
         coverage: slimetrail::Coverage::Compact,
+        build: slimetrail::BuildPolicy::Inline,
+        progress: false,
     }
 }
 fn root(ctx: &Context, agent: Agent) -> &Path {
@@ -532,7 +534,11 @@ fn codex_native_names_refresh_for_live_and_archived_sessions() {
                 ),
             );
             let raw = discover(source.as_ref(), &ctx).sessions.remove(0);
-            assert_ne!(raw.fingerprint, before.fingerprint);
+            assert_eq!(
+                raw.fingerprint == before.fingerprint,
+                name.trim().is_empty(),
+                "{name:?}"
+            );
             let (parsed, _) = parse(source.as_ref(), &raw);
             assert!(parsed.complete);
             if name.trim().is_empty() {
@@ -548,9 +554,11 @@ fn codex_native_names_refresh_for_live_and_archived_sessions() {
             Some(TitleOrigin::Derived)
         );
         write(&ctx.roots.codex_session_index, "malformed secret\n");
-        let parsed = parse(source.as_ref(), &before).0;
-        assert!(!parsed.complete);
-        assert_eq!(parsed.diagnostics[0].code, "malformed_metadata");
+        assert!(parse(source.as_ref(), &before).0.complete);
+        let discovered = discover(source.as_ref(), &ctx);
+        assert_eq!(discovered.diagnostics, []);
+        assert_eq!(discovered.warnings.len(), 1);
+        assert_eq!(discovered.warnings[0].code, "malformed_metadata");
         fs::remove_file(&ctx.roots.codex_session_index).unwrap();
         fs::create_dir(&ctx.roots.codex_session_index).unwrap();
         let parsed = parse(source.as_ref(), &before).0;

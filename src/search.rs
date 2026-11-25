@@ -2,7 +2,10 @@ use crate::{
     Context, Coverage, Diagnostic, Error, Kind, Result, SearchHit, SearchOptions, SearchResult,
     Sort,
     api::{accepts, selected},
-    index::{Document, IndexSession},
+    index::{
+        Document, IndexSession,
+        coverage::{TOOL_RESULT_TAIL, mismatch},
+    },
     read::{kind_name, python_whitespace},
 };
 use regex::{Regex, RegexBuilder};
@@ -95,32 +98,29 @@ pub(crate) fn coverage_note(
     config: Coverage,
     kinds: &BTreeSet<Kind>,
 ) -> Option<Diagnostic> {
-    let mismatch = match (index, config) {
-        (Coverage::Compact, Coverage::Full) => {
-            " The config asks for full coverage but the index is compact; run `slimetrail index` to rebuild it."
-        }
-        (Coverage::Full, Coverage::Compact) => {
-            " The config asks for compact coverage but the index is full; run `slimetrail index` to rebuild it."
-        }
-        _ => "",
-    };
+    let mismatch = mismatch(index, config);
     let note = |code: &str, message: String| Diagnostic {
         agent: None,
         source: None,
         code: code.into(),
-        message: format!("{message}{mismatch}").trim_start().into(),
+        message: format!("{message} {}", mismatch.unwrap_or_default())
+            .trim()
+            .into(),
     };
     if index == Coverage::Full {
-        return (!mismatch.is_empty()).then(|| note("search_coverage", String::new()));
+        return mismatch.map(|_| note("search_coverage", String::new()));
     }
-    let limited: Vec<&str> = [
+    let tail = format!("{} KB", TOOL_RESULT_TAIL / 1024);
+    let limited: Vec<String> = [
         (
             Kind::Meta,
-            "--kind meta does not search reasoning in compact coverage",
+            "--kind meta does not search reasoning in compact coverage".to_string(),
         ),
         (
             Kind::Tool,
-            "--kind tool searches only the last 2 KB of each tool result in compact coverage",
+            format!(
+                "--kind tool searches only the last {tail} of each tool result in compact coverage"
+            ),
         ),
     ]
     .into_iter()
@@ -130,7 +130,9 @@ pub(crate) fn coverage_note(
     Some(if limited.is_empty() {
         note(
             "search_coverage",
-            "Compact coverage: reasoning is not searched, and only the last 2 KB of each tool result is searched; run `slimetrail index --coverage full` to search everything.".into(),
+            format!(
+                "Compact coverage: reasoning is not searched, and only the last {tail} of each tool result is searched; run `slimetrail index --coverage full` to search everything."
+            ),
         )
     } else {
         note(

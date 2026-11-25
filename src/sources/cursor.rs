@@ -511,6 +511,7 @@ impl Source for Cursor {
         Ok(Discovery {
             sessions: sessions.into_values().map(|(_, _, raw)| raw).collect(),
             diagnostics,
+            warnings: Vec::new(),
             complete_agents,
         })
     }

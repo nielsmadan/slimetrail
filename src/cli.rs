@@ -2,18 +2,32 @@ use clap::{Args, Parser, Subcommand};
 use jiff::{Timestamp, civil, tz::TimeZone};
 use serde::Serialize;
 use slimetrail::{
-    Agent, Context, Coverage, Diagnostic, Entry, Envelope, Error, Filter, Kind, ReadMode,
-    ReadOptions, Result, Scope, SearchOptions, Session, SessionKey, Sort, TimelineOptions, config,
+    Agent, BuildPolicy, Context, Coverage, Diagnostic, Entry, Envelope, Error, Filter, JobEstimate,
+    Kind, ReadMode, ReadOptions, Result, Scope, SearchOptions, SearchResult, Session, SessionKey,
+    Sort, TimelineOptions, TimelineResult, api, config,
     dto::{EntryDto, ReadDataDto, SearchDataDto, SessionDto, SessionsDataDto, TimelineDataDto},
-    entries, read, refresh, resolve_roots, search, sessions, timeline,
+    entries, index, read, refresh, resolve_roots, search, sessions, timeline,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{self, Write},
+    io::{self, BufRead, IsTerminal, Write},
     path::{Path, PathBuf},
 };
 
+mod prompt;
 mod search_text;
+
+struct Terminal<'a> {
+    tty: bool,
+    input: &'a mut dyn BufRead,
+    prompt: &'a mut dyn Write,
+}
+
+struct Gate<'a> {
+    config: config::Config,
+    path: PathBuf,
+    terminal: Terminal<'a>,
+}
 
 #[derive(Parser)]
 #[command(version, about = "Read-only search across local coding-agent sessions")]
@@ -137,7 +151,12 @@ pub(crate) fn run() -> i32 {
     let cli = Cli::parse();
     let env = std::env::vars().collect::<BTreeMap<_, _>>();
     let mut stdout = io::stdout().lock();
-    match execute(&cli, &env, &mut stdout) {
+    let terminal = Terminal {
+        tty: io::stdin().is_terminal() && io::stderr().is_terminal(),
+        input: &mut io::stdin().lock(),
+        prompt: &mut io::stderr(),
+    };
+    match execute(&cli, &env, &mut stdout, terminal) {
         Ok(code) => code,
         Err(error) if broken_pipe(&error) => 0,
         Err(error) => {
@@ -167,7 +186,12 @@ pub(crate) fn run() -> i32 {
 }
 
 #[expect(clippy::too_many_lines, reason = "Keep command dispatch together")]
-fn execute(cli: &Cli, env: &BTreeMap<String, String>, out: &mut dyn Write) -> Result<i32> {
+fn execute(
+    cli: &Cli,
+    env: &BTreeMap<String, String>,
+    out: &mut dyn Write,
+    terminal: Terminal<'_>,
+) -> Result<i32> {
     let home = env
         .get("HOME")
         .filter(|s| !s.is_empty())
@@ -199,6 +223,9 @@ fn execute(cli: &Cli, env: &BTreeMap<String, String>, out: &mut dyn Write) -> Re
     } else {
         config::load(&config_path)?
     };
+    let is_json = cli.common.format == "json";
+    let indexing = matches!(cli.command, Command::Index { .. });
+    let interactive = !indexing && !is_json && !env.contains_key("CI") && terminal.tty;
     let ctx = Context {
         roots: resolve_roots(&home, env)?,
         index_dir,
@@ -206,9 +233,26 @@ fn execute(cli: &Cli, env: &BTreeMap<String, String>, out: &mut dyn Write) -> Re
         cwd: cwd.clone(),
         time_zone: zone,
         coverage: config.coverage,
+        build: if indexing {
+            BuildPolicy::Inline
+        } else {
+            BuildPolicy::Limit {
+                max_ms: build_limit(env).unwrap_or(if interactive { 120_000 } else { 20_000 }),
+                whole: interactive,
+            }
+        },
+        progress: if indexing {
+            io::stderr().is_terminal()
+        } else {
+            interactive
+        },
+    };
+    let mut gate = Gate {
+        config,
+        path: config_path,
+        terminal,
     };
     let filter = filter(&cli.common, env, &home, &cwd)?;
-    let is_json = cli.common.format == "json";
     match &cli.command {
         Command::Search {
             query,
@@ -219,24 +263,35 @@ fn execute(cli: &Cli, env: &BTreeMap<String, String>, out: &mut dyn Write) -> Re
             max_snippets,
             context,
         } => {
-            let result = search(
+            let options = SearchOptions {
+                filter,
+                query: query.clone(),
+                regex: *regex,
+                case_sensitive: *case_sensitive,
+                sort: if sort == "score" {
+                    Sort::Score
+                } else {
+                    Sort::Recent
+                },
+                max_results: *max_results,
+                max_snippets: *max_snippets,
+                context_chars: *context,
+            };
+            let result = gated(
                 &ctx,
-                &SearchOptions {
-                    filter,
-                    query: query.clone(),
-                    regex: *regex,
-                    case_sensitive: *case_sensitive,
-                    sort: if sort == "score" {
-                        Sort::Score
-                    } else {
-                        Sort::Recent
-                    },
-                    max_results: *max_results,
-                    max_snippets: *max_snippets,
-                    context_chars: *context,
+                &mut gate,
+                |ctx| convert(search(ctx, &options)?, |v| SearchDataDto::try_from(v)),
+                || {
+                    SearchDataDto::try_from(&SearchResult {
+                        query: options.query.clone(),
+                        agents: api::selected(&options.filter.agents).into_iter().collect(),
+                        sort: options.sort,
+                        count: 0,
+                        results: Vec::new(),
+                    })
+                    .map(Some)
                 },
             )?;
-            let result = convert(result, |v| SearchDataDto::try_from(v))?;
             if is_json {
                 emit(out, &result, true)
             } else {
@@ -252,20 +307,21 @@ fn execute(cli: &Cli, env: &BTreeMap<String, String>, out: &mut dyn Write) -> Re
             offset,
         } => {
             validate_key(session, &filter.agents)?;
-            let result = read(
-                &ctx,
-                session,
-                &ReadOptions {
-                    mode: match mode.as_str() {
-                        "full" => ReadMode::Full,
-                        "log" => ReadMode::Log,
-                        _ => ReadMode::Lite,
-                    },
-                    max_chars: *max_chars,
-                    offset: *offset,
+            let options = ReadOptions {
+                mode: match mode.as_str() {
+                    "full" => ReadMode::Full,
+                    "log" => ReadMode::Log,
+                    _ => ReadMode::Lite,
                 },
+                max_chars: *max_chars,
+                offset: *offset,
+            };
+            let result = gated(
+                &ctx,
+                &mut gate,
+                |ctx| convert(read(ctx, session, &options)?, |v| ReadDataDto::try_from(v)),
+                || Ok(None),
             )?;
-            let result = convert(result, |v| ReadDataDto::try_from(v))?;
             if is_json {
                 emit(out, &result, true)
             } else {
@@ -294,35 +350,115 @@ fn execute(cli: &Cli, env: &BTreeMap<String, String>, out: &mut dyn Write) -> Re
             let idle_ms = idle_minutes
                 .checked_mul(60_000)
                 .ok_or_else(|| Error::InvalidArgument("idle-minutes is too large".into()))?;
-            emit(
-                out,
-                &convert(
-                    timeline(
-                        &ctx,
-                        &TimelineOptions {
-                            filter,
-                            since,
-                            until,
-                            idle_ms,
-                        },
-                    )?,
-                    |v| TimelineDataDto::try_from(v),
-                )?,
-                is_json,
-            )
+            let options = TimelineOptions {
+                filter,
+                since,
+                until,
+                idle_ms,
+            };
+            let result = gated(
+                &ctx,
+                &mut gate,
+                |ctx| convert(timeline(ctx, &options)?, |v| TimelineDataDto::try_from(v)),
+                || {
+                    TimelineDataDto::try_from(&TimelineResult {
+                        sessions: Vec::new(),
+                        daily_active_ms: BTreeMap::new(),
+                    })
+                    .map(Some)
+                },
+            )?;
+            emit(out, &result, is_json)
         }
         Command::Index { .. } => emit(out, &refresh(&ctx, &filter.agents, true)?, is_json),
-        Command::Sessions => emit(
-            out,
-            &convert(sessions(&ctx, &filter)?, |s| {
-                SessionsDataDto::try_from(s.as_slice())
-            })?,
-            is_json,
-        ),
+        Command::Sessions => {
+            let result = gated(
+                &ctx,
+                &mut gate,
+                |ctx| {
+                    convert(sessions(ctx, &filter)?, |s| {
+                        SessionsDataDto::try_from(s.as_slice())
+                    })
+                },
+                || SessionsDataDto::try_from([].as_slice()).map(Some),
+            )?;
+            emit(out, &result, is_json)
+        }
         Command::Entries { session } => {
             validate_key(session, &filter.agents)?;
-            stream_entries(&ctx, session, out, is_json)
+            stream_entries(&ctx, &mut gate, session, out, is_json)
         }
+    }
+}
+
+fn build_limit(env: &BTreeMap<String, String>) -> Option<u64> {
+    if cfg!(debug_assertions) {
+        env.get("SLIMETRAIL_TEST_BUILD_LIMIT_MS")?.parse().ok()
+    } else {
+        None
+    }
+}
+
+fn required(estimate: &JobEstimate) -> Vec<Diagnostic> {
+    estimate
+        .agents
+        .iter()
+        .map(|agent| index::estimate::required(agent, estimate.coverage))
+        .collect()
+}
+
+const fn whole(ctx: &Context) -> bool {
+    matches!(ctx.build, BuildPolicy::Limit { whole: true, .. })
+}
+
+fn rerun(ctx: &Context, gate: &mut Gate<'_>, estimate: &JobEstimate) -> Result<Context> {
+    let chosen = prompt::ask(
+        estimate,
+        gate.config,
+        &gate.path,
+        gate.terminal.input,
+        gate.terminal.prompt,
+    )?;
+    Ok(match (chosen, ctx.build) {
+        (Some(coverage), _) => Context {
+            build: BuildPolicy::Inline,
+            progress: true,
+            coverage: if estimate.coverage_locked {
+                ctx.coverage
+            } else {
+                coverage
+            },
+            ..ctx.clone()
+        },
+        (None, BuildPolicy::Limit { max_ms, .. }) => Context {
+            build: BuildPolicy::Limit {
+                max_ms,
+                whole: false,
+            },
+            ..ctx.clone()
+        },
+        (None, BuildPolicy::Inline) => ctx.clone(),
+    })
+}
+
+fn gated<T>(
+    ctx: &Context,
+    gate: &mut Gate<'_>,
+    run: impl Fn(&Context) -> Result<Envelope<T>>,
+    empty: impl FnOnce() -> Result<Option<T>>,
+) -> Result<Envelope<T>> {
+    let result = match run(ctx) {
+        Err(Error::IndexRequired(estimate)) if whole(ctx) => run(&rerun(ctx, gate, &estimate)?),
+        other => other,
+    };
+    match result {
+        Err(Error::IndexRequired(estimate)) => Ok(Envelope {
+            version: 1,
+            incomplete: true,
+            diagnostics: required(&estimate),
+            data: empty()?,
+        }),
+        other => other,
     }
 }
 
@@ -545,11 +681,27 @@ fn broken_pipe(error: &Error) -> bool {
 
 fn stream_entries(
     ctx: &Context,
+    gate: &mut Gate<'_>,
     key: &SessionKey,
     out: &mut dyn Write,
     is_json: bool,
 ) -> Result<i32> {
-    write_entries(out, is_json, |emit| entries(ctx, key, emit))
+    let mut ctx = ctx.clone();
+    if whole(&ctx) {
+        match write_entries(out, is_json, |emit| entries(&ctx, key, emit)) {
+            Err(Error::IndexRequired(estimate)) => ctx = rerun(&ctx, gate, &estimate)?,
+            other => return other,
+        }
+    }
+    write_entries(out, is_json, |emit| match entries(&ctx, key, emit) {
+        Err(Error::IndexRequired(estimate)) => Ok(Envelope {
+            version: 1,
+            incomplete: true,
+            diagnostics: required(&estimate),
+            data: None,
+        }),
+        other => other,
+    })
 }
 
 fn write_entries(
@@ -606,6 +758,268 @@ fn write_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    struct Run {
+        code: i32,
+        stdout: String,
+        prompt: String,
+    }
+
+    fn codex(root: &Path, text: &str) {
+        let records = [
+            serde_json::json!({"type":"session_meta","payload":{"id":"sample","cwd":"/fixture/app"}}),
+            serde_json::json!({"type":"response_item","timestamp":"2026-10-25T00:30:00Z","payload":{"type":"message","role":"user","content":text}}),
+            serde_json::json!({"type":"response_item","timestamp":"2026-10-25T00:40:00Z","payload":{"type":"message","role":"assistant","content":"Second reply"}}),
+        ];
+        let path = root.join("codex/sessions/sample.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            records
+                .iter()
+                .map(|r| r.to_string() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+    }
+
+    fn invoke(root: &Path, args: &[&str], limit: u64, answer: &str) -> Run {
+        let index_dir = root.join("index");
+        let cli = Cli::try_parse_from(
+            ["slimetrail", "--index-dir", index_dir.to_str().unwrap()]
+                .into_iter()
+                .chain(["--scope", "all"])
+                .chain(args.iter().copied()),
+        )
+        .unwrap();
+        let path = |name: &str| root.join(name).to_string_lossy().into_owned();
+        let env = BTreeMap::from([
+            ("HOME".into(), path("")),
+            ("CODEX_HOME".into(), path("codex")),
+            ("XDG_DATA_HOME".into(), path("data")),
+            ("SLIMETRAIL_CONFIG".into(), path("config.toml")),
+            ("SLIMETRAIL_TEST_BUILD_LIMIT_MS".into(), limit.to_string()),
+            ("TZ".into(), "UTC".into()),
+        ]);
+        let (mut stdout, mut prompt) = (Vec::new(), Vec::new());
+        let code = execute(
+            &cli,
+            &env,
+            &mut stdout,
+            Terminal {
+                tty: true,
+                input: &mut answer.as_bytes(),
+                prompt: &mut prompt,
+            },
+        )
+        .unwrap();
+        Run {
+            code,
+            stdout: String::from_utf8(stdout).unwrap(),
+            prompt: String::from_utf8(prompt).unwrap(),
+        }
+    }
+
+    fn settings<T: rusqlite::types::FromSql>(root: &Path, column: &str) -> T {
+        rusqlite::Connection::open(root.join("index").join(index::DATABASE))
+            .unwrap()
+            .query_row(&format!("SELECT {column} FROM settings"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn stored_coverage(root: &Path) -> String {
+        settings(root, "coverage")
+    }
+
+    fn published_then_changed(root: &Path) {
+        codex(root, "Published needle");
+        assert_eq!(invoke(root, &["--codex", "index"], 0, "").code, 0);
+        codex(root, "Changed needle that is not indexed yet");
+    }
+
+    const SEARCH: [&str; 3] = ["--codex", "search", "needle"];
+
+    #[test]
+    fn interactive_query_with_nothing_to_build_runs_once_without_prompting() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        codex(root, "Published needle");
+        assert_eq!(invoke(root, &["--codex", "index"], 0, "").code, 0);
+        let before: i64 = settings(root, "refresh_seq");
+        let discovered = index::discoveries();
+        let run = invoke(root, &SEARCH, 0, "y\n");
+        assert_eq!(index::discoveries() - discovered, 1);
+        assert_eq!(run.code, 0);
+        assert_eq!(run.prompt, "");
+        assert_eq!(settings::<i64>(root, "refresh_seq"), before + 1);
+        assert!(
+            run.stdout.starts_with("Returned sessions: 1\n"),
+            "{}",
+            run.stdout
+        );
+    }
+
+    #[test]
+    fn interactive_query_while_another_process_writes_answers_stale_without_prompting() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        published_then_changed(root);
+        let lock = fs::File::options()
+            .read(true)
+            .write(true)
+            .open(root.join("index/writer.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let started = std::time::Instant::now();
+        let run = invoke(root, &SEARCH, 0, "c\n");
+        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+        drop(lock);
+        assert_eq!(run.code, 1);
+        assert_eq!(run.prompt, "");
+        assert!(run.stdout.contains("Published needle"), "{}", run.stdout);
+        assert!(!root.join("config.toml").exists());
+    }
+
+    #[test]
+    fn interactive_query_during_a_pending_rebuild_answers_stale_without_prompting() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        published_then_changed(root);
+        rusqlite::Connection::open(root.join("index").join(index::DATABASE))
+            .unwrap()
+            .execute("UPDATE settings SET coverage_pending='full'", [])
+            .unwrap();
+        let run = invoke(root, &SEARCH, 0, "f\n");
+        assert_eq!(run.code, 1);
+        assert_eq!(run.prompt, "");
+        assert!(run.stdout.contains("Published needle"), "{}", run.stdout);
+        assert!(!root.join("config.toml").exists());
+        assert_eq!(settings::<String>(root, "coverage_pending"), "full");
+    }
+
+    #[test]
+    fn interactive_first_build_takes_the_chosen_coverage_when_only_small_agents_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pi = root.join(".pi/agent/sessions/project/session.jsonl");
+        fs::create_dir_all(pi.parent().unwrap()).unwrap();
+        fs::write(&pi, include_str!("../tests/fixtures/jsonl/pi.jsonl")).unwrap();
+        let claude = root.join(".claude/projects/app/large.jsonl");
+        fs::create_dir_all(claude.parent().unwrap()).unwrap();
+        let text = "large backlog text ".repeat(100_000);
+        fs::write(
+            &claude,
+            serde_json::json!({"type":"user","sessionId":"large","cwd":"/fixture/app","message":{"content":text}}).to_string() + "\n",
+        )
+        .unwrap();
+        let estimate = api::estimate(
+            &Context {
+                roots: resolve_roots(root, &BTreeMap::new()).unwrap(),
+                index_dir: root.join("index"),
+                cwd: root.into(),
+                now_ms: 0,
+                time_zone: "UTC".into(),
+                coverage: Coverage::Compact,
+                build: BuildPolicy::Inline,
+                progress: false,
+            },
+            &BTreeSet::from([Agent::Claude, Agent::Pi]),
+        )
+        .unwrap();
+        let millis = |agent| {
+            estimate
+                .agents
+                .iter()
+                .find(|a| a.agent == agent)
+                .unwrap()
+                .compact
+                .millis
+        };
+        assert!(millis(Agent::Pi) <= 20 && millis(Agent::Claude) > 20);
+        let run = invoke(root, &["--claude", "--pi", "sessions"], 20, "f\n");
+        assert_eq!(run.code, 0, "{}", run.prompt);
+        assert!(run.prompt.contains("\n  compact "), "{}", run.prompt);
+        assert!(run.prompt.contains("\n  full "), "{}", run.prompt);
+        assert!(
+            run.prompt
+                .ends_with("Build now? [c]ompact / [f]ull / [N]o: ")
+        );
+        assert_eq!(stored_coverage(root), "full");
+        assert_eq!(
+            fs::read_to_string(root.join("config.toml")).unwrap(),
+            "coverage = \"full\"\n"
+        );
+        let data: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+        assert_eq!(data["count"], 2);
+    }
+
+    #[test]
+    fn interactive_prompt_on_a_used_index_offers_only_its_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        published_then_changed(root);
+        fs::write(root.join("config.toml"), "coverage = \"full\"\n").unwrap();
+        let declined = invoke(root, &SEARCH, 0, "\n");
+        assert_eq!(declined.code, 1);
+        let lines: Vec<_> = declined.prompt.lines().collect();
+        assert_eq!(lines.len(), 4, "{}", declined.prompt);
+        assert!(lines[1].starts_with("  compact "), "{}", lines[1]);
+        assert_eq!(
+            lines[2],
+            "The config asks for full coverage but the index is compact; run `slimetrail index` to rebuild it."
+        );
+        assert_eq!(lines[3], "Build now? [y/N]: ");
+        assert_eq!(
+            declined
+                .stdout
+                .matches("Returned sessions: 1 (search incomplete)\n")
+                .count(),
+            1,
+            "{}",
+            declined.stdout
+        );
+        assert!(
+            declined.stdout.contains("Published needle"),
+            "{}",
+            declined.stdout
+        );
+        let accepted = invoke(root, &SEARCH, 0, "y\n");
+        assert_eq!(accepted.code, 0);
+        assert!(
+            accepted.stdout.contains("Changed needle"),
+            "{}",
+            accepted.stdout
+        );
+        assert_eq!(stored_coverage(root), "compact");
+        assert_eq!(
+            fs::read_to_string(root.join("config.toml")).unwrap(),
+            "coverage = \"full\"\n"
+        );
+    }
+
+    #[test]
+    fn interactive_entries_stream_once_after_the_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        codex(root, "Gated needle");
+        let entries = ["entries", "codex:sample"];
+        let built = invoke(root, &entries, 0, "c\n");
+        assert_eq!(built.code, 0);
+        assert!(built.prompt.contains("[c]ompact"), "{}", built.prompt);
+        assert_eq!(built.stdout, "Gated needle\nSecond reply\n");
+        codex(root, "Changed text that is not indexed yet");
+        let declined = invoke(root, &entries, 0, "n\n");
+        assert_eq!(declined.code, 1);
+        assert!(declined.prompt.ends_with("Build now? [y/N]: "));
+        assert_eq!(declined.stdout, "Gated needle\nSecond reply\n");
+        let accepted = invoke(root, &entries, 0, "y\n");
+        assert_eq!(accepted.code, 0);
+        assert_eq!(
+            accepted.stdout,
+            "Changed text that is not indexed yet\nSecond reply\n"
+        );
+    }
 
     #[test]
     fn calendar_dates_follow_dst_and_days_remain_elapsed_duration() {

@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     Agent, Context, Discovery, DiscoveryCache, Entry, Fingerprint, Kind, ParsedSession, RawSession,
-    Result, Searchable, Session, SessionKey, SourceState, Timestamp, TitleOrigin,
+    Result, Searchable, Session, SessionKey, SourceState, Timestamp, TitleOrigin, hex::hex,
 };
 use rusqlite::{Connection, Row, types::ValueRef};
 use serde_json::{Value, json};
@@ -128,16 +128,6 @@ fn subagent_heads(connection: &Connection) -> Result<Vec<(String, String, Value)
         .collect::<std::result::Result<_, _>>()?)
 }
 
-fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .fold(String::new(), |mut hex, byte| {
-            std::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"))
-                .expect("writing to a String cannot fail");
-            hex
-        })
-}
-
 fn key_value(value: ValueRef<'_>) -> Value {
     match value {
         ValueRef::Null => Value::Null,
@@ -146,7 +136,7 @@ fn key_value(value: ValueRef<'_>) -> Value {
             serde_json::Number::from_f64(number).map_or(Value::Null, Value::Number)
         }
         ValueRef::Text(text) => String::from_utf8_lossy(text).into(),
-        ValueRef::Blob(blob) => json!({ "blob": sha256_hex(blob) }),
+        ValueRef::Blob(blob) => json!({ "blob": hex(Sha256::digest(blob)) }),
     }
 }
 
@@ -217,7 +207,7 @@ impl Content {
     fn finish_with(mut self, nodes: &[u8]) -> SourceState {
         self.front.update(nodes);
         SourceState::Content {
-            sha256: sha256_hex(self.front.finalize()),
+            sha256: hex(Sha256::digest(self.front.finalize())),
         }
     }
 }
@@ -337,7 +327,7 @@ fn discovery(
         }
         let source = source_name(path, &id);
         let fingerprint = Fingerprint {
-            signature: sha256_hex(serde_json::to_string(&key)?),
+            signature: hex(Sha256::digest(serde_json::to_string(&key)?)),
         };
         let cached = previous.by_source.get(&source).filter(|cached| {
             cached.key.agent == Agent::Devin
@@ -615,6 +605,7 @@ impl Source for Devin {
                 Ok(Discovery {
                     sessions: Vec::new(),
                     complete_agents: BTreeSet::new(),
+                    warnings: Vec::new(),
                     diagnostics: vec![diagnostic(
                         Agent::Devin,
                         &ctx.roots.devin_sessions_db,
@@ -627,6 +618,7 @@ impl Source for Devin {
                 Ok(Discovery {
                     sessions,
                     diagnostics: Vec::new(),
+                    warnings: Vec::new(),
                     complete_agents: BTreeSet::from([Agent::Devin]),
                 })
             },

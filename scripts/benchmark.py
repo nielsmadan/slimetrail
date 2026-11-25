@@ -32,6 +32,10 @@ DIAGNOSTICS = {
     "duplicate_identity",
     "timeline_missing_timestamps",
     "search_coverage",
+    "coverage_excluded",
+    "index_required",
+    "refresh_in_progress",
+    "coverage_rebuild_pending",
     "fatal",
 }
 

@@ -1,7 +1,6 @@
-use crate::{Context, Error, Result};
+use crate::{Context, Error, Result, hex::hex};
 use sha2::{Digest, Sha256};
 use std::{
-    fmt::Write as _,
     fs::{self, File, OpenOptions},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
@@ -56,15 +55,6 @@ fn canonical_path(path: &Path, cwd: &Path, source: bool) -> Result<PathBuf> {
     Ok(resolved)
 }
 
-fn hex_digest(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .fold(String::new(), |mut hex, b| {
-            let _ = write!(hex, "{b:02x}");
-            hex
-        })
-}
-
 pub(super) fn namespace(ctx: &Context) -> Result<(String, String)> {
     let mut roots = serde_json::to_value(&ctx.roots)?;
     for value in roots
@@ -77,7 +67,7 @@ pub(super) fn namespace(ctx: &Context) -> Result<(String, String)> {
         }
     }
     let encoded = serde_json::to_string(&roots)?;
-    Ok((hex_digest(encoded.as_bytes()), encoded))
+    Ok((hex(Sha256::digest(encoded.as_bytes())), encoded))
 }
 
 pub(super) fn check_file(path: &Path) -> Result<bool> {
@@ -380,16 +370,13 @@ impl Drop for Staging {
 
 #[cfg(test)]
 mod tests {
-    use super::{hex_digest, sweep_listed};
+    use super::sweep_listed;
     use std::os::unix::fs::DirBuilderExt;
 
     #[test]
     fn sweep_skips_a_listed_directory_that_vanished() {
-        let root = std::env::temp_dir().join(format!("sweep-vanish-{}", super::random()));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&root)
-            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
         let gone = root.join("proc-1-gone");
         let dead = root.join("proc-2-dead");
         std::fs::DirBuilder::new()
@@ -405,14 +392,5 @@ mod tests {
         let own = root.join("proc-3-own");
         sweep_listed(vec![gone, dead.clone()], &own).unwrap();
         assert!(!dead.exists());
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn hex_digest_is_lowercase_sha256_hex() {
-        assert_eq!(
-            hex_digest(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
     }
 }

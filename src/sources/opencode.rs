@@ -127,6 +127,7 @@ impl Source for Opencode {
             Ok(Discovery {
                 sessions: Vec::new(),
                 complete_agents: BTreeSet::new(),
+                warnings: Vec::new(),
                 diagnostics: vec![diagnostic(
                     Agent::Opencode,
                     &ctx.roots.opencode_db,
@@ -145,6 +146,7 @@ impl Source for Opencode {
         }, |sessions| Ok(Discovery {
             sessions,
             diagnostics: Vec::new(),
+            warnings: Vec::new(),
             complete_agents: BTreeSet::from([Agent::Opencode]),
         }))
     }

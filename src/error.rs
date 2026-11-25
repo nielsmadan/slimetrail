@@ -18,6 +18,8 @@ pub enum Error {
     Time(#[from] jiff::Error),
     #[error("SQLite operation failed")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("the index must be built first; run `slimetrail index`")]
+    IndexRequired(Box<crate::JobEstimate>),
     #[error("append resume state no longer matches the source")]
     ResumeRejected,
 }

@@ -716,7 +716,13 @@ fn tool_session(fixture: &Fixture) {
 }
 
 fn index_settings(fixture: &Fixture) -> (String, Option<String>) {
-    let db = rusqlite::Connection::open(fixture.root().join("index/index-v3.sqlite3")).unwrap();
+    let db = rusqlite::Connection::open(
+        fixture
+            .root()
+            .join("index")
+            .join(slimetrail::index::DATABASE),
+    )
+    .unwrap();
     db.query_row("SELECT coverage,coverage_pending FROM settings", [], |r| {
         Ok((r.get(0)?, r.get(1)?))
     })
@@ -855,15 +861,24 @@ fn interrupted_coverage_rebuild_keeps_queries_stale_until_index_completes_it() {
     let fixture = Fixture::new();
     tool_session(&fixture);
     fixture.json(&["index", "--codex"], 0);
-    let db = rusqlite::Connection::open(fixture.root().join("index/index-v3.sqlite3")).unwrap();
+    let db = rusqlite::Connection::open(
+        fixture
+            .root()
+            .join("index")
+            .join(slimetrail::index::DATABASE),
+    )
+    .unwrap();
     db.execute("UPDATE settings SET coverage_pending='full'", [])
         .unwrap();
     drop(db);
     let stale = fixture.json(&search_args("late-literal"), 1);
     assert_eq!(stale["incomplete"], true);
-    assert_eq!(codes(&stale), ["refresh_in_progress", "search_coverage"]);
+    assert_eq!(
+        codes(&stale),
+        ["coverage_rebuild_pending", "search_coverage"]
+    );
     let listed = fixture.json(&["sessions", "--codex", "--scope", "all"], 1);
-    assert_eq!(codes(&listed), ["refresh_in_progress"]);
+    assert_eq!(codes(&listed), ["coverage_rebuild_pending"]);
     assert_eq!(
         index_settings(&fixture),
         ("compact".into(), Some("full".into()))
@@ -955,4 +970,126 @@ fn config_file_location_and_validation() {
             .unwrap()
             .contains("config asks for compact")
     );
+}
+
+#[test]
+fn non_interactive_over_limit_queries_return_index_required_shapes() {
+    let fixture = Fixture::new();
+    fixture.write("Gated needle");
+    let gated = |args: &[&str]| {
+        let output = fixture
+            .command()
+            .env("SLIMETRAIL_TEST_BUILD_LIMIT_MS", "0")
+            .args(["--format", "json", "--codex", "--scope", "all"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["incomplete"], true);
+        assert_eq!(value["diagnostics"].as_array().unwrap().len(), 1);
+        assert_eq!(value["diagnostics"][0]["code"], "index_required");
+        assert_eq!(value["diagnostics"][0]["agent"], "codex");
+        value["data"].clone()
+    };
+    assert_eq!(
+        gated(&["search", "needle"]),
+        json!({"query":"needle","agents":["codex"],"sort":"score","count":0,"results":[]})
+    );
+    assert_eq!(gated(&["sessions"]), json!({"count":0,"sessions":[]}));
+    assert_eq!(
+        gated(&["timeline", "--days", "1"]),
+        json!({"sessions":[],"daily_active_minutes":{}})
+    );
+    assert_eq!(gated(&["read", "codex:sample"]), Value::Null);
+    assert_eq!(
+        gated(&["entries", "codex:sample"]),
+        json!({"entries":[],"session":null})
+    );
+    let text = fixture
+        .command()
+        .env("SLIMETRAIL_TEST_BUILD_LIMIT_MS", "0")
+        .args(["entries", "codex:sample"])
+        .output()
+        .unwrap();
+    assert_eq!(text.status.code(), Some(1));
+    assert_eq!(text.stdout, b"");
+    assert!(String::from_utf8_lossy(&text.stderr).contains("index_required: [codex]"));
+}
+
+#[test]
+fn index_command_builds_regardless_of_the_estimate() {
+    let fixture = Fixture::new();
+    fixture.write("Gated needle");
+    let index = fixture
+        .command()
+        .env("SLIMETRAIL_TEST_BUILD_LIMIT_MS", "0")
+        .args(["--format", "json", "--codex", "index"])
+        .output()
+        .unwrap();
+    assert_eq!(index.status.code(), Some(0));
+    let stats: Value = serde_json::from_slice(&index.stdout).unwrap();
+    assert_eq!(stats["data"]["reparsed"], 1);
+    let search = fixture
+        .command()
+        .env("SLIMETRAIL_TEST_BUILD_LIMIT_MS", "0")
+        .args([
+            "--format", "json", "--codex", "--scope", "all", "search", "needle",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(search.status.code(), Some(0));
+    let value: Value = serde_json::from_slice(&search.stdout).unwrap();
+    assert_eq!(value["data"]["count"], 1);
+}
+
+#[test]
+fn index_required_names_the_index_coverage_when_config_differs() {
+    let fixture = Fixture::new();
+    let projects = fixture.root().join(".claude/projects/app");
+    fs::create_dir_all(&projects).unwrap();
+    fs::write(
+        projects.join("claude.jsonl"),
+        json!({"type":"user","sessionId":"claude-sample","uuid":"u1","cwd":fixture.root().join("work/app"),"message":{"content":"needle"}}).to_string() + "\n",
+    ).unwrap();
+    fixture.json(&["--claude", "index"], 0);
+    fixture.write("Gated needle");
+    let config = fixture.root().join("config.toml");
+    fs::write(&config, "coverage = \"full\"\n").unwrap();
+    let output = fixture
+        .command()
+        .env("SLIMETRAIL_TEST_BUILD_LIMIT_MS", "0")
+        .env("SLIMETRAIL_CONFIG", &config)
+        .args([
+            "--format", "json", "--codex", "--scope", "all", "search", "needle",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["diagnostics"][0]["code"], "index_required");
+    let message = value["diagnostics"][0]["message"].as_str().unwrap();
+    assert!(message.contains("at compact coverage"), "{message}");
+}
+
+#[test]
+fn non_interactive_stale_entries_stream_once_with_index_required() {
+    let fixture = Fixture::new();
+    fixture.write("Published text");
+    fixture.json(&["--codex", "index"], 0);
+    fixture.write("Changed text that is not indexed yet");
+    let output = fixture
+        .command()
+        .env("SLIMETRAIL_TEST_BUILD_LIMIT_MS", "0")
+        .args(["entries", "codex:sample"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"Published text\nSecond reply\n");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("index_required: [codex]"));
 }

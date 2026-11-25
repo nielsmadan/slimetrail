@@ -27,6 +27,8 @@ pub(crate) fn context(base: &Path) -> Context {
         now_ms: ts("2026-11-16T12:00:00Z"),
         time_zone: "UTC".into(),
         coverage: slimetrail::Coverage::Compact,
+        build: slimetrail::BuildPolicy::Inline,
+        progress: false,
     }
 }
 pub(crate) fn ts(text: &str) -> i64 {

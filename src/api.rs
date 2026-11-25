@@ -1,11 +1,10 @@
 use crate::{
-    Agent, Context, Entry, Envelope, Error, Filter, IndexStats, ReadOptions, ReadPage, Result,
-    Scope, SearchOptions, SearchResult, Session, SessionKey, TimelineOptions, TimelineResult,
-    index, index::IndexSession,
+    Agent, Context, Entry, Envelope, Error, Filter, IndexStats, JobEstimate, ReadOptions, ReadPage,
+    Result, Scope, SearchOptions, SearchResult, Session, SessionKey, TimelineOptions,
+    TimelineResult, index, index::IndexSession,
 };
 use std::{
     collections::BTreeSet,
-    io::IsTerminal,
     path::{Component, Path, PathBuf},
 };
 
@@ -14,13 +13,11 @@ pub fn refresh(
     agents: &BTreeSet<Agent>,
     verify: bool,
 ) -> Result<Envelope<IndexStats>> {
-    // Placeholder until Context gains `progress`.
-    index::refresh_noting(
-        ctx,
-        &selected(agents),
-        std::io::stderr().is_terminal(),
-        verify,
-    )
+    index::refresh_noting(ctx, &selected(agents), ctx.progress, verify)
+}
+
+pub fn estimate(ctx: &Context, agents: &BTreeSet<Agent>) -> Result<JobEstimate> {
+    IndexSession::open(ctx)?.estimate(&selected(agents))
 }
 
 pub fn sessions(ctx: &Context, filter: &Filter) -> Result<Envelope<Vec<Session>>> {
@@ -115,7 +112,7 @@ fn with_data<T>(status: Envelope<IndexStats>, data: Option<T>) -> Envelope<T> {
     }
 }
 
-pub(crate) fn selected(agents: &BTreeSet<Agent>) -> BTreeSet<Agent> {
+pub fn selected(agents: &BTreeSet<Agent>) -> BTreeSet<Agent> {
     if agents.is_empty() {
         BTreeSet::from([
             Agent::Claude,

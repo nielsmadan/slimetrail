@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::json;
 use slimetrail::{
     index::{self, DATABASE, IndexSession, VERSION},
@@ -34,6 +34,8 @@ fn context(base: &Path) -> Context {
         now_ms: 0,
         time_zone: "UTC".into(),
         coverage: slimetrail::Coverage::Compact,
+        build: slimetrail::BuildPolicy::Inline,
+        progress: false,
     }
 }
 
@@ -1265,6 +1267,114 @@ fn droid_settings_change_reparses_and_codex_title_change_resumes() {
     assert_eq!((session, entries), cold(&ctx, &canonical(Agent::Codex)));
 }
 
+fn titled_hits(ctx: &Context, title: &str) -> Vec<(String, Option<String>)> {
+    let mut options = query_options(title);
+    options.filter.agents = selected(Agent::Codex);
+    let result = search(ctx, &options).unwrap();
+    result
+        .data
+        .unwrap()
+        .results
+        .into_iter()
+        .map(|hit| (hit.session.key.id, hit.session.title))
+        .collect()
+}
+
+#[test]
+fn codex_title_index_changes_invalidate_only_the_named_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let agents = selected(Agent::Codex);
+    let fixture = jsonl_fixture(Agent::Codex);
+    let plain = transcript(&ctx, Agent::Codex, "session");
+    write(&plain, &fixture);
+    let zst = transcript(&ctx, Agent::Codex, "zst-thread").with_extension("jsonl.zst");
+    fs::write(
+        &zst,
+        ruzstd::encoding::compress_to_vec(
+            fixture.replace("codex-canonical", "zst-thread").as_bytes(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        ),
+    )
+    .unwrap();
+    let names = &ctx.roots.codex_session_index;
+    let line = |id: &str, name: &str| format!("{}\n", json!({"id":id,"thread_name":name}));
+    write(
+        names,
+        &(line("codex-canonical", "Plain title") + &line("zst-thread", "Packed title")),
+    );
+    let zst_key = SessionKey {
+        agent: Agent::Codex,
+        id: "zst-thread".into(),
+    };
+    let (_, result) = refreshed(&ctx, &agents);
+    assert_eq!(result.diagnostics, []);
+    let plain_state = append_state(&ctx, &plain);
+    let (plain_rows, zst_rows) = (
+        rowids(&ctx, &canonical(Agent::Codex)),
+        rowids(&ctx, &zst_key),
+    );
+
+    write(
+        &transcript(&ctx, Agent::Codex, "new-thread"),
+        &fixture.replace("codex-canonical", "new-thread"),
+    );
+    append(names, &line("new-thread", "Fresh title"));
+    let (_, result) = refreshed(&ctx, &agents);
+    assert_eq!(result.diagnostics, []);
+    assert_eq!(counts(&result), (1, 2));
+    assert_eq!(rowids(&ctx, &zst_key), zst_rows);
+    assert_eq!(rowids(&ctx, &canonical(Agent::Codex)), plain_rows);
+
+    append(names, &line("zst-thread", "Repacked title"));
+    let (lease, result) = refreshed(&ctx, &agents);
+    assert_eq!(result.diagnostics, []);
+    assert_eq!(counts(&result), (1, 2));
+    assert_eq!(
+        lease.session(&zst_key).unwrap().unwrap().title.as_deref(),
+        Some("Repacked title")
+    );
+    drop(lease);
+    assert_eq!(
+        titled_hits(&ctx, "Repacked title"),
+        [("zst-thread".into(), Some("Repacked title".into()))]
+    );
+    assert_eq!(rowids(&ctx, &canonical(Agent::Codex)), plain_rows);
+    let zst_renamed = rowids(&ctx, &zst_key);
+    assert_ne!(zst_renamed, zst_rows);
+
+    append(names, &line("codex-canonical", "Plain renamed"));
+    let (lease, result) = refreshed(&ctx, &agents);
+    assert_eq!(result.diagnostics, []);
+    assert_eq!(counts(&result), (1, 2));
+    assert_eq!(append_state(&ctx, &plain), plain_state);
+    assert_eq!(rowids(&ctx, &canonical(Agent::Codex)), plain_rows);
+    assert_eq!(rowids(&ctx, &zst_key), zst_renamed);
+    let session = lease.session(&canonical(Agent::Codex)).unwrap().unwrap();
+    assert_eq!(
+        (session.title.as_deref(), session.title_origin),
+        (Some("Plain renamed"), Some(TitleOrigin::Native))
+    );
+    drop(lease);
+    assert_eq!(
+        titled_hits(&ctx, "Plain renamed"),
+        [("codex-canonical".into(), Some("Plain renamed".into()))]
+    );
+
+    write(
+        names,
+        &(line("zst-thread", "Repacked title") + &line("new-thread", "Fresh title")),
+    );
+    let (lease, result) = refreshed(&ctx, &agents);
+    assert_eq!(result.diagnostics, []);
+    assert_eq!(counts(&result), (1, 2));
+    let session = lease.session(&canonical(Agent::Codex)).unwrap().unwrap();
+    assert_eq!(session.title_origin, Some(TitleOrigin::Derived));
+    assert_ne!(session.title.as_deref(), Some("Plain renamed"));
+    drop(lease);
+    assert_eq!(titled_hits(&ctx, "Plain renamed"), []);
+}
+
 #[test]
 fn cursor_appends_still_fully_reparse() {
     let dir = tempfile::tempdir().unwrap();
@@ -1365,7 +1475,34 @@ fn unchanged_recent_torn_title_index_line_is_rechecked_until_it_counts_as_malfor
     drop(lease);
     age(names);
     let (_, result) = refreshed(&ctx, &selected(Agent::Codex));
-    assert_eq!(codes(&result), ["malformed_metadata", "malformed_metadata"]);
+    assert_eq!(codes(&result), ["malformed_metadata"]);
+}
+
+#[test]
+fn malformed_title_index_line_is_reported_while_sessions_are_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    with_companion(&ctx, Agent::Codex);
+    let names = &ctx.roots.codex_session_index;
+    write(
+        names,
+        "{\"id\":\"codex-canonical\",\"thread_name\":\"First\"}\n",
+    );
+    let (_, result) = refreshed(&ctx, &selected(Agent::Codex));
+    assert_eq!(result.diagnostics, []);
+    let before = rowids(&ctx, &canonical(Agent::Codex));
+    append(names, "malformed\n");
+    age(names);
+    for _ in 0..2 {
+        let (lease, result) = refreshed(&ctx, &selected(Agent::Codex));
+        assert!(result.incomplete);
+        assert_eq!(codes(&result), ["malformed_metadata"]);
+        assert_eq!(result.diagnostics[0].agent, Some(Agent::Codex));
+        assert_eq!(counts(&result), (0, 2));
+        let session = lease.session(&canonical(Agent::Codex)).unwrap().unwrap();
+        assert_eq!(session.title.as_deref(), Some("First"));
+    }
+    assert_eq!(rowids(&ctx, &canonical(Agent::Codex)), before);
 }
 
 #[test]
@@ -1556,4 +1693,471 @@ fn contentless_fts_survives_cascaded_deletes_appends_and_coverage_flips() {
             .verify_integrity()
             .is_err()
     );
+}
+
+fn limited(ctx: &Context, max_ms: u64) -> Context {
+    Context {
+        build: BuildPolicy::Limit {
+            max_ms,
+            whole: false,
+        },
+        ..ctx.clone()
+    }
+}
+
+fn listed(ctx: &Context, agents: &[Agent]) -> Envelope<Vec<Session>> {
+    sessions(
+        ctx,
+        &Filter {
+            agents: agents.iter().copied().collect(),
+            cwd: ctx.cwd.clone(),
+            scope: Scope::All,
+            app: None,
+            days: None,
+            kinds: BTreeSet::new(),
+        },
+    )
+    .unwrap()
+}
+
+fn ids(envelope: &Envelope<Vec<Session>>) -> Vec<String> {
+    let data = envelope.data.as_ref().unwrap();
+    data.iter()
+        .map(|s| format!("{}:{}", s.key.agent, s.key.id))
+        .collect()
+}
+
+fn large(ctx: &Context, id: &str) -> PathBuf {
+    claude(ctx, id, &"large backlog text ".repeat(100_000))
+}
+
+fn index_rows(ctx: &Context) -> (i64, i64) {
+    let db = Connection::open(ctx.index_dir.join(DATABASE)).unwrap();
+    db.query_row(
+        "SELECT (SELECT count(*) FROM refresh_runs),(SELECT count(*) FROM sources)",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap()
+}
+
+#[test]
+fn over_limit_first_build_reports_the_estimate_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let one = claude(&ctx, "one", "first text");
+    let two = claude(&ctx, "two", "second text");
+    let pi = transcript(&ctx, Agent::Pi, "session");
+    write(&pi, &jsonl_fixture(Agent::Pi));
+    let size = |path: &Path| fs::metadata(path).unwrap().len();
+    let mut index = IndexSession::open(&limited(&ctx, 1)).unwrap();
+    let Err(Error::IndexRequired(estimate)) =
+        index.refresh_for_query(&BTreeSet::from([Agent::Claude, Agent::Pi]))
+    else {
+        panic!("expected IndexRequired");
+    };
+    let found: Vec<_> = estimate
+        .agents
+        .iter()
+        .map(|a| (a.agent, a.sessions, a.bytes))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (Agent::Claude, 2, size(&one) + size(&two)),
+            (Agent::Pi, 1, size(&pi))
+        ]
+    );
+    assert_eq!(
+        estimate.agents[1].compact.millis,
+        size(&pi).div_ceil(30_000) + 2
+    );
+    drop(index);
+    assert_eq!(index_rows(&ctx), (0, 0));
+    let Err(Error::IndexRequired(_)) = search(&limited(&ctx, 1), &{
+        let mut opt = query_options("text");
+        opt.filter.agents = selected(Agent::Claude);
+        opt
+    }) else {
+        panic!("expected IndexRequired from search");
+    };
+    assert_eq!(index_rows(&ctx), (0, 0));
+}
+
+fn query_options(query: &str) -> SearchOptions {
+    SearchOptions {
+        filter: Filter {
+            agents: BTreeSet::new(),
+            cwd: "/".into(),
+            scope: Scope::All,
+            app: None,
+            days: None,
+            kinds: BTreeSet::new(),
+        },
+        query: query.into(),
+        regex: false,
+        case_sensitive: false,
+        sort: Sort::Score,
+        max_results: 50,
+        max_snippets: 3,
+        context_chars: 80,
+    }
+}
+
+#[test]
+fn gated_agent_with_a_published_state_is_served_stale_while_small_agents_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    claude(&ctx, "old", "published text");
+    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
+    large(&ctx, "new");
+    write(
+        &transcript(&ctx, Agent::Pi, "session"),
+        &jsonl_fixture(Agent::Pi),
+    );
+    let result = listed(&limited(&ctx, 50), &[Agent::Claude, Agent::Pi]);
+    assert!(result.incomplete);
+    let required: Vec<_> = result
+        .diagnostics
+        .iter()
+        .map(|d| (d.code.as_str(), d.agent))
+        .collect();
+    assert_eq!(required, [("index_required", Some(Agent::Claude))]);
+    assert!(result.diagnostics[0].message.contains("slimetrail index"));
+    assert_eq!(ids(&result), ["claude:old", "pi:pi-canonical"]);
+    let built = listed(&ctx, &[Agent::Claude, Agent::Pi]);
+    assert!(!built.incomplete, "{:?}", built.diagnostics);
+    assert_eq!(ids(&built), ["claude:new", "claude:old", "pi:pi-canonical"]);
+}
+
+#[test]
+fn whole_gate_requires_the_index_when_any_agent_is_over_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    claude(&ctx, "old", "published text");
+    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
+    let new = large(&ctx, "new");
+    write(
+        &transcript(&ctx, Agent::Pi, "session"),
+        &jsonl_fixture(Agent::Pi),
+    );
+    let before = index_rows(&ctx);
+    let whole = Context {
+        build: BuildPolicy::Limit {
+            max_ms: 50,
+            whole: true,
+        },
+        coverage: slimetrail::Coverage::Full,
+        ..ctx.clone()
+    };
+    let Err(Error::IndexRequired(estimate)) = sessions(
+        &whole,
+        &Filter {
+            agents: BTreeSet::from([Agent::Claude, Agent::Pi]),
+            cwd: ctx.cwd.clone(),
+            scope: Scope::All,
+            app: None,
+            days: None,
+            kinds: BTreeSet::new(),
+        },
+    ) else {
+        panic!("expected IndexRequired");
+    };
+    let gated: Vec<_> = estimate
+        .agents
+        .iter()
+        .map(|a| (a.agent, a.sessions, a.bytes))
+        .collect();
+    assert_eq!(
+        gated,
+        [(Agent::Claude, 1, fs::metadata(&new).unwrap().len())]
+    );
+    assert_eq!(
+        (estimate.coverage, estimate.coverage_locked),
+        (slimetrail::Coverage::Compact, true)
+    );
+    assert_eq!(index_rows(&ctx), before);
+    let small = Context {
+        build: BuildPolicy::Limit {
+            max_ms: 50,
+            whole: true,
+        },
+        ..ctx
+    };
+    assert_eq!(ids(&listed(&small, &[Agent::Pi])), ["pi:pi-canonical"]);
+}
+
+#[test]
+fn incremental_backlogs_are_gated_by_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    claude(&ctx, "old", "published text");
+    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
+    claude(&ctx, "small", "small backlog");
+    let small = listed(&limited(&ctx, 10), &[Agent::Claude]);
+    assert!(!small.incomplete, "{:?}", small.diagnostics);
+    assert_eq!(ids(&small), ["claude:old", "claude:small"]);
+    large(&ctx, "large");
+    let gated = listed(&limited(&ctx, 10), &[Agent::Claude]);
+    assert!(gated.incomplete);
+    assert_eq!(gated.diagnostics[0].code, "index_required");
+    assert_eq!(ids(&gated), ["claude:old", "claude:small"]);
+    let estimate = api::estimate(&ctx, &selected(Agent::Claude)).unwrap();
+    assert_eq!(estimate.agents.len(), 1);
+    assert_eq!(estimate.agents[0].sessions, 1);
+}
+
+#[test]
+fn observed_throughput_is_recorded_per_coverage_and_drives_later_estimates() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    claude(&ctx, "one", "first text");
+    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
+    let db = Connection::open(ctx.index_dir.join(DATABASE)).unwrap();
+    let observed = |db: &Connection| -> Vec<(String, u64, String)> {
+        db.prepare("SELECT coverage,bytes,typeof(micros) FROM throughput WHERE agent='claude'")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    assert_eq!(observed(&db), []);
+    let two = claude(&ctx, "two", "second text");
+    let bytes = fs::metadata(&two).unwrap().len();
+    let estimate = api::estimate(&ctx, &selected(Agent::Claude)).unwrap();
+    assert_eq!(
+        estimate.agents[0].compact.millis,
+        bytes.div_ceil(31_000) + 2
+    );
+    db.execute(
+        "INSERT INTO throughput(agent,coverage,bytes,micros) VALUES('claude','compact',67108864,67108864000)",
+        [],
+    )
+    .unwrap();
+    let estimate = api::estimate(&ctx, &selected(Agent::Claude)).unwrap();
+    assert_eq!(estimate.agents[0].compact.millis, bytes + 2);
+    assert_eq!(estimate.agents[0].full.millis, bytes.div_ceil(14_000) + 2);
+    db.execute(
+        "INSERT INTO throughput(agent,coverage,bytes,micros) VALUES('claude','full',67108864,134217728000)",
+        [],
+    )
+    .unwrap();
+    let estimate = api::estimate(&ctx, &selected(Agent::Claude)).unwrap();
+    assert_eq!(estimate.agents[0].full.millis, 2 * bytes + 2);
+    assert_eq!(estimate.agents[0].compact.millis, bytes + 2);
+    let gated = listed(&limited(&ctx, bytes), &[Agent::Claude]);
+    assert_eq!(gated.diagnostics[0].code, "index_required");
+    assert_eq!(ids(&gated), ["claude:one"]);
+    let admitted = listed(&limited(&ctx, bytes + 2), &[Agent::Claude]);
+    assert!(!admitted.incomplete, "{:?}", admitted.diagnostics);
+    assert_eq!(ids(&admitted), ["claude:one", "claude:two"]);
+
+    let full_dir = tempfile::tempdir().unwrap();
+    let full = Context {
+        coverage: Coverage::Full,
+        ..context(full_dir.path())
+    };
+    let three = large(&full, "three");
+    index::refresh(&full, &selected(Agent::Claude), false).unwrap();
+    let db = Connection::open(full.index_dir.join(DATABASE)).unwrap();
+    assert_eq!(
+        observed(&db),
+        [(
+            "full".into(),
+            fs::metadata(&three).unwrap().len(),
+            "integer".into()
+        )]
+    );
+}
+
+fn throughput_row(ctx: &Context) -> Option<(u64, u64)> {
+    Connection::open(ctx.index_dir.join(DATABASE))
+        .unwrap()
+        .query_row(
+            "SELECT bytes,micros FROM throughput WHERE agent='claude' AND coverage='compact'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .unwrap()
+}
+
+#[test]
+fn learned_throughput_counts_only_ingests_of_at_least_one_mebibyte() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let agents = selected(Agent::Claude);
+    let first = large(&ctx, "first");
+    let first_bytes = fs::metadata(&first).unwrap().len();
+    assert!(first_bytes >= 1 << 20);
+    index::refresh(&ctx, &agents, false).unwrap();
+    let (bytes, micros) = throughput_row(&ctx).unwrap();
+    assert_eq!(bytes, first_bytes);
+    assert!(micros > 0);
+    for round in 0..4 {
+        append(
+            &first,
+            &format!(
+                "{}\n",
+                json!({"type":"user","sessionId":"first","message":{"content":format!("tail {round}")}})
+            ),
+        );
+        claude(&ctx, &format!("small-{round}"), "small session");
+        let stats = index::refresh(&ctx, &agents, false).unwrap().data.unwrap();
+        assert_eq!(stats.reparsed, 2);
+        assert_eq!(throughput_row(&ctx), Some((bytes, micros)));
+    }
+    let second = large(&ctx, "second");
+    index::refresh(&ctx, &agents, false).unwrap();
+    let (summed, more) = throughput_row(&ctx).unwrap();
+    assert_eq!(summed, first_bytes + fs::metadata(&second).unwrap().len());
+    assert!(more > micros);
+}
+
+#[test]
+fn small_appends_to_large_indexed_transcripts_are_costed_as_hashing() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let path = large(&ctx, "big");
+    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
+    let consumed = fs::metadata(&path).unwrap().len();
+    fs::File::options()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(
+            format!(
+                "{}\n",
+                json!({"type":"user","sessionId":"big","cwd":"/fixture/project","message":{"content":"appended text"}})
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let size = fs::metadata(&path).unwrap().len();
+    let full_parse = size.div_ceil(31_000) + 2;
+    let limit = 20;
+    assert!(full_parse > limit, "{full_parse}");
+    let estimate = api::estimate(&ctx, &selected(Agent::Claude)).unwrap();
+    assert_eq!(estimate.agents[0].bytes, size);
+    assert_eq!(
+        estimate.agents[0].compact.millis,
+        (size - consumed).div_ceil(31_000) + consumed.div_ceil(1_000_000) + 2
+    );
+    let mut index = IndexSession::open(&limited(&ctx, limit)).unwrap();
+    let admitted = index.refresh_for_query(&selected(Agent::Claude)).unwrap();
+    assert!(!admitted.incomplete, "{:?}", admitted.diagnostics);
+    assert_eq!(admitted.data.unwrap().reparsed, 1);
+    assert_eq!(texts(&index, &key("big")).last().unwrap(), "appended text");
+}
+
+#[test]
+fn first_build_after_a_refused_query_takes_the_chosen_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    claude(&ctx, "one", "first text");
+    let mut refused = IndexSession::open(&limited(&ctx, 0)).unwrap();
+    let Err(Error::IndexRequired(_)) = refused.refresh_for_query(&selected(Agent::Claude)) else {
+        panic!("expected IndexRequired");
+    };
+    drop(refused);
+    let stored = |ctx: &Context| -> String {
+        Connection::open(ctx.index_dir.join(DATABASE))
+            .unwrap()
+            .query_row("SELECT coverage FROM settings", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(stored(&ctx), "compact");
+    let full = Context {
+        coverage: Coverage::Full,
+        ..ctx.clone()
+    };
+    let unlocked = |ctx: &Context| {
+        let estimate = api::estimate(ctx, &selected(Agent::Claude)).unwrap();
+        (estimate.coverage, estimate.coverage_locked)
+    };
+    assert_eq!(unlocked(&full), (Coverage::Full, false));
+    assert_eq!(unlocked(&ctx), (Coverage::Compact, false));
+    let built = listed(&full, &[Agent::Claude]);
+    assert!(!built.incomplete, "{:?}", built.diagnostics);
+    assert_eq!(stored(&ctx), "full");
+    assert_eq!(
+        IndexSession::open(&ctx).unwrap().coverage().unwrap(),
+        Coverage::Full
+    );
+    assert_eq!(unlocked(&ctx), (Coverage::Full, true));
+}
+
+#[test]
+fn shared_database_bytes_are_split_across_its_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    fs::create_dir_all(ctx.roots.opencode_db.parent().unwrap()).unwrap();
+    let writer = Connection::open(&ctx.roots.opencode_db).unwrap();
+    writer.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE session(id TEXT,directory TEXT,title TEXT,time_created INTEGER,time_updated INTEGER); CREATE TABLE message(id TEXT,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT,message_id TEXT,time_created INTEGER,data TEXT); INSERT INTO session VALUES('one','/fixture','A',1,2),('two','/fixture','B',1,2),('three','/fixture','C',1,2);").unwrap();
+    let expected: u64 = slimetrail::sources::sqlite::dependencies(&ctx.roots.opencode_db)
+        .iter()
+        .map(|path| fs::metadata(path).map_or(0, |m| m.len()).div_ceil(3) * 3)
+        .sum();
+    let estimate = api::estimate(&ctx, &selected(Agent::Opencode)).unwrap();
+    assert_eq!(estimate.agents.len(), 1);
+    assert_eq!(estimate.agents[0].sessions, 3);
+    assert_eq!(estimate.agents[0].bytes, expected);
+    assert!(expected > 0);
+}
+
+#[test]
+fn integrity_check_rejects_fts_text_that_no_longer_matches_its_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    claude(&ctx, "one", "genuine searchable words");
+    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
+    IndexSession::open(&ctx)
+        .unwrap()
+        .verify_integrity()
+        .unwrap();
+    let db = Connection::open(ctx.index_dir.join(DATABASE)).unwrap();
+    let id: i64 = db
+        .query_row(
+            "SELECT document_id FROM search_documents WHERE entry_index IS NOT NULL LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    db.execute("DELETE FROM search_fts WHERE rowid=?1", [id])
+        .unwrap();
+    db.execute(
+        "INSERT INTO search_fts(rowid,ascii_lower) VALUES(?1,'unrelated words')",
+        [id],
+    )
+    .unwrap();
+    drop(db);
+    assert!(
+        IndexSession::open(&ctx)
+            .unwrap()
+            .verify_integrity()
+            .is_err()
+    );
+}
+
+#[test]
+fn an_interrupted_first_build_keeps_its_stored_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let compact = context(dir.path());
+    let full = Context {
+        coverage: Coverage::Full,
+        ..compact.clone()
+    };
+    claude(&compact, "one", "first text");
+    let agents = selected(Agent::Claude);
+    index::refresh(&compact, &agents, false).unwrap();
+    let db = Connection::open(compact.index_dir.join(DATABASE)).unwrap();
+    db.execute("UPDATE refresh_runs SET published=0", [])
+        .unwrap();
+    drop(db);
+    claude(&compact, "two", "second text");
+    index::refresh(&full, &agents, false).unwrap();
+    let session = IndexSession::open(&full).unwrap();
+    assert_eq!(session.coverage().unwrap(), Coverage::Compact);
+    session.verify_integrity().unwrap();
 }

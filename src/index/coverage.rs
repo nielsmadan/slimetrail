@@ -23,6 +23,18 @@ pub fn searchable_start(
     }
 }
 
+pub const fn mismatch(index: Coverage, config: Coverage) -> Option<&'static str> {
+    match (index, config) {
+        (Coverage::Compact, Coverage::Full) => Some(
+            "The config asks for full coverage but the index is compact; run `slimetrail index` to rebuild it.",
+        ),
+        (Coverage::Full, Coverage::Compact) => Some(
+            "The config asks for compact coverage but the index is full; run `slimetrail index` to rebuild it.",
+        ),
+        _ => None,
+    }
+}
+
 pub(crate) const fn coverage_name(coverage: Coverage) -> &'static str {
     match coverage {
         Coverage::Compact => "compact",

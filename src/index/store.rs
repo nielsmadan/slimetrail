@@ -6,7 +6,7 @@ use crate::{
     Agent, CachedSource, Coverage, Diagnostic, DiscoveryCache, Entry, Error, Kind, RawSession,
     Result, Searchable, Session, SessionKey, SourceState, TitleOrigin,
 };
-use rusqlite::{Connection, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub struct Document {
@@ -146,6 +146,43 @@ pub(super) fn published(
         diagnostics.extend(decode::<Vec<Diagnostic>>(&row.get::<_, String>(0)?)?);
     }
     Ok(Some(diagnostics))
+}
+
+pub(super) fn has_published(
+    connection: &Connection,
+    namespace: &str,
+    agent: Agent,
+) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM refresh_runs WHERE namespace=?1 AND agent=?2 AND published>=1)",
+        (namespace, agent.to_string()),
+        |r| r.get(0),
+    )?)
+}
+
+pub(super) fn throughput(
+    connection: &Connection,
+    agent: Agent,
+    coverage: Coverage,
+) -> Result<Option<(u64, u64)>> {
+    Ok(connection
+        .query_row(
+            "SELECT bytes,micros FROM throughput WHERE agent=?1 AND coverage=?2",
+            [agent.to_string(), coverage_name(coverage).to_owned()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?)
+}
+
+pub(super) fn observe(
+    connection: &Connection,
+    agent: Agent,
+    coverage: Coverage,
+    bytes: u64,
+    micros: u64,
+) -> Result<()> {
+    connection.execute("INSERT INTO throughput(agent,coverage,bytes,micros) VALUES(?1,?2,?3,?4) ON CONFLICT(agent,coverage) DO UPDATE SET bytes=bytes+excluded.bytes,micros=micros+excluded.micros", params![agent.to_string(), coverage_name(coverage), bytes, micros])?;
+    Ok(())
 }
 
 pub(super) fn carry_forward(
@@ -464,7 +501,7 @@ impl IndexSession {
     fn ready(&self, agent: Agent) -> Result<()> {
         if !self.readable(agent) {
             return Err(Error::InvalidArgument(
-                "selected agent must be refreshed under this index lease before querying".into(),
+                "selected agent must be refreshed by this index session before querying".into(),
             ));
         }
         Ok(())
@@ -473,7 +510,7 @@ impl IndexSession {
     pub fn visit_sessions(&self, emit: &mut dyn FnMut(Session) -> Result<()>) -> Result<()> {
         if self.refreshed.is_empty() && self.stale.is_empty() {
             return Err(Error::InvalidArgument(
-                "index must be refreshed under this lease before querying".into(),
+                "index must be refreshed by this index session before querying".into(),
             ));
         }
         let sql = format!("SELECT x.metadata FROM sessions x {VISIBLE} ORDER BY x.agent,x.id");
@@ -565,7 +602,7 @@ impl IndexSession {
     ) -> Result<()> {
         if self.refreshed.is_empty() && self.stale.is_empty() {
             return Err(Error::InvalidArgument(
-                "index must be refreshed under this lease before querying".into(),
+                "index must be refreshed by this index session before querying".into(),
             ));
         }
         let mut keys = Vec::new();
@@ -746,6 +783,8 @@ mod tests {
             now_ms: 0,
             time_zone: "UTC".into(),
             coverage: crate::Coverage::Compact,
+            build: crate::BuildPolicy::Inline,
+            progress: false,
         };
         fs::create_dir_all(&ctx.roots.claude_projects).unwrap();
         for id in ids {

@@ -21,6 +21,8 @@ fn context(base: &Path) -> Context {
         cwd: base.into(),
         time_zone: "UTC".into(),
         coverage: slimetrail::Coverage::Compact,
+        build: slimetrail::BuildPolicy::Inline,
+        progress: false,
     }
 }
 
@@ -278,6 +280,8 @@ fn dead_owner_staging_is_swept_and_live_staging_survives() {
     ready(&mut dead);
     let dead_pid = dead.0.id();
     assert_eq!(owned_dirs(&ctx, dead_pid).len(), 1);
+    // Child::wait closes stdin, which lets the worker exit cleanly before SIGKILL lands.
+    let _stdin = dead.0.stdin.take();
     dead.0.kill().unwrap();
     dead.0.wait().unwrap();
     assert_eq!(owned_dirs(&ctx, dead_pid).len(), 1);

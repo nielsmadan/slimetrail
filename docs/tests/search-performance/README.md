@@ -29,7 +29,7 @@ Real sources require explicit opt-in:
 timeout 900 python3 scripts/benchmark.py --real
 ```
 
-This captures the existing environment's root overrides and selects all six agents by default. For a declared subset, use e.g. `--real --agents pi opencode`; a subset does not establish all-agent coverage. The default per-command deadline is 180 seconds, and total driver budget is 840 seconds. Larger runs may override `--timeout` and `--total-timeout`; place an outer `timeout` above the total budget to leave time for cleanup. The driver terminates a timed-out child before deleting its workspace. A real run never performs the changed-source mutation.
+This captures the existing environment's root overrides and selects all seven agents by default. For a declared subset, use e.g. `--real --agents pi opencode`; a subset does not establish all-agent coverage. The default per-command deadline is 180 seconds, and total driver budget is 840 seconds. Larger runs may override `--timeout` and `--total-timeout`; place an outer `timeout` above the total budget to leave time for cleanup. The driver terminates a timed-out child before deleting its workspace. A real run never performs the changed-source mutation.
 
 ## Privacy, capacity and outputs
 
@@ -46,6 +46,8 @@ Durations use `time.monotonic` around a complete CLI invocation. Warm query medi
 Record hardware/toolchain, binary hash, actual arguments, workload dimensions, status and diagnostics, and cleanup evidence. An exit-1 measurement is useful timing for incomplete coverage, not a successful full-corpus run. A deadline is a timed-out attempt, not a slow completed measurement. Code snapshots can be identified by the binary hash when the repository has no commit yet.
 
 ## Recorded runs
+
+The 2026-11-24 runs are the current baselines; the 2026-11-16 v2 runs are historical.
 
 - [2026-11-24 real per-agent cold builds](runs/2026-11-24-per-agent-real.md): index v3, each store indexed separately under compact and full coverage; source of the first-build estimate defaults.
 - [2026-11-24 synthetic per-agent measurements](runs/2026-11-24-per-agent-synthetic.md): the extended generator (reasoning, tool calls/results, Devin) under both coverages.

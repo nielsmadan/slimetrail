@@ -1,7 +1,7 @@
 use crate::{
     Agent, AppendState, Context, Diagnostic, Discovery, DiscoveryCache, Entry, Error, Fingerprint,
     Kind, ParsedSession, RawSession, Result, Searchable, Session, SessionKey, SourceState,
-    TitleOrigin,
+    TitleOrigin, hex::hex,
 };
 use ruzstd::decoding::{
     BlockDecodingStrategy, FrameDecoder,
@@ -103,6 +103,17 @@ pub fn fingerprint(paths: &[PathBuf]) -> Result<Fingerprint> {
     Ok(Fingerprint {
         signature: serde_json::to_string(&values)?,
     })
+}
+
+const TITLE_MARK: &str = "\ntitle:";
+
+pub fn drifted(raw: &RawSession) -> bool {
+    match raw.fingerprint.signature.split_once(TITLE_MARK) {
+        Some((base, _)) => {
+            fingerprint(&raw.dependencies[..1]).map_or(true, |c| c.signature != base)
+        }
+        None => fingerprint(&raw.dependencies).map_or(true, |c| c != raw.fingerprint),
+    }
 }
 
 pub fn diagnostic(agent: Agent, path: &Path, code: &str, message: &str) -> Diagnostic {
@@ -271,14 +282,6 @@ pub fn records(path: &Path, visit: &mut dyn FnMut(u64, &Value) -> Result<bool>) 
     Ok(Tally {
         malformed: state.malformed(),
         recheck: state.recheck,
-    })
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::new(), |mut hex, byte| {
-        std::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"))
-            .expect("writing to a String cannot fail");
-        hex
     })
 }
 
@@ -599,15 +602,34 @@ impl FileReader {
         let mut files: Vec<_> = files.into_iter().map(readable).collect();
         files.sort();
         files.dedup();
+        let titles = self.names.as_deref().map(|names| {
+            let read = || {
+                self.titles(names)
+                    .ok()
+                    .filter(|titles| !unavailable(titles))
+            };
+            read().or_else(read)
+        });
+        let title_diagnostics = match (&self.names, &titles) {
+            (_, Some(Some(titles))) => titles.diagnostics.clone(),
+            (Some(names), Some(None)) => vec![diagnostic(
+                self.agent,
+                names,
+                "source_unavailable",
+                "Session names could not be read; unchanged sessions keep their titles and reparsed sessions may lack titles until the index is readable",
+            )],
+            _ => Vec::new(),
+        };
         let mut chosen: BTreeMap<String, (bool, i128, RawSession)> = BTreeMap::new();
         for path in files {
             let source = path.to_string_lossy().into_owned();
             let mut dependencies = vec![path.clone()];
-            dependencies.extend(self.names.iter().cloned());
             if self.agent == Agent::Droid {
                 dependencies.push(path.with_extension("settings.json"));
             }
-            let Ok(fingerprint) = fingerprint(&dependencies) else {
+            let base = fingerprint(&dependencies);
+            dependencies.extend(self.names.iter().cloned());
+            let Ok(base) = base else {
                 diagnostics.push(diagnostic(
                     self.agent,
                     &path,
@@ -616,10 +638,25 @@ impl FileReader {
                 ));
                 continue;
             };
+            let previous_title = previous.by_source.get(&source);
+            let signed = |id: &str| {
+                let mark = titles.as_ref().map(|titles| {
+                    titles.as_ref().map_or_else(
+                        || {
+                            previous_title
+                                .filter(|c| c.key.agent == self.agent && c.key.id == id)
+                                .and_then(|c| c.fingerprint.signature.split_once(TITLE_MARK))
+                                .map_or_else(|| hashed("unavailable"), |(_, mark)| mark.to_owned())
+                        },
+                        |titles| title_mark(titles, id),
+                    )
+                });
+                with_title(&base, mark.as_deref())
+            };
             let cached = previous
                 .by_source
                 .get(&source)
-                .filter(|c| c.fingerprint == fingerprint && c.key.agent == self.agent);
+                .filter(|c| c.key.agent == self.agent && c.fingerprint == signed(&c.key.id));
             if self.shared.as_ref().is_some_and(|a| path.starts_with(a)) && cached.is_none() {
                 let zst = compressed(&path);
                 let owner = self.agent == if zst { Agent::Codex } else { Agent::Claude };
@@ -662,10 +699,10 @@ impl FileReader {
                 Ok((
                     modified,
                     RawSession {
+                        fingerprint: signed(&key.id),
                         key,
                         source: source.clone(),
                         dependencies,
-                        fingerprint,
                         snapshot: None,
                         resume: None,
                     },
@@ -704,6 +741,7 @@ impl FileReader {
         Ok(Discovery {
             sessions: chosen.into_values().map(|(_, _, raw)| raw).collect(),
             diagnostics,
+            warnings: title_diagnostics,
             complete_agents,
         })
     }
@@ -761,32 +799,52 @@ impl FileReader {
         id: &str,
         diagnostics: &mut Vec<Diagnostic>,
         recheck: &mut bool,
-    ) -> Result<Option<String>> {
-        let Some(names) = &self.names else {
-            return Ok(None);
+    ) -> Option<String> {
+        let names = self.names.as_ref()?;
+        let Ok(titles) = self.titles(names) else {
+            diagnostics.push(diagnostic(
+                self.agent,
+                names,
+                "source_unavailable",
+                "Session names could not be read",
+            ));
+            return None;
         };
-        let signature = fingerprint(std::slice::from_ref(names))?;
+        if unavailable(&titles) {
+            diagnostics.extend(titles.diagnostics.iter().cloned());
+        }
+        *recheck |= titles.recheck;
+        titles.names.get(id).cloned().flatten()
+    }
+
+    fn titles(&self, names: &Path) -> Result<Arc<Titles>> {
+        #[cfg(test)]
+        if tests::FAILING_TITLE_READS.with(|left| left.replace(left.get().saturating_sub(1))) > 0 {
+            return Err(Error::InvalidArgument(
+                "synthetic title read failure".into(),
+            ));
+        }
+        let names = [names.to_path_buf()];
+        let signature = fingerprint(&names)?;
         let cached = self
             .titles
             .borrow()
             .as_ref()
             .filter(|(old, _)| *old == signature)
             .map(|(_, titles)| Arc::clone(titles));
-        let titles = if let Some(titles) = cached {
-            titles
-        } else {
-            let titles = Arc::new(read_titles(names));
-            if fingerprint(std::slice::from_ref(names))? != signature {
-                return Err(Error::InvalidArgument(
-                    "Session names changed during parsing".into(),
-                ));
-            }
+        if let Some(titles) = cached {
+            return Ok(titles);
+        }
+        let titles = Arc::new(read_titles(&names[0]));
+        if fingerprint(&names)? != signature {
+            return Err(Error::InvalidArgument(
+                "Session names changed during parsing".into(),
+            ));
+        }
+        if !unavailable(&titles) {
             *self.titles.borrow_mut() = Some((signature, Arc::clone(&titles)));
-            titles
-        };
-        diagnostics.extend(titles.diagnostics.iter().cloned());
-        *recheck |= titles.recheck;
-        Ok(titles.names.get(id).cloned().flatten())
+        }
+        Ok(titles)
     }
 
     #[expect(
@@ -856,7 +914,7 @@ impl FileReader {
             self.settings(path, &mut automated, &mut diagnostics)?;
         }
         let mut recheck = false;
-        let title = self.title(&session.key.id, &mut diagnostics, &mut recheck)?;
+        let title = self.title(&session.key.id, &mut diagnostics, &mut recheck);
         let mut index = resume.map_or(0, |resume| resume.entries);
         let mut checkpoint = None;
         let mut visit = |line: u64, record: &Value, terminated: bool| {
@@ -887,7 +945,7 @@ impl FileReader {
             let mut scanned = Scan::new(recent(&metadata), None);
             if let Some(resume) = resume {
                 if !hash_prefix(&mut reader, path, &mut hasher, resume.consumed)?
-                    || hex(&hasher.clone().finalize()) != resume.prefix_sha256
+                    || hex(hasher.clone().finalize()) != resume.prefix_sha256
                 {
                     return Err(Error::ResumeRejected);
                 }
@@ -900,7 +958,7 @@ impl FileReader {
             let (boundary, entries) = checkpoint.unwrap_or_else(|| (session.clone(), index));
             let state = AppendState {
                 consumed: scanned.consumed,
-                prefix_sha256: hex(&scanned.hasher.take().unwrap_or_default().finalize()),
+                prefix_sha256: hex(scanned.hasher.take().unwrap_or_default().finalize()),
                 lines: scanned.lines,
                 entries,
                 malformed: scanned.malformed,
@@ -936,6 +994,37 @@ impl FileReader {
             recheck,
         })
     }
+}
+
+fn unavailable(titles: &Titles) -> bool {
+    titles
+        .diagnostics
+        .iter()
+        .any(|d| d.code == "source_unavailable")
+}
+
+fn hashed(title: &str) -> String {
+    hex(Sha256::digest(title.as_bytes()))
+}
+
+fn title_mark(titles: &Titles, id: &str) -> String {
+    hashed(
+        &titles
+            .names
+            .get(id)
+            .cloned()
+            .flatten()
+            .map_or_else(|| "none".into(), |title| format!("some:{title}")),
+    )
+}
+
+fn with_title(base: &Fingerprint, mark: Option<&str>) -> Fingerprint {
+    mark.map_or_else(
+        || base.clone(),
+        |mark| Fingerprint {
+            signature: format!("{}{TITLE_MARK}{mark}", base.signature),
+        },
+    )
 }
 
 fn update_metadata(session: &mut Session, record: &Value) {
@@ -1289,6 +1378,245 @@ fn normalize(agent: Agent, record: &Value) -> Vec<Entry> {
 mod tests {
     use super::*;
 
+    thread_local! {
+        pub(super) static FAILING_TITLE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn context(dir: &Path) -> Context {
+        Context {
+            roots: crate::resolve_roots(dir, &BTreeMap::new()).unwrap(),
+            index_dir: dir.join("index"),
+            cwd: dir.into(),
+            now_ms: 0,
+            time_zone: "UTC".into(),
+            coverage: crate::Coverage::Compact,
+            build: crate::BuildPolicy::Inline,
+            progress: false,
+        }
+    }
+
+    #[test]
+    fn title_read_failures_keep_each_sessions_cached_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        fs::create_dir_all(&ctx.roots.codex_sessions).unwrap();
+        for id in ["one", "two"] {
+            fs::write(
+                ctx.roots.codex_sessions.join(format!("{id}.jsonl")),
+                format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\"}}}}\n"),
+            )
+            .unwrap();
+        }
+        let names = &ctx.roots.codex_session_index;
+        fs::write(names, "{\"id\":\"one\",\"thread_name\":\"Named\"}\n").unwrap();
+        let agents = BTreeSet::from([Agent::Codex]);
+        let refresh = || crate::index::refresh(&ctx, &agents, false).unwrap();
+        let counts = |result: &crate::Envelope<crate::IndexStats>| {
+            let stats = result.data.as_ref().unwrap();
+            (stats.reused, stats.reparsed)
+        };
+        let codes = |result: &crate::Envelope<crate::IndexStats>| -> Vec<String> {
+            result.diagnostics.iter().map(|d| d.code.clone()).collect()
+        };
+        assert_eq!(counts(&refresh()), (0, 2));
+        let empty = DiscoveryCache {
+            by_source: BTreeMap::new(),
+            verify: false,
+        };
+        let reader = FileReader::new(Agent::Codex, &ctx);
+        let readable = DiscoveryCache {
+            by_source: reader
+                .discover(&ctx, &empty)
+                .unwrap()
+                .sessions
+                .into_iter()
+                .map(|raw| {
+                    let cached = crate::CachedSource {
+                        key: raw.key,
+                        source: raw.source.clone(),
+                        dependencies: raw.dependencies,
+                        fingerprint: raw.fingerprint,
+                        state: None,
+                    };
+                    (raw.source, cached)
+                })
+                .collect(),
+            verify: false,
+        };
+        FAILING_TITLE_READS.set(1);
+        let retried = refresh();
+        assert_eq!(FAILING_TITLE_READS.get(), 0);
+        assert!(!retried.incomplete, "{:?}", retried.diagnostics);
+        assert_eq!(counts(&retried), (2, 0));
+        fs::remove_file(names).unwrap();
+        fs::create_dir(names).unwrap();
+        let mut index = crate::index::IndexSession::open(&ctx).unwrap();
+        let failing = index.refresh_under_lease(&agents).unwrap();
+        assert!(failing.incomplete);
+        assert_eq!(codes(&failing), ["source_unavailable"]);
+        assert_eq!(failing.diagnostics[0].source.as_deref(), names.to_str());
+        assert_eq!(counts(&failing), (2, 0));
+        let one = SessionKey {
+            agent: Agent::Codex,
+            id: "one".into(),
+        };
+        assert_eq!(
+            index.session(&one).unwrap().unwrap().title.as_deref(),
+            Some("Named")
+        );
+        let three = ctx.roots.codex_sessions.join("three.jsonl");
+        fs::write(
+            &three,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"three\"}}\n",
+        )
+        .unwrap();
+        let outage = FileReader::new(Agent::Codex, &ctx)
+            .discover(&ctx, &readable)
+            .unwrap();
+        fs::remove_file(&three).unwrap();
+        assert_eq!(outage.sessions.len(), 3);
+        for raw in &outage.sessions {
+            let mark = raw.fingerprint.signature.split_once(TITLE_MARK).unwrap().1;
+            match readable.by_source.get(&raw.source) {
+                Some(cached) => assert_eq!(cached.fingerprint, raw.fingerprint),
+                None => assert_eq!(
+                    (raw.key.id.as_str(), mark),
+                    ("three", hashed("unavailable").as_str())
+                ),
+            }
+        }
+        drop(index);
+        fs::remove_dir(names).unwrap();
+        fs::write(names, "{\"id\":\"one\",\"thread_name\":\"Named\"}\n").unwrap();
+        let recovered = refresh();
+        assert!(!recovered.incomplete, "{:?}", recovered.diagnostics);
+        assert_eq!(counts(&recovered), (2, 0));
+    }
+
+    fn write_codex(ctx: &Context, id: &str, lines: &[&str]) -> PathBuf {
+        let path = ctx.roots.codex_sessions.join(format!("{id}.jsonl"));
+        let meta = format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\"}}}}");
+        let text: String = std::iter::once(meta.as_str())
+            .chain(lines.iter().copied())
+            .flat_map(|line| [line, "\n"])
+            .collect();
+        fs::create_dir_all(&ctx.roots.codex_sessions).unwrap();
+        fs::write(&path, text).unwrap();
+        path
+    }
+
+    fn codes(result: &crate::Envelope<crate::IndexStats>) -> Vec<&str> {
+        result.diagnostics.iter().map(|d| d.code.as_str()).collect()
+    }
+
+    fn key(id: &str) -> SessionKey {
+        SessionKey {
+            agent: Agent::Codex,
+            id: id.into(),
+        }
+    }
+
+    #[test]
+    fn malformed_title_lines_do_not_keep_deleted_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        write_codex(&ctx, "one", &[]);
+        let two = write_codex(&ctx, "two", &[]);
+        let names = &ctx.roots.codex_session_index;
+        fs::write(
+            names,
+            "{\"id\":\"one\",\"thread_name\":\"Named\"}\nmalformed\n",
+        )
+        .unwrap();
+        File::options()
+            .write(true)
+            .open(names)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(10))
+            .unwrap();
+        let agents = BTreeSet::from([Agent::Codex]);
+        let first = crate::index::refresh(&ctx, &agents, false).unwrap();
+        assert_eq!(codes(&first), ["malformed_metadata"]);
+        fs::remove_file(two).unwrap();
+        let mut index = crate::index::IndexSession::open(&ctx).unwrap();
+        let removed = index.refresh_under_lease(&agents).unwrap();
+        assert!(removed.incomplete);
+        assert_eq!(codes(&removed), ["malformed_metadata"]);
+        assert_eq!(removed.data.as_ref().unwrap().removed, 1);
+        assert_eq!(index.session(&key("two")).unwrap(), None);
+        assert_eq!(
+            index
+                .session(&key("one"))
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Named")
+        );
+    }
+
+    #[test]
+    fn rollouts_appended_during_a_title_outage_are_indexed_as_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let reply = |text: &str| {
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":text}}).to_string()
+        };
+        let first = reply("first message");
+        write_codex(&ctx, "one", &[&first]);
+        fs::write(
+            &ctx.roots.codex_session_index,
+            "{\"id\":\"one\",\"thread_name\":\"Named\"}\n",
+        )
+        .unwrap();
+        let agents = BTreeSet::from([Agent::Codex]);
+        crate::index::refresh(&ctx, &agents, false).unwrap();
+        FAILING_TITLE_READS.set(usize::MAX);
+        let appended = reply("outage needle");
+        write_codex(&ctx, "one", &[&first, &appended]);
+        let status = || -> String {
+            rusqlite::Connection::open(ctx.index_dir.join(crate::index::DATABASE))
+                .unwrap()
+                .query_row("SELECT status FROM sources WHERE id='one'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        let mut index = crate::index::IndexSession::open(&ctx).unwrap();
+        let outage = index.refresh_under_lease(&agents).unwrap();
+        assert!(outage.incomplete);
+        assert_eq!(codes(&outage), ["source_unavailable", "source_unavailable"]);
+        let counts = outage.data.as_ref().unwrap();
+        assert_eq!((counts.reparsed, counts.failed), (1, 1));
+        let session = index.session(&key("one")).unwrap().unwrap();
+        assert_ne!(session.title_origin, Some(TitleOrigin::Native));
+        let mut found = 0;
+        index
+            .visit_search_documents(Some(("outage needle", false)), &mut |doc| {
+                found += usize::from(doc.text.contains("outage needle"));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(found, 1);
+        drop(index);
+        assert_eq!(status(), "partial");
+        FAILING_TITLE_READS.set(0);
+        let mut index = crate::index::IndexSession::open(&ctx).unwrap();
+        let recovered = index.refresh_under_lease(&agents).unwrap();
+        assert!(!recovered.incomplete, "{:?}", recovered.diagnostics);
+        assert_eq!(
+            index
+                .session(&key("one"))
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Named")
+        );
+        drop(index);
+        assert_eq!(status(), "fresh");
+    }
+
     #[test]
     fn title_cache_reuses_final_map_and_tracks_revisions_and_diagnostics() {
         let dir = tempfile::tempdir().unwrap();
@@ -1299,6 +1627,8 @@ mod tests {
             now_ms: 0,
             time_zone: "UTC".into(),
             coverage: crate::Coverage::Compact,
+            build: crate::BuildPolicy::Inline,
+            progress: false,
         };
         fs::create_dir_all(&ctx.roots.codex_sessions).unwrap();
         for id in ["one", "two"] {
@@ -1333,8 +1663,10 @@ mod tests {
         ));
         assert_eq!(first.session.title.as_deref(), Some("last"));
         assert_eq!(second.session.title, None);
-        assert_eq!(first.diagnostics, second.diagnostics);
-        assert_eq!(first.diagnostics[0].code, "malformed_metadata");
+        assert!(first.complete && second.complete);
+        assert_eq!(discovery.diagnostics, []);
+        assert_eq!(discovery.warnings.len(), 1);
+        assert_eq!(discovery.warnings[0].code, "malformed_metadata");
         fs::write(names, "{\"id\":\"one\",\"thread_name\":\"revised\"}\n").unwrap();
         let revised = reader
             .parse(&discovery.sessions[0], &mut |_| Ok(()))

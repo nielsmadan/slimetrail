@@ -1,13 +1,17 @@
 pub mod coverage;
+pub mod estimate;
 mod lock;
 mod refresh;
 mod schema;
 mod store;
 
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub use refresh::discoveries;
 pub use schema::{DATABASE, VERSION};
 pub use store::Document;
 
-use crate::{Agent, Context, Coverage, Diagnostic, Envelope, IndexStats, Result};
+use crate::{Agent, Context, Coverage, Diagnostic, Envelope, IndexStats, JobEstimate, Result};
 use rusqlite::Connection;
 use std::{
     collections::BTreeSet,
@@ -22,6 +26,7 @@ struct Writer {
     connection: Connection,
     coverage: Coverage,
     pending: Option<Coverage>,
+    locked: bool,
     _lock: File,
 }
 
@@ -94,8 +99,7 @@ impl IndexSession {
     }
 
     pub fn coverage(&self) -> Result<Coverage> {
-        Ok(schema::coverage(&self.connection)?
-            .map_or(self.context.coverage, |(coverage, _)| coverage))
+        Ok(schema::effective_coverage(&self.connection, self.context.coverage)?.coverage)
     }
 
     pub fn refresh_under_lease(
@@ -107,6 +111,21 @@ impl IndexSession {
 
     pub fn refresh_for_query(&mut self, agents: &BTreeSet<Agent>) -> Result<Envelope<IndexStats>> {
         self.prepare(agents, QUERY_WAIT)
+    }
+
+    pub fn estimate(&self, agents: &BTreeSet<Agent>) -> Result<JobEstimate> {
+        let readers = crate::sources::registry_in(&self.context, &self.staging.path);
+        let planned = refresh::plan(self, &self.connection, agents, readers, false)?;
+        let effective = schema::effective_coverage(&self.connection, self.context.coverage)?;
+        Ok(JobEstimate {
+            agents: planned
+                .into_iter()
+                .map(|p| p.estimate)
+                .filter(|e| e.sessions > 0)
+                .collect(),
+            coverage: effective.coverage,
+            coverage_locked: effective.locked,
+        })
     }
 
     fn prepare(
@@ -123,7 +142,11 @@ impl IndexSession {
             self.pin()?;
             self.seen_seq = schema::refresh_seq(&self.connection)?;
             self.stale.extend(agents.iter().copied());
-            let busy = refresh_in_progress(rebuilding);
+            let busy = if rebuilding {
+                rebuild_pending()
+            } else {
+                refresh_in_progress()
+            };
             return Ok(skipped(vec![busy], started));
         };
         let published = store::published(&writer.connection, &self.namespace, agents, s0)?;
@@ -132,7 +155,8 @@ impl IndexSession {
             skipped(diagnostics, started)
         } else {
             let readers = crate::sources::registry_in(&self.context, &self.staging.path);
-            refresh::write(self, &mut writer, agents, readers, false)?
+            let policy = self.context.build;
+            refresh::write(self, &mut writer, agents, readers, false, policy)?
         };
         self.publish(writer, true)?;
         self.seen_seq = schema::refresh_seq(&self.connection)?;
@@ -152,12 +176,15 @@ impl IndexSession {
             &self.roots,
             self.context.coverage,
         )?;
-        let (coverage, pending) =
-            schema::coverage(&connection)?.unwrap_or((self.context.coverage, None));
+        let effective = schema::effective_coverage(&connection, self.context.coverage)?;
+        if effective.stored != Some(effective.coverage) {
+            schema::set_coverage(&connection, effective.coverage)?;
+        }
         Ok(Some(Writer {
             connection,
-            coverage,
-            pending,
+            coverage: effective.coverage,
+            pending: effective.pending,
+            locked: effective.locked,
             _lock: lock,
         }))
     }
@@ -188,17 +215,21 @@ impl IndexSession {
     }
 }
 
-fn refresh_in_progress(rebuilding: bool) -> Diagnostic {
-    let message = if rebuilding {
-        "A search coverage rebuild is unfinished; search results may be missing matches until `slimetrail index` completes it"
-    } else {
-        "Another slimetrail process is refreshing the index; results come from the last published index"
-    };
+fn refresh_in_progress() -> Diagnostic {
     Diagnostic {
         agent: None,
         source: None,
         code: "refresh_in_progress".into(),
-        message: message.into(),
+        message: "Another slimetrail process is refreshing the index; results come from the last published index".into(),
+    }
+}
+
+fn rebuild_pending() -> Diagnostic {
+    Diagnostic {
+        agent: None,
+        source: None,
+        code: "coverage_rebuild_pending".into(),
+        message: "A search coverage rebuild is unfinished; search results may be missing matches until `slimetrail index` completes it".into(),
     }
 }
 
@@ -238,23 +269,34 @@ pub(crate) fn refresh_noting(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DiscoveryCache, sources};
-    use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt};
+    use crate::{BuildPolicy, DiscoveryCache, sources};
+    use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, path::Path};
+
+    fn context(base: &Path) -> Context {
+        Context {
+            roots: crate::resolve_roots(base, &BTreeMap::new()).unwrap(),
+            index_dir: base.join("index"),
+            cwd: base.into(),
+            now_ms: 0,
+            time_zone: "UTC".into(),
+            coverage: Coverage::Compact,
+            build: BuildPolicy::Inline,
+            progress: false,
+        }
+    }
+
+    fn opencode_fixture(base: &Path) -> (Context, Connection) {
+        let ctx = context(base);
+        fs::create_dir_all(ctx.roots.opencode_db.parent().unwrap()).unwrap();
+        let db = Connection::open(&ctx.roots.opencode_db).unwrap();
+        db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE session(id TEXT,directory TEXT,title TEXT,time_created INTEGER,time_updated INTEGER); CREATE TABLE message(id TEXT,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT,message_id TEXT,time_created INTEGER,data TEXT); INSERT INTO session VALUES('one','/fixture','Title',1,2);").unwrap();
+        (ctx, db)
+    }
 
     #[test]
     fn indexed_database_discovery_uses_owned_staging_and_private_files() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = Context {
-            roots: crate::resolve_roots(dir.path(), &BTreeMap::new()).unwrap(),
-            index_dir: dir.path().join("index"),
-            cwd: dir.path().into(),
-            now_ms: 0,
-            time_zone: "UTC".into(),
-            coverage: Coverage::Compact,
-        };
-        fs::create_dir_all(ctx.roots.opencode_db.parent().unwrap()).unwrap();
-        let db = Connection::open(&ctx.roots.opencode_db).unwrap();
-        db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE session(id TEXT,directory TEXT,title TEXT,time_created INTEGER,time_updated INTEGER); CREATE TABLE message(id TEXT,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT,message_id TEXT,time_created INTEGER,data TEXT); INSERT INTO session VALUES('one','/fixture','Title',1,2);").unwrap();
+        let (ctx, _db) = opencode_fixture(dir.path());
         let index = IndexSession::open(&ctx).unwrap();
         let reader = sources::registry_in(&index.context, &index.staging.path)
             .into_iter()
@@ -299,26 +341,16 @@ mod tests {
     #[test]
     fn repeated_query_refreshes_see_changes_and_pin_a_snapshot() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = Context {
-            roots: crate::resolve_roots(dir.path(), &BTreeMap::new()).unwrap(),
-            index_dir: dir.path().join("index"),
-            cwd: dir.path().into(),
-            now_ms: 0,
-            time_zone: "UTC".into(),
-            coverage: Coverage::Compact,
-        };
-        fs::create_dir_all(ctx.roots.opencode_db.parent().unwrap()).unwrap();
-        let db = Connection::open(&ctx.roots.opencode_db).unwrap();
-        db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE session(id TEXT,directory TEXT,title TEXT,time_created INTEGER,time_updated INTEGER); CREATE TABLE message(id TEXT,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT,message_id TEXT,time_created INTEGER,data TEXT); INSERT INTO session VALUES('one','/fixture','Title',1,2);").unwrap();
+        let (ctx, db) = opencode_fixture(dir.path());
         let agents = BTreeSet::from([Agent::Opencode]);
         let mut index = IndexSession::open(&ctx).unwrap();
         let first = index.refresh_for_query(&agents).unwrap();
-        assert!(first.data.unwrap().discovered > 0);
+        assert_eq!(first.data.unwrap().discovered, 1);
         assert!(!index.connection.is_autocommit());
         db.execute_batch("INSERT INTO session VALUES('two','/fixture','Other',3,4);")
             .unwrap();
         let second = index.refresh_for_query(&agents).unwrap();
-        assert!(second.data.unwrap().discovered > 0);
+        assert_eq!(second.data.unwrap().discovered, 2);
         assert!(!index.connection.is_autocommit());
     }
 }

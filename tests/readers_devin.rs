@@ -26,6 +26,8 @@ fn context(base: &Path) -> Context {
         cwd: "/fixture/project".into(),
         time_zone: "UTC".into(),
         coverage: slimetrail::Coverage::Compact,
+        build: slimetrail::BuildPolicy::Inline,
+        progress: false,
     }
 }
 

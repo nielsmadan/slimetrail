@@ -44,6 +44,17 @@ pub enum Searchable {
     ToolResult,
     Duplicate,
 }
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildPolicy {
+    #[default]
+    Inline,
+    Limit {
+        max_ms: u64,
+        #[serde(default)]
+        whole: bool,
+    },
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Roots {
     pub claude_projects: PathBuf,
@@ -68,6 +79,10 @@ pub struct Context {
     pub time_zone: String,
     #[serde(default)]
     pub coverage: Coverage,
+    #[serde(default)]
+    pub build: BuildPolicy,
+    #[serde(default)]
+    pub progress: bool,
 }
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -170,6 +185,7 @@ pub struct CachedSource {
 pub struct Discovery {
     pub sessions: Vec<RawSession>,
     pub diagnostics: Vec<Diagnostic>,
+    pub warnings: Vec<Diagnostic>,
     pub complete_agents: BTreeSet<Agent>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +209,25 @@ pub struct IndexStats {
     pub removed: u64,
     pub failed: u64,
     pub elapsed_ms: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Projection {
+    pub index_bytes: u64,
+    pub millis: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEstimate {
+    pub agent: Agent,
+    pub sessions: u64,
+    pub bytes: u64,
+    pub compact: Projection,
+    pub full: Projection,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobEstimate {
+    pub agents: Vec<AgentEstimate>,
+    pub coverage: Coverage,
+    pub coverage_locked: bool,
 }
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]

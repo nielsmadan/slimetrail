@@ -60,6 +60,7 @@ CREATE VIRTUAL TABLE search_fts USING fts5(ascii_lower,content='',contentless_de
 CREATE TRIGGER documents_delete AFTER DELETE ON search_documents BEGIN
  DELETE FROM search_fts WHERE rowid=old.document_id;
 END;
+CREATE TABLE throughput(agent TEXT NOT NULL, coverage TEXT NOT NULL, bytes INTEGER NOT NULL, micros INTEGER NOT NULL, PRIMARY KEY(agent,coverage));
 PRAGMA user_version=3;
 ";
 
@@ -135,9 +136,7 @@ pub(super) fn open(
         0 => transaction.execute_batch(SCHEMA)?,
         VERSION => {}
         _ => {
-            return Err(Error::InvalidArgument(
-                "index schema version does not match its filename".into(),
-            ));
+            return Err(version_mismatch());
         }
     }
     transaction.execute("INSERT INTO meta(namespace,version,roots) VALUES(?1,?2,?3) ON CONFLICT(namespace) DO NOTHING", (namespace,VERSION,roots))?;
@@ -148,6 +147,10 @@ pub(super) fn open(
     check_namespace(&transaction, namespace, roots)?;
     transaction.commit()?;
     Ok(connection)
+}
+
+fn version_mismatch() -> Error {
+    Error::InvalidArgument("index schema version does not match its filename".into())
 }
 
 fn unbuilt() -> Result<Connection> {
@@ -173,9 +176,7 @@ pub(super) fn read(directory: &Path, namespace: &str, roots: &str) -> Result<Con
             check_namespace(&connection, namespace, roots)?;
             Ok(connection)
         }
-        _ => Err(Error::InvalidArgument(
-            "index schema version does not match its filename".into(),
-        )),
+        _ => Err(version_mismatch()),
     }
 }
 
@@ -204,6 +205,47 @@ pub(super) fn coverage(connection: &Connection) -> Result<Option<(Coverage, Opti
             ))
         })
         .transpose()
+}
+
+pub(super) struct Effective {
+    pub coverage: Coverage,
+    pub stored: Option<Coverage>,
+    pub pending: Option<Coverage>,
+    pub locked: bool,
+}
+
+pub(super) fn effective_coverage(
+    connection: &Connection,
+    configured: Coverage,
+) -> Result<Effective> {
+    let Some((stored, pending)) = coverage(connection)? else {
+        return Ok(Effective {
+            coverage: configured,
+            stored: None,
+            pending: None,
+            locked: false,
+        });
+    };
+    let locked = pending.is_some()
+        || connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM refresh_runs WHERE published>=1) OR EXISTS(SELECT 1 FROM sources)",
+            [],
+            |r| r.get(0),
+        )?;
+    Ok(Effective {
+        coverage: if locked { stored } else { configured },
+        stored: Some(stored),
+        pending,
+        locked,
+    })
+}
+
+pub(super) fn set_coverage(connection: &Connection, coverage: Coverage) -> Result<()> {
+    connection.execute(
+        "UPDATE settings SET coverage=?1 WHERE id=1",
+        [coverage_name(coverage)],
+    )?;
+    Ok(())
 }
 
 pub(super) fn prune(directory: &Path) -> Result<()> {
