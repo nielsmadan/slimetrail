@@ -1,5 +1,7 @@
 #[allow(dead_code)]
 mod query_support;
+#[allow(dead_code)]
+mod support;
 use query_support::*;
 use serde_json::json;
 use slimetrail::*;
@@ -56,7 +58,10 @@ fn indexed_literals_equal_independent_scalar_matcher() {
         for sensitive in [false, true] {
             let mut opt = options(query);
             opt.case_sensitive = sensitive;
-            let actual = search(&ctx, &opt).unwrap().data.unwrap();
+            let actual = search(&ctx, &opt, &RefreshOptions::QUERY)
+                .unwrap()
+                .data
+                .unwrap();
             let expected: std::collections::BTreeMap<_, _> = texts
                 .iter()
                 .enumerate()
@@ -128,7 +133,10 @@ fn native_title_once_kind_independent_and_derived_only_displayed() {
         &[event("user", "needle", None)],
     );
     let opt = options("needle");
-    let result = search(&ctx, &opt).unwrap().data.unwrap();
+    let result = search(&ctx, &opt, &RefreshOptions::QUERY)
+        .unwrap()
+        .data
+        .unwrap();
     assert_eq!(result.results[0].session.key.id, "native");
     assert_eq!(result.results[0].score, 16);
     assert_eq!(result.results[0].matches, 5);
@@ -144,7 +152,10 @@ fn native_title_once_kind_independent_and_derived_only_displayed() {
     assert_eq!(result.results[1].by_kind.len(), 1);
     let mut opt = opt;
     opt.filter.kinds = BTreeSet::from([Kind::Tool]);
-    let result = search(&ctx, &opt).unwrap().data.unwrap();
+    let result = search(&ctx, &opt, &RefreshOptions::QUERY)
+        .unwrap()
+        .data
+        .unwrap();
     assert_eq!(result.count, 1);
     assert_eq!(result.results[0].score, 11);
     assert_eq!(result.results[0].by_kind["title"], 2);
@@ -162,25 +173,45 @@ fn regex_is_explicit_skips_zero_width_and_rejects_unsupported_syntax() {
         &[event("user", "aaa a.b axb", None)],
     );
     assert_eq!(
-        search(&ctx, &options("a.b")).unwrap().data.unwrap().results[0].matches,
+        search(&ctx, &options("a.b"), &RefreshOptions::QUERY)
+            .unwrap()
+            .data
+            .unwrap()
+            .results[0]
+            .matches,
         1
     );
     let mut opt = options("a.b");
     opt.regex = true;
     assert_eq!(
-        search(&ctx, &opt).unwrap().data.unwrap().results[0].matches,
+        search(&ctx, &opt, &RefreshOptions::QUERY)
+            .unwrap()
+            .data
+            .unwrap()
+            .results[0]
+            .matches,
         2
     );
     opt.query = "a*".into();
-    let result = search(&ctx, &opt).unwrap().data.unwrap();
+    let result = search(&ctx, &opt, &RefreshOptions::QUERY)
+        .unwrap()
+        .data
+        .unwrap();
     assert_eq!(result.results[0].matches, 3);
     opt.query = "^|$".into();
-    assert_eq!(search(&ctx, &opt).unwrap().data.unwrap().count, 0);
+    assert_eq!(
+        search(&ctx, &opt, &RefreshOptions::QUERY)
+            .unwrap()
+            .data
+            .unwrap()
+            .count,
+        0
+    );
     for query in ["(?=a)", "(a)\\1", "["] {
         opt.query = query.into();
-        assert!(search(&ctx, &opt).is_err());
+        assert!(search(&ctx, &opt, &RefreshOptions::QUERY).is_err());
     }
-    assert!(search(&ctx, &options("")).is_err());
+    assert!(search(&ctx, &options(""), &RefreshOptions::QUERY).is_err());
 }
 
 #[test]
@@ -197,17 +228,31 @@ fn snippets_use_scalar_context_whitespace_and_bounded_limits() {
     let mut opt = options("needle");
     opt.context_chars = 2;
     assert_eq!(
-        search(&ctx, &opt).unwrap().data.unwrap().results[0].snippets,
+        search(&ctx, &opt, &RefreshOptions::QUERY)
+            .unwrap()
+            .data
+            .unwrap()
+            .results[0]
+            .snippets,
         ["[user/message] …NEEDLE γ…"]
     );
     opt.context_chars = 0;
     assert_eq!(
-        search(&ctx, &opt).unwrap().data.unwrap().results[0].snippets,
+        search(&ctx, &opt, &RefreshOptions::QUERY)
+            .unwrap()
+            .data
+            .unwrap()
+            .results[0]
+            .snippets,
         ["[user/message] …NEEDLE…"]
     );
     opt.max_snippets = 0;
     assert_eq!(
-        search(&ctx, &opt).unwrap().data.unwrap().results[0]
+        search(&ctx, &opt, &RefreshOptions::QUERY)
+            .unwrap()
+            .data
+            .unwrap()
+            .results[0]
             .snippets
             .len(),
         0
@@ -235,12 +280,18 @@ fn ordering_and_top_limits_are_deterministic() {
             .collect::<Vec<_>>()
     };
     assert_eq!(
-        ids(search(&ctx, &opt).unwrap().data.unwrap()),
+        ids(search(&ctx, &opt, &RefreshOptions::QUERY)
+            .unwrap()
+            .data
+            .unwrap()),
         ["c", "z", "a"]
     );
     opt.sort = Sort::Recent;
     assert_eq!(
-        ids(search(&ctx, &opt).unwrap().data.unwrap()),
+        ids(search(&ctx, &opt, &RefreshOptions::QUERY)
+            .unwrap()
+            .data
+            .unwrap()),
         ["c", "a", "b"]
     );
 }
@@ -273,13 +324,31 @@ fn scope_app_and_source_mtime_follow_reference_rules() {
     let mut opt = options("needle");
     opt.filter.days = Some(1);
     opt.filter.scope = Scope::Siblings;
-    assert_eq!(search(&ctx, &opt).unwrap().data.unwrap().count, 2);
+    assert_eq!(
+        search(&ctx, &opt, &RefreshOptions::QUERY)
+            .unwrap()
+            .data
+            .unwrap()
+            .count,
+        2
+    );
     opt.filter.scope = Scope::Current;
     opt.filter.cwd = "/fixture/else/../project".into();
-    assert_eq!(search(&ctx, &opt).unwrap().data.unwrap().count, 1);
+    assert_eq!(
+        search(&ctx, &opt, &RefreshOptions::QUERY)
+            .unwrap()
+            .data
+            .unwrap()
+            .count,
+        1
+    );
     opt.filter.app = Some("OUTSIDE".into());
     assert_eq!(
-        search(&ctx, &opt).unwrap().data.unwrap().results[0]
+        search(&ctx, &opt, &RefreshOptions::QUERY)
+            .unwrap()
+            .data
+            .unwrap()
+            .results[0]
             .session
             .key
             .id,
@@ -287,9 +356,23 @@ fn scope_app_and_source_mtime_follow_reference_rules() {
     );
     opt.filter.app = None;
     opt.filter.scope = Scope::All;
-    assert_eq!(search(&ctx, &opt).unwrap().data.unwrap().count, 5);
+    assert_eq!(
+        search(&ctx, &opt, &RefreshOptions::QUERY)
+            .unwrap()
+            .data
+            .unwrap()
+            .count,
+        5
+    );
     opt.filter.days = Some(0);
-    assert_eq!(search(&ctx, &opt).unwrap().data.unwrap().count, 0);
+    assert_eq!(
+        search(&ctx, &opt, &RefreshOptions::QUERY)
+            .unwrap()
+            .data
+            .unwrap()
+            .count,
+        0
+    );
 }
 
 #[test]
@@ -299,28 +382,32 @@ fn duplicate_archive_copy_does_not_duplicate_search_or_metadata() {
     let path = claude(&ctx, "one", None, None, &[event("user", "needle", None)]);
     let archive = ctx.roots.archive.as_ref().unwrap().join("copy.jsonl");
     write(&archive, &fs::read_to_string(&path).unwrap());
-    let result = search(&ctx, &options("needle")).unwrap().data.unwrap();
+    let result = search(&ctx, &options("needle"), &RefreshOptions::QUERY)
+        .unwrap()
+        .data
+        .unwrap();
     assert_eq!(result.count, 1);
     assert_eq!(result.results[0].matches, 1);
     assert!(!result.results[0].session.archived);
     fs::remove_file(path).unwrap();
-    let result = search(&ctx, &options("needle")).unwrap().data.unwrap();
+    let result = search(&ctx, &options("needle"), &RefreshOptions::QUERY)
+        .unwrap()
+        .data
+        .unwrap();
     assert_eq!(result.count, 1);
     assert!(result.results[0].session.archived);
 }
 
 fn with_coverage(ctx: &Context, coverage: Coverage) -> Context {
-    Context {
-        index_dir: ctx.index_dir.with_extension(format!("{coverage:?}")),
-        coverage,
-        ..ctx.clone()
-    }
+    let mut varied = ctx.clone().with_coverage(coverage, ctx.coverage_explicit);
+    varied.index_dir = ctx.index_dir.with_extension(format!("{coverage:?}"));
+    varied
 }
 
 fn found(ctx: &Context, query: &str, regex: bool) -> (u64, Vec<String>) {
     let mut opt = options(query);
     opt.regex = regex;
-    let result = search(ctx, &opt).unwrap();
+    let result = search(ctx, &opt, &RefreshOptions::QUERY).unwrap();
     assert!(!result.incomplete, "{:?}", result.diagnostics);
     let data = result.data.unwrap();
     data.results
@@ -381,10 +468,15 @@ fn compact_searches_only_tool_result_tails_on_every_path() {
     let (_, snippets) = found(&compact, "本", false);
     assert_eq!(snippets, ["[user/tool] 本 tail \0n…"]);
     let mut stored = Vec::new();
-    entries(&compact, &"claude:long".parse().unwrap(), &mut |entry| {
-        stored.push((entry.text, entry.searchable));
-        Ok(())
-    })
+    entries(
+        &compact,
+        &"claude:long".parse().unwrap(),
+        &RefreshOptions::QUERY,
+        &mut |entry| {
+            stored.push((entry.text, entry.searchable));
+            Ok(())
+        },
+    )
     .unwrap();
     assert_eq!(stored, [(text, Searchable::ToolResult)]);
 }
@@ -405,14 +497,22 @@ fn duplicate_tool_use_result_is_stored_but_scored_once() {
     );
     for coverage in [Coverage::Compact, Coverage::Full] {
         let ctx = with_coverage(&base, coverage);
-        let result = search(&ctx, &options("needle")).unwrap().data.unwrap();
+        let result = search(&ctx, &options("needle"), &RefreshOptions::QUERY)
+            .unwrap()
+            .data
+            .unwrap();
         assert_eq!(result.results[0].matches, 3, "{coverage:?}");
         assert_eq!(result.results[0].by_kind["tool"], 3);
         let mut stored = Vec::new();
-        entries(&ctx, &"claude:dup".parse().unwrap(), &mut |entry| {
-            stored.push((entry.kind, entry.searchable, entry.text));
-            Ok(())
-        })
+        entries(
+            &ctx,
+            &"claude:dup".parse().unwrap(),
+            &RefreshOptions::QUERY,
+            &mut |entry| {
+                stored.push((entry.kind, entry.searchable, entry.text));
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(
             stored,

@@ -5,7 +5,8 @@ use super::{
 };
 use crate::{
     Agent, Context, Diagnostic, Discovery, DiscoveryCache, Entry, Error, Fingerprint,
-    ParsedSession, PrivateSnapshot, RawSession, Result, Session, SessionKey, TitleOrigin,
+    ParsedSession, PrivateSnapshot, RawSession, Result, Session, SessionKey, Timestamp,
+    TitleOrigin,
 };
 use rusqlite::OptionalExtension;
 use serde_json::Value;
@@ -20,6 +21,7 @@ use std::{
 pub struct Cursor {
     staging: Option<PathBuf>,
     archive: Option<PathBuf>,
+    now_ms: Timestamp,
 }
 
 struct CursorDependencies<'a> {
@@ -58,6 +60,7 @@ impl Cursor {
         Self {
             staging: None,
             archive: ctx.roots.archive.clone(),
+            now_ms: ctx.now_ms,
         }
     }
 
@@ -65,6 +68,7 @@ impl Cursor {
         Self {
             staging: Some(staging.into()),
             archive: ctx.roots.archive.clone(),
+            now_ms: ctx.now_ms,
         }
     }
 
@@ -511,8 +515,8 @@ impl Source for Cursor {
         Ok(Discovery {
             sessions: sessions.into_values().map(|(_, _, raw)| raw).collect(),
             diagnostics,
-            warnings: Vec::new(),
             complete_agents,
+            ..Discovery::default()
         })
     }
 
@@ -567,18 +571,20 @@ impl Source for Cursor {
                 },
                 |snapshot| db_metadata(snapshot),
             );
-            result.unwrap_or_else(|_| {
-                diagnostics.push(diagnostic(
-                    Agent::Cursor,
-                    path,
-                    "metadata_unavailable",
-                    "Cursor database metadata could not be read",
-                ));
-                Value::Null
-            })
+            result.ok()
         } else {
-            Value::Null
+            Some(Value::Null)
         };
+        let unread_database = db.is_none();
+        if unread_database {
+            diagnostics.push(diagnostic(
+                Agent::Cursor,
+                path,
+                "metadata_unavailable",
+                "Cursor database metadata could not be read",
+            ));
+        }
+        let db = db.unwrap_or(Value::Null);
         let metadata = fs::metadata(path).map_err(|source| Error::Io {
             path: path.into(),
             source,
@@ -604,7 +610,7 @@ impl Source for Cursor {
         };
         let mut pending = None;
         let mut index = 0;
-        let tally = records(path, &mut |line, record| {
+        let tally = records(path, self.now_ms, &mut |line, record| {
             for (part, mut entry) in normalize(record).into_iter().enumerate() {
                 entry.session = session.key.clone();
                 entry.index = index;
@@ -645,8 +651,18 @@ impl Source for Cursor {
             complete: diagnostics.is_empty(),
             diagnostics,
             state: None,
-            recheck: tally.recheck,
+            recheck: tally.recheck || unread_database,
         })
+    }
+
+    fn transcript<'a>(&self, raw: &'a RawSession) -> Option<&'a Path> {
+        CursorDependencies::from_paths(&raw.dependencies)
+            .ok()
+            .map(|dependencies| dependencies.transcript)
+    }
+
+    fn drifted(&self, raw: &RawSession) -> bool {
+        fingerprint(&raw.dependencies).map_or(true, |current| current != raw.fingerprint)
     }
 }
 

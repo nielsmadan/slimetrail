@@ -2,10 +2,11 @@ import json
 import sys
 from pathlib import Path
 
+INFORMATIONAL = {"search_coverage", "coverage_mismatch"}
+
 
 def failing(counts):
-    # search_coverage is an informational note about compact coverage, not a failure.
-    return {code: n for code, n in counts.items() if code != "search_coverage"}
+    return {code: n for code, n in counts.items() if code not in INFORMATIONAL}
 
 
 def validate_per_agent(records):

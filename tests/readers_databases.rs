@@ -1,44 +1,22 @@
+#[allow(dead_code)]
+mod support;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use slimetrail::{
-    sources::{Source, source_for, sqlite},
+    sources::{
+        CachedSource, Discovery, DiscoveryCache, ParsedSession, RawSession, Source, source_for,
+        sqlite,
+    },
     *,
 };
 use std::{
-    collections::BTreeMap,
     fs,
     hash::{Hash, Hasher},
     os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime},
 };
-
-fn context(base: &Path) -> Context {
-    Context {
-        roots: resolve_roots(
-            base,
-            &BTreeMap::from([
-                (
-                    "CODEX_HOME".into(),
-                    base.join("codex").to_string_lossy().into_owned(),
-                ),
-                (
-                    "XDG_DATA_HOME".into(),
-                    base.join("data").to_string_lossy().into_owned(),
-                ),
-            ]),
-        )
-        .unwrap(),
-        index_dir: base.join("index"),
-        now_ms: 0,
-        cwd: "/fixture/project".into(),
-        time_zone: "UTC".into(),
-        coverage: slimetrail::Coverage::Compact,
-        build: slimetrail::BuildPolicy::Inline,
-        progress: false,
-    }
-}
+use support::{an_hour_later, context};
 
 fn write(path: &Path, text: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -120,11 +98,8 @@ fn opencode(ctx: &Context) -> Connection {
     connection
 }
 
-const fn empty_cache() -> DiscoveryCache {
-    DiscoveryCache {
-        by_source: BTreeMap::new(),
-        verify: false,
-    }
+fn empty_cache() -> DiscoveryCache {
+    DiscoveryCache::default()
 }
 
 fn cached(discovery: &Discovery) -> DiscoveryCache {
@@ -556,17 +531,13 @@ fn cursor_partial_transcripts_and_metadata_errors_are_sanitized() {
             include_str!("fixtures/jsonl/cursor.jsonl")
         ),
     );
-    fs::File::options()
-        .append(true)
-        .open(&transcript)
-        .unwrap()
-        .set_modified(SystemTime::now() - Duration::from_secs(3600))
-        .unwrap();
+    let ctx = an_hour_later(&ctx, &transcript);
     let source = source_for(&ctx, Agent::Cursor).unwrap();
     let discovery = discover(source.as_ref(), &ctx);
     let (parsed, entries) = parse(source.as_ref(), &discovery.sessions[0]);
     assert_eq!(entries.len(), 3);
     assert!(!parsed.complete);
+    assert!(parsed.recheck);
     assert_eq!(
         parsed
             .diagnostics
@@ -621,15 +592,7 @@ fn cursor_companion_directory_symlink_reports_incomplete() {
     fs::rename(meta.parent().unwrap(), &unrelated).unwrap();
     symlink(&unrelated, ctx.roots.cursor_chats.join("main")).unwrap();
     let source = source_for(&ctx, Agent::Cursor).unwrap();
-    let found = source
-        .discover(
-            &ctx,
-            &DiscoveryCache {
-                by_source: BTreeMap::new(),
-                verify: false,
-            },
-        )
-        .unwrap();
+    let found = source.discover(&ctx, &DiscoveryCache::default()).unwrap();
     assert!(found.sessions.is_empty());
     assert!(found.complete_agents.is_empty());
     assert_eq!(found.diagnostics[0].code, "source_unavailable");

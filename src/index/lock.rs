@@ -221,15 +221,17 @@ impl Lease {
     }
 }
 
-pub(super) fn writer(directory: &Path, timeout: Duration, notice: bool) -> Result<Option<File>> {
+pub(super) fn writer(
+    directory: &Path,
+    timeout: Duration,
+    waiting: impl FnOnce(),
+) -> Result<Option<File>> {
     let path = directory.join("writer.lock");
     let file = lock_file(&path)?;
     if poll(&file, &path, &Mode::Exclusive, Duration::ZERO)? {
         return Ok(Some(file));
     }
-    if notice {
-        eprintln!("waiting for another slimetrail refresh…");
-    }
+    waiting();
     Ok(poll(&file, &path, &Mode::Exclusive, timeout)?.then_some(file))
 }
 
@@ -306,19 +308,6 @@ fn sweep_listed(listed: Vec<PathBuf>, own: &Path) -> Result<()> {
 
 const OWNER: &str = "owner.lock";
 
-fn random() -> String {
-    use std::hash::BuildHasher;
-    let seed = (
-        std::process::id(),
-        Instant::now(),
-        std::thread::current().id(),
-    );
-    format!(
-        "{:016x}",
-        std::collections::hash_map::RandomState::new().hash_one(format!("{seed:?}"))
-    )
-}
-
 pub(super) struct Staging {
     pub(super) path: PathBuf,
     _owner: File,
@@ -327,14 +316,15 @@ pub(super) struct Staging {
 impl Staging {
     pub(super) fn create(staging: &Path) -> Result<Self> {
         directory(staging)?;
-        let temporary = staging.join(format!("tmp-{}", random()));
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&temporary)
-            .map_err(|e| io(&temporary, e))?;
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700))
-            .map_err(|e| io(&temporary, e))?;
-        let owner = temporary.join(OWNER);
+        let temporary = tempfile::Builder::new()
+            .prefix("tmp-")
+            .rand_bytes(16)
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in(staging)
+            .map_err(|e| io(staging, e))?;
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))
+            .map_err(|e| io(temporary.path(), e))?;
+        let owner = temporary.path().join(OWNER);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -347,7 +337,17 @@ impl Staging {
                 "new snapshot staging owner lock is already held".into(),
             ));
         }
-        let path = staging.join(format!("proc-{}-{}", std::process::id(), random()));
+        let suffix = temporary
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("tmp-"))
+            .ok_or_else(|| {
+                Error::InvalidArgument("snapshot staging name is not valid UTF-8".into())
+            })?
+            .to_owned();
+        let path = staging.join(format!("proc-{}-{suffix}", std::process::id()));
+        let temporary = temporary.keep();
         fs::rename(&temporary, &path).map_err(|e| io(&path, e))?;
         Ok(Self { path, _owner: file })
     }

@@ -33,6 +33,7 @@ DIAGNOSTICS = {
     "timeline_missing_timestamps",
     "search_coverage",
     "coverage_excluded",
+    "coverage_mismatch",
     "index_required",
     "refresh_in_progress",
     "coverage_rebuild_pending",
@@ -451,44 +452,6 @@ def payload(entry):
     return f"{marker} record {entry} " + "synthetic benchmark content " * 8
 
 
-def aggregate_index(index):
-    databases = [
-        path
-        for path in index.glob("index-v*.sqlite3")
-        if path.name.removeprefix("index-v").removesuffix(".sqlite3").isdigit()
-    ]
-    if not databases:
-        return {}
-    path = max(
-        databases,
-        key=lambda path: int(
-            path.name.removeprefix("index-v").removesuffix(".sqlite3")
-        ),
-    )
-    if not path.exists():
-        return {}
-    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
-        return {
-            "sessions": connection.execute("SELECT count(*) FROM sessions").fetchone()[
-                0
-            ],
-            "entries": connection.execute("SELECT count(*) FROM entries").fetchone()[0],
-            "entry_bytes": connection.execute(
-                "SELECT coalesce(sum(length(cast(text AS BLOB))),0) FROM entries"
-            ).fetchone()[0],
-            "documents": connection.execute(
-                "SELECT count(*) FROM search_documents"
-            ).fetchone()[0],
-            "non_ascii_documents": connection.execute(
-                "SELECT count(*) FROM search_documents WHERE has_non_ascii=1"
-            ).fetchone()[0],
-            "nul_documents": connection.execute(
-                "SELECT count(*) FROM search_documents WHERE has_nul=1"
-            ).fetchone()[0],
-            "index_bytes": path.stat().st_size,
-        }
-
-
 def index_database(index):
     databases = [
         path
@@ -504,28 +467,105 @@ def index_database(index):
     )
 
 
-def agent_dimensions(index, agent):
-    """Aggregate counts and DB+WAL bytes after a TRUNCATE checkpoint (owned index only)."""
+def checkpointed_bytes(connection, path):
+    """DB+WAL bytes after a TRUNCATE checkpoint (owned index only)."""
+    busy = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+    if busy:
+        raise RuntimeError("checkpoint_busy")
+    wal = Path(str(path) + "-wal")
+    return path.stat().st_size + (wal.stat().st_size if wal.exists() else 0)
+
+
+def aggregate_index(index):
     path = index_database(index)
     if path is None:
         return {}
     with contextlib.closing(sqlite3.connect(path)) as connection:
-        sessions = connection.execute(
-            "SELECT count(*) FROM sessions WHERE agent=?", (agent,)
-        ).fetchone()[0]
-        entries = connection.execute(
-            "SELECT count(*) FROM entries WHERE agent=?", (agent,)
-        ).fetchone()[0]
-        busy = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
-        if busy:
-            raise RuntimeError("checkpoint_busy")
-    wal = Path(str(path) + "-wal")
-    return {
-        "sessions": sessions,
-        "entries": entries,
-        "index_bytes": path.stat().st_size
-        + (wal.stat().st_size if wal.exists() else 0),
-    }
+
+        def scalar(sql):
+            return connection.execute(sql).fetchone()[0]
+
+        return {
+            "sessions": scalar("SELECT count(*) FROM sessions"),
+            "entries": scalar("SELECT count(*) FROM entries"),
+            "entry_bytes": scalar(
+                "SELECT coalesce(sum(length(cast(text AS BLOB))"
+                "+length(cast(text_tail AS BLOB))),0) FROM entries"
+            ),
+            "documents": scalar("SELECT count(*) FROM search_documents"),
+            "non_ascii_documents": scalar(
+                "SELECT count(*) FROM search_documents WHERE has_non_ascii=1"
+            ),
+            "nul_documents": scalar(
+                "SELECT count(*) FROM search_documents WHERE has_nul=1"
+            ),
+            "index_bytes": checkpointed_bytes(connection, path),
+        }
+
+
+def agent_dimensions(index, agent):
+    path = index_database(index)
+    if path is None:
+        return {}
+    with contextlib.closing(sqlite3.connect(path)) as connection:
+        return {
+            "sessions": connection.execute(
+                "SELECT count(*) FROM sessions WHERE agent=?", (agent,)
+            ).fetchone()[0],
+            "entries": connection.execute(
+                "SELECT count(*) FROM entries WHERE agent=?", (agent,)
+            ).fetchone()[0],
+            "index_bytes": checkpointed_bytes(connection, path),
+        }
+
+
+def attempt(identity, action):
+    started = time.monotonic()
+    try:
+        return action()
+    except (Exception, KeyboardInterrupt) as error:
+        emit(
+            {
+                **identity,
+                "failure": type(error).__name__,
+                "elapsed_seconds": round(time.monotonic() - started, 6),
+            }
+        )
+        raise
+
+
+def require_success(runs):
+    if any(run["exit"] not in (0, 1) for run in runs):
+        raise RuntimeError("cli_fatal")
+
+
+def measure_agent(binary, fresh, env, agent, source, coverage, timeout, deadline):
+    def run():
+        try:
+            result = invoke(
+                binary, fresh, env, ["index", "--" + agent], timeout, deadline
+            )
+            return {
+                "per_agent": agent,
+                "coverage": coverage,
+                "source_files": source["files"],
+                "source_bytes": source["bytes"],
+                "cold_ms": round(result["seconds"] * 1000),
+                "exit": result["exit"],
+                "incomplete": result.get("incomplete"),
+                "diagnostic_counts": result["diagnostic_counts"],
+                "counters": result.get("counters", {}),
+                **agent_dimensions(fresh, agent),
+                **(
+                    {"invalid_envelope": True} if result.get("invalid_envelope") else {}
+                ),
+            }
+        finally:
+            shutil.rmtree(fresh, ignore_errors=True)
+
+    record = attempt({"per_agent": agent}, run)
+    emit(record)
+    require_success([record])
 
 
 def invoke(binary, index, env, args, timeout, deadline):
@@ -696,23 +736,15 @@ def main():
                 if any("--" + agent in command for agent in AGENTS)
                 else ["--" + agent for agent in args.agents]
             )
-            started = time.monotonic()
-            try:
-                runs = [
+            runs = attempt(
+                {"measurement": label},
+                lambda: [
                     invoke(
                         binary, index, env, command + selection, args.timeout, deadline
                     )
                     for _ in range(repetitions)
-                ]
-            except (Exception, KeyboardInterrupt) as error:
-                emit(
-                    {
-                        "measurement": label,
-                        "failure": type(error).__name__,
-                        "elapsed_seconds": round(time.monotonic() - started, 6),
-                    }
-                )
-                raise
+                ],
+            )
             emit(
                 {
                     "measurement": label,
@@ -722,8 +754,7 @@ def main():
                     ),
                 }
             )
-            if any(run["exit"] not in (0, 1) for run in runs):
-                raise RuntimeError("cli_fatal")
+            require_success(runs)
 
         measure("cold_index", ["index"])
         emit({"indexed_dimensions": aggregate_index(index)})
@@ -759,45 +790,16 @@ def main():
             emit({"one_changed_source": "synthetic_only"})
         if args.per_agent:
             for agent in args.agents:
-                fresh = workspace / f"index-{agent}"
-                started = time.monotonic()
-                try:
-                    run = invoke(
-                        binary,
-                        fresh,
-                        env,
-                        ["index", "--" + agent],
-                        args.timeout,
-                        deadline,
-                    )
-                    record = {
-                        "per_agent": agent,
-                        "coverage": args.coverage,
-                        "source_files": corpus[agent]["files"],
-                        "source_bytes": corpus[agent]["bytes"],
-                        "cold_ms": round(run["seconds"] * 1000),
-                        "exit": run["exit"],
-                        "incomplete": run.get("incomplete"),
-                        "diagnostic_counts": run["diagnostic_counts"],
-                        "counters": run.get("counters", {}),
-                        **agent_dimensions(fresh, agent),
-                    }
-                    if run.get("invalid_envelope"):
-                        record["invalid_envelope"] = True
-                except (Exception, KeyboardInterrupt) as error:
-                    emit(
-                        {
-                            "per_agent": agent,
-                            "failure": type(error).__name__,
-                            "elapsed_seconds": round(time.monotonic() - started, 6),
-                        }
-                    )
-                    raise
-                finally:
-                    shutil.rmtree(fresh, ignore_errors=True)
-                emit(record)
-                if run["exit"] not in (0, 1):
-                    raise RuntimeError("cli_fatal")
+                measure_agent(
+                    binary,
+                    workspace / f"index-{agent}",
+                    env,
+                    agent,
+                    corpus[agent],
+                    args.coverage,
+                    args.timeout,
+                    deadline,
+                )
     finally:
         shutil.rmtree(workspace)
         emit(

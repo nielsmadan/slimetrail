@@ -1,10 +1,12 @@
+#[allow(dead_code)]
+mod support;
 use rusqlite::Connection;
 use slimetrail::{
-    index::{self, DATABASE, IndexSession},
+    index::{DATABASE, IndexSession},
     *,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs,
     io::{BufRead, BufReader, Write},
     os::unix::fs::PermissionsExt,
@@ -12,18 +14,14 @@ use std::{
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
+use support::context_at;
 
 fn context(base: &Path) -> Context {
-    Context {
-        roots: resolve_roots(base, &BTreeMap::new()).unwrap(),
-        index_dir: base.join("index"),
-        now_ms: 0,
-        cwd: base.into(),
-        time_zone: "UTC".into(),
-        coverage: slimetrail::Coverage::Compact,
-        build: slimetrail::BuildPolicy::Inline,
-        progress: false,
-    }
+    context_at(base)
+        .without_codex_home()
+        .without_data_home()
+        .cwd(base)
+        .build()
 }
 
 struct Worker(Child);
@@ -128,7 +126,7 @@ fn index_worker() {
         "transaction" => {
             let mut index = IndexSession::open(&ctx).unwrap();
             index
-                .refresh_under_lease(&BTreeSet::from([Agent::Claude]))
+                .refresh(&BTreeSet::from([Agent::Claude]), &RefreshOptions::QUERY)
                 .unwrap();
             let db = Connection::open(ctx.index_dir.join(DATABASE)).unwrap();
             db.execute_batch("PRAGMA foreign_keys=ON; UPDATE refresh_runs SET generation=generation+1,status='incomplete'; BEGIN IMMEDIATE; DELETE FROM sessions;").unwrap();
@@ -151,7 +149,7 @@ fn index_worker() {
         }
         "search" => {
             signal_and_wait();
-            let result = api::search(&ctx, &options()).unwrap();
+            let result = api::search(&ctx, &options(), &RefreshOptions::QUERY).unwrap();
             assert!(!result.incomplete, "{:?}", result.diagnostics);
             assert_eq!(hits(&result), ["one"]);
         }
@@ -209,11 +207,16 @@ fn query_during_another_write_answers_from_the_published_index() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     session(&ctx, "one");
-    index::refresh(&ctx, &BTreeSet::from([Agent::Claude]), false).unwrap();
+    refresh(
+        &ctx,
+        &BTreeSet::from([Agent::Claude]),
+        &RefreshOptions::QUERY,
+    )
+    .unwrap();
     let mut child = worker(&ctx, "writer");
     ready(&mut child);
     let started = Instant::now();
-    let result = api::search(&ctx, &options()).unwrap();
+    let result = api::search(&ctx, &options(), &RefreshOptions::QUERY).unwrap();
     let elapsed = started.elapsed();
     assert!(elapsed >= Duration::from_secs(5), "{elapsed:?}");
     assert!(elapsed < Duration::from_secs(7), "{elapsed:?}");
@@ -239,7 +242,12 @@ fn concurrent_searches_on_a_built_index_both_complete() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     session(&ctx, "one");
-    index::refresh(&ctx, &BTreeSet::from([Agent::Claude]), false).unwrap();
+    refresh(
+        &ctx,
+        &BTreeSet::from([Agent::Claude]),
+        &RefreshOptions::QUERY,
+    )
+    .unwrap();
     let mut first = worker(&ctx, "search");
     let mut second = worker(&ctx, "search");
     ready(&mut first);
@@ -328,7 +336,7 @@ fn killed_transaction_recovers_and_requires_refresh_before_queries() {
     };
     assert!(index.session(&key).is_err());
     let result = index
-        .refresh_under_lease(&BTreeSet::from([Agent::Claude]))
+        .refresh(&BTreeSet::from([Agent::Claude]), &RefreshOptions::QUERY)
         .unwrap();
     assert!(!result.incomplete);
     assert_eq!(result.data.unwrap().reused, 1);

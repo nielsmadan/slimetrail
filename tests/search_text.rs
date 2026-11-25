@@ -6,7 +6,7 @@ use std::{
 };
 use tempfile::TempDir;
 
-const COMPACT: &[u8] = b"search_coverage: Compact coverage: reasoning is not searched, and only the last 2 KB of each tool result is searched; run `slimetrail index --coverage full` to search everything.\n";
+const COMPACT: &[u8] = b"search_coverage: Compact coverage: reasoning is not searched, and only the last 2 KB of each tool result is searched; run `slimetrail index --coverage full` to search everything\n";
 
 struct Fixture(TempDir);
 

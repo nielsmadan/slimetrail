@@ -1,5 +1,7 @@
 #[allow(dead_code)]
 mod query_support;
+#[allow(dead_code)]
+mod support;
 use query_support::*;
 use serde_json::{Value, json};
 use slimetrail::*;
@@ -13,11 +15,8 @@ fn six_agent_reference_search_read_and_timeline_goldens() {
     let golden: Value =
         serde_json::from_str(include_str!("fixtures/query/six.golden.json")).unwrap();
     for coverage in [Coverage::Full, Coverage::Compact] {
-        let ctx = Context {
-            index_dir: dir.path().join(format!("index-{coverage:?}")),
-            coverage,
-            ..base.clone()
-        };
+        let mut ctx = base.clone().with_coverage(coverage, false);
+        ctx.index_dir = dir.path().join(format!("index-{coverage:?}"));
         goldens(&ctx, &golden);
     }
 }
@@ -36,13 +35,16 @@ fn goldens(ctx: &Context, golden: &Value) {
         Agent::Pi,
     ] {
         let selected = filter(agent);
-        let list = sessions(ctx, &selected).unwrap();
+        let list = sessions(ctx, &selected, &RefreshOptions::QUERY).unwrap();
         assert!(!list.incomplete, "{:?}", list.diagnostics);
         let session = &list.data.unwrap()[0];
         for query in ["needle", "café", "Native", "title"] {
             let mut opt = options(query);
             opt.filter = selected.clone();
-            let result = search(ctx, &opt).unwrap().data.unwrap();
+            let result = search(ctx, &opt, &RefreshOptions::QUERY)
+                .unwrap()
+                .data
+                .unwrap();
             let actual = result.results.first().map_or(Value::Null, |hit|json!({"score":hit.score as f64,"matches":hit.matches,"by_kind":hit.by_kind,"snippets":hit.snippets}));
             assert_eq!(
                 actual,
@@ -63,6 +65,7 @@ fn goldens(ctx: &Context, golden: &Value) {
                     offset: 0,
                     max_chars: 100_000,
                 },
+                &RefreshOptions::QUERY,
             )
             .unwrap()
             .data
@@ -81,6 +84,7 @@ fn goldens(ctx: &Context, golden: &Value) {
                 until: ts("2026-08-11T00:00:00Z"),
                 idle_ms: 1_800_000,
             },
+            &RefreshOptions::QUERY,
         )
         .unwrap()
         .data
@@ -113,17 +117,17 @@ fn partial_sources_preserve_results_and_status_across_all_apis() {
     write(&path, &format!("{valid}malformed\n"));
     let mut opt = options("needle");
     opt.filter.agents.insert(Agent::Pi);
-    let found = search(&ctx, &opt).unwrap();
+    let found = search(&ctx, &opt, &RefreshOptions::QUERY).unwrap();
     assert!(found.incomplete);
     assert_eq!(found.data.unwrap().count, 1);
     assert_eq!(found.diagnostics.len(), 3);
     assert_eq!(found.diagnostics[2].code, "search_coverage");
-    let list = sessions(&ctx, &opt.filter).unwrap();
+    let list = sessions(&ctx, &opt.filter, &RefreshOptions::QUERY).unwrap();
     assert!(list.incomplete);
     assert_eq!(list.data.unwrap().len(), 1);
     let key = "claude:one".parse().unwrap();
     let mut seen = Vec::new();
-    let streamed = entries(&ctx, &key, &mut |e| {
+    let streamed = entries(&ctx, &key, &RefreshOptions::QUERY, &mut |e| {
         seen.push(e.text);
         Ok(())
     })
@@ -138,13 +142,17 @@ fn partial_sources_preserve_results_and_status_across_all_apis() {
             offset: 0,
             max_chars: 100,
         },
+        &RefreshOptions::QUERY,
     )
     .unwrap();
     assert!(page.incomplete);
     assert!(page.data.is_some());
-    let unknown = entries(&ctx, &"pi:missing".parse().unwrap(), &mut |_| {
-        panic!("unavailable source emitted entry")
-    })
+    let unknown = entries(
+        &ctx,
+        &"pi:missing".parse().unwrap(),
+        &RefreshOptions::QUERY,
+        &mut |_| panic!("unavailable source emitted entry"),
+    )
     .unwrap();
     assert!(unknown.incomplete);
     assert!(unknown.data.is_none());
@@ -156,6 +164,7 @@ fn partial_sources_preserve_results_and_status_across_all_apis() {
             until: ts("2026-11-17T00:00:00Z"),
             idle_ms: 60_000,
         },
+        &RefreshOptions::QUERY,
     )
     .unwrap();
     assert!(activity.incomplete);
@@ -172,7 +181,15 @@ fn partial_sources_preserve_results_and_status_across_all_apis() {
     assert_eq!(data.sessions[0].session.key, key);
     assert_eq!(data.sessions[0].spans[0].human_prompts, 1);
     fs::create_dir_all(&ctx.roots.pi_sessions).unwrap();
-    assert!(entries(&ctx, &"pi:missing".parse().unwrap(), &mut |_| Ok(())).is_err());
+    assert!(
+        entries(
+            &ctx,
+            &"pi:missing".parse().unwrap(),
+            &RefreshOptions::QUERY,
+            &mut |_| Ok(())
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -181,7 +198,7 @@ fn default_selection_refreshes_all_and_callbacks_can_stop() {
     let ctx = context(dir.path());
     six(&ctx);
     assert_eq!(
-        refresh(&ctx, &BTreeSet::new(), false)
+        refresh(&ctx, &BTreeSet::new(), &RefreshOptions::QUERY)
             .unwrap()
             .data
             .unwrap()
@@ -190,11 +207,19 @@ fn default_selection_refreshes_all_and_callbacks_can_stop() {
     );
     let mut f = filter(Agent::Claude);
     f.agents.clear();
-    assert_eq!(sessions(&ctx, &f).unwrap().data.unwrap().len(), 6);
+    assert_eq!(
+        sessions(&ctx, &f, &RefreshOptions::QUERY)
+            .unwrap()
+            .data
+            .unwrap()
+            .len(),
+        6
+    );
     let mut count = 0;
     let result = entries(
         &ctx,
         &"claude:claude-canonical".parse().unwrap(),
+        &RefreshOptions::QUERY,
         &mut |_| {
             count += 1;
             Err(Error::InvalidArgument("stopped".into()))
@@ -218,12 +243,15 @@ fn dto_conversions_preserve_wire_shapes_and_fractional_minutes() {
             event("assistant", "done", Some("2026-11-16T00:00:30Z")),
         ],
     );
-    let found = search(&ctx, &options("needle")).unwrap().data.unwrap();
+    let found = search(&ctx, &options("needle"), &RefreshOptions::QUERY)
+        .unwrap()
+        .data
+        .unwrap();
     let data = serde_json::to_value(dto::SearchDataDto::try_from(&found).unwrap()).unwrap();
     assert_eq!(data["results"][0]["ref"], "claude:one");
     assert_eq!(data["count"], 1);
     let key = "claude:one".parse().unwrap();
-    entries(&ctx, &key, &mut |e| {
+    entries(&ctx, &key, &RefreshOptions::QUERY, &mut |e| {
         if e.index == 0 {
             assert_eq!(
                 dto::EntryDto::try_from(&e)?.timestamp.as_deref(),
@@ -241,6 +269,7 @@ fn dto_conversions_preserve_wire_shapes_and_fractional_minutes() {
             offset: 1,
             max_chars: 3,
         },
+        &RefreshOptions::QUERY,
     )
     .unwrap()
     .data
@@ -256,6 +285,7 @@ fn dto_conversions_preserve_wire_shapes_and_fractional_minutes() {
             until: ts("2026-11-17T00:00:00Z"),
             idle_ms: 60000,
         },
+        &RefreshOptions::QUERY,
     )
     .unwrap()
     .data
@@ -263,6 +293,13 @@ fn dto_conversions_preserve_wire_shapes_and_fractional_minutes() {
     let wire = dto::TimelineDataDto::try_from(&result).unwrap();
     assert_eq!(wire.sessions[0].active_minutes, 0.5);
     assert_eq!(wire.daily_active_minutes["2026-11-16"], 0.5);
+}
+
+fn found(ctx: &Context, options: &SearchOptions) -> SearchResult {
+    search(ctx, options, &RefreshOptions::QUERY)
+        .unwrap()
+        .data
+        .unwrap()
 }
 
 #[test]
@@ -295,7 +332,7 @@ fn thinking_blocks_keep_order_ids_kind_weights_and_read_visibility() {
             id: "thinking".into(),
         };
         let mut seen = Vec::new();
-        entries(&ctx, &key, &mut |entry| {
+        entries(&ctx, &key, &RefreshOptions::QUERY, &mut |entry| {
             seen.push(entry);
             Ok(())
         })
@@ -318,23 +355,20 @@ fn thinking_blocks_keep_order_ids_kind_weights_and_read_visibility() {
         );
         let mut opt = options("needle");
         opt.filter = filter(agent);
-        let found = search(&ctx, &opt).unwrap().data.unwrap();
-        assert_eq!((found.results[0].score, found.results[0].matches), (4, 2));
+        let hits = found(&ctx, &opt);
+        assert_eq!((hits.results[0].score, hits.results[0].matches), (4, 2));
         opt.filter.kinds = BTreeSet::from([Kind::Meta]);
-        let meta = search(&ctx, &opt).unwrap();
+        let meta = search(&ctx, &opt, &RefreshOptions::QUERY).unwrap();
         assert!(!meta.incomplete);
         assert_eq!(meta.diagnostics[0].code, "coverage_excluded");
         assert_eq!(meta.data.unwrap().count, 0);
-        let full = Context {
-            index_dir: dir.path().join(format!("full-{agent}")),
-            coverage: Coverage::Full,
-            ..ctx.clone()
-        };
+        let mut full = ctx.clone().with_coverage(Coverage::Full, false);
+        full.index_dir = dir.path().join(format!("full-{agent}"));
         opt.filter.kinds = BTreeSet::new();
-        let found = search(&full, &opt).unwrap().data.unwrap();
-        assert_eq!((found.results[0].score, found.results[0].matches), (8, 4));
+        let hits = found(&full, &opt);
+        assert_eq!((hits.results[0].score, hits.results[0].matches), (8, 4));
         opt.filter.kinds = BTreeSet::from([Kind::Meta]);
-        let meta = search(&full, &opt).unwrap().data.unwrap();
+        let meta = found(&full, &opt);
         assert_eq!((meta.results[0].score, meta.results[0].matches), (4, 2));
         let page = |mode| {
             read(
@@ -345,6 +379,7 @@ fn thinking_blocks_keep_order_ids_kind_weights_and_read_visibility() {
                     offset: 0,
                     max_chars: 1000,
                 },
+                &RefreshOptions::QUERY,
             )
             .unwrap()
             .data

@@ -32,7 +32,7 @@ pub(crate) fn run(
             "{}[{}/{}]\n",
             timestamp.map(|s| format!("{s} ")).unwrap_or_default(),
             entry.role,
-            kind_name(entry.kind)
+            entry.kind.as_str()
         );
         for part in [
             heading.as_str(),
@@ -55,14 +55,6 @@ pub(crate) fn run(
     page.truncated = end < page.total_chars;
     page.next_offset = page.truncated.then_some(end);
     Ok(page)
-}
-
-pub(crate) const fn kind_name(kind: Kind) -> &'static str {
-    match kind {
-        Kind::Message => "message",
-        Kind::Tool => "tool",
-        Kind::Meta => "meta",
-    }
 }
 
 pub(crate) fn python_whitespace(ch: char) -> bool {

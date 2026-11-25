@@ -1,5 +1,7 @@
 #[allow(dead_code)]
 mod query_support;
+#[allow(dead_code)]
+mod support;
 use query_support::*;
 use serde_json::json;
 use slimetrail::*;
@@ -39,7 +41,7 @@ fn window_is_half_open_idle_boundary_inclusive_and_all_activity_counts() {
     );
     let mut opt = opts("2026-08-10T00:00:00Z", "2026-08-11T00:00:00Z");
     opt.filter.kinds = BTreeSet::from([Kind::Meta]);
-    let result = timeline(&ctx, &opt).unwrap();
+    let result = timeline(&ctx, &opt, &RefreshOptions::QUERY).unwrap();
     assert!(!result.incomplete);
     let result = result.data.unwrap();
     let spans = &result.sessions[0].spans;
@@ -73,7 +75,10 @@ fn unordered_events_and_simultaneous_sessions_union_daily_time() {
     }
     let mut opt = opts("2026-08-10T00:00:00Z", "2026-08-11T00:00:00Z");
     opt.idle_ms = 3_600_000;
-    let result = timeline(&ctx, &opt).unwrap().data.unwrap();
+    let result = timeline(&ctx, &opt, &RefreshOptions::QUERY)
+        .unwrap()
+        .data
+        .unwrap();
     assert_eq!(result.sessions[0].session.key.id, "a");
     assert_eq!(result.sessions[0].spans[0].human_prompts, 2);
     assert_eq!(
@@ -114,7 +119,10 @@ fn civil_midnights_respect_spring_and_autumn_dst() {
         );
         let mut opt = opts(start, "2026-10-27T00:00:00Z");
         opt.idle_ms = 26 * 3_600_000;
-        let result = timeline(&ctx, &opt).unwrap().data.unwrap();
+        let result = timeline(&ctx, &opt, &RefreshOptions::QUERY)
+            .unwrap()
+            .data
+            .unwrap();
         assert_eq!(result.daily_active_ms.len(), 1);
         assert_eq!(result.daily_active_ms[day], hours * 3_600_000);
         assert_eq!(result.sessions[0].active_ms, hours * 3_600_000);
@@ -136,10 +144,14 @@ fn spans_split_at_midnight_in_explicit_zone() {
             event("assistant", "end", Some("2026-08-10T18:50:00Z")),
         ],
     );
-    let result = timeline(&ctx, &opts("2026-08-10T00:00:00Z", "2026-08-12T00:00:00Z"))
-        .unwrap()
-        .data
-        .unwrap();
+    let result = timeline(
+        &ctx,
+        &opts("2026-08-10T00:00:00Z", "2026-08-12T00:00:00Z"),
+        &RefreshOptions::QUERY,
+    )
+    .unwrap()
+    .data
+    .unwrap();
     assert_eq!(result.daily_active_ms["2026-08-10"], 600_000);
     assert_eq!(result.daily_active_ms["2026-08-11"], 1_200_000);
 }
@@ -159,7 +171,12 @@ fn missing_timestamps_are_counted_once_per_source_without_text() {
             event("user", "valid", Some("2026-08-10T00:00:00Z")),
         ],
     );
-    let result = timeline(&ctx, &opts("2026-08-10T00:00:00Z", "2026-08-11T00:00:00Z")).unwrap();
+    let result = timeline(
+        &ctx,
+        &opts("2026-08-10T00:00:00Z", "2026-08-11T00:00:00Z"),
+        &RefreshOptions::QUERY,
+    )
+    .unwrap();
     assert!(result.incomplete);
     assert_eq!(result.diagnostics.len(), 1);
     assert_eq!(result.diagnostics[0].code, "timeline_missing_timestamps");
@@ -195,7 +212,10 @@ fn historical_until_uses_since_for_source_cutoff_not_today() {
     }
     let mut opt = opts("2026-08-10T00:00:00Z", "2026-08-11T00:00:00Z");
     opt.filter.days = Some(1);
-    let result = timeline(&ctx, &opt).unwrap().data.unwrap();
+    let result = timeline(&ctx, &opt, &RefreshOptions::QUERY)
+        .unwrap()
+        .data
+        .unwrap();
     assert_eq!(result.sessions.len(), 1);
     assert_eq!(result.sessions[0].session.key.id, "fresh");
 }
@@ -223,7 +243,10 @@ fn claude_cursor_children_excluded_while_other_agent_children_remain() {
     );
     let mut search_options = options("needle");
     search_options.filter.agents.clear();
-    let all = search(&ctx, &search_options).unwrap().data.unwrap();
+    let all = search(&ctx, &search_options, &RefreshOptions::QUERY)
+        .unwrap()
+        .data
+        .unwrap();
     assert!(
         all.results
             .iter()
@@ -236,7 +259,10 @@ fn claude_cursor_children_excluded_while_other_agent_children_remain() {
     );
     let mut opt = opts("2026-08-10T00:00:00Z", "2026-08-11T00:00:00Z");
     opt.filter.agents.clear();
-    let result = timeline(&ctx, &opt).unwrap().data.unwrap();
+    let result = timeline(&ctx, &opt, &RefreshOptions::QUERY)
+        .unwrap()
+        .data
+        .unwrap();
     assert_eq!(result.sessions.len(), 6);
     let codex = result
         .sessions
@@ -253,11 +279,11 @@ fn invalid_windows_zones_and_idle_values_fail_before_refresh() {
     let mut ctx = context(dir.path());
     let mut opt = opts("2026-08-10T00:00:00Z", "2026-08-11T00:00:00Z");
     ctx.time_zone = "Not/AZone".into();
-    assert!(timeline(&ctx, &opt).is_err());
+    assert!(timeline(&ctx, &opt, &RefreshOptions::QUERY).is_err());
     ctx.time_zone = "UTC".into();
     opt.idle_ms = 0;
-    assert!(timeline(&ctx, &opt).is_err());
+    assert!(timeline(&ctx, &opt, &RefreshOptions::QUERY).is_err());
     opt.idle_ms = 1;
     opt.until = opt.since;
-    assert!(timeline(&ctx, &opt).is_err());
+    assert!(timeline(&ctx, &opt, &RefreshOptions::QUERY).is_err());
 }

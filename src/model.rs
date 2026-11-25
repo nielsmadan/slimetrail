@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
-    sync::Arc,
+    time::Duration,
 };
 
 pub type Timestamp = i64;
@@ -44,16 +44,75 @@ pub enum Searchable {
     ToolResult,
     Duplicate,
 }
-#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub enum Admission {
+    #[default]
+    PerAgent,
+    AllOrNothing,
+}
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub enum BuildPolicy {
     #[default]
     Inline,
     Limit {
         max_ms: u64,
-        #[serde(default)]
-        whole: bool,
+        admission: Admission,
     },
+}
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub enum RefreshMode {
+    #[default]
+    Query,
+    Full,
+}
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct Progress {
+    pub sessions: u64,
+    pub total_sessions: u64,
+    pub bytes: u64,
+    pub total_bytes: u64,
+}
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct Rebuild {
+    pub entries: u64,
+    pub total_entries: u64,
+}
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum RefreshEvent {
+    Waiting,
+    Rebuilding(Rebuild),
+    Started(Progress),
+    Advanced(Progress),
+    Finished(Progress),
+}
+pub trait Observer {
+    fn observe(&self, event: RefreshEvent);
+}
+#[derive(Copy, Clone)]
+pub struct RefreshOptions<'a> {
+    pub mode: RefreshMode,
+    pub wait: Duration,
+    pub build: BuildPolicy,
+    pub observer: Option<&'a dyn Observer>,
+}
+impl RefreshOptions<'static> {
+    pub const QUERY: Self = Self {
+        mode: RefreshMode::Query,
+        wait: Duration::from_secs(5),
+        build: BuildPolicy::Inline,
+        observer: None,
+    };
+    pub const FULL: Self = Self {
+        mode: RefreshMode::Full,
+        wait: Duration::from_secs(3600),
+        build: BuildPolicy::Inline,
+        observer: None,
+    };
+}
+impl Default for RefreshOptions<'_> {
+    fn default() -> Self {
+        RefreshOptions::QUERY
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Roots {
@@ -71,6 +130,7 @@ pub struct Roots {
     pub archive: Option<PathBuf>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Context {
     pub roots: Roots,
     pub index_dir: PathBuf,
@@ -80,9 +140,34 @@ pub struct Context {
     #[serde(default)]
     pub coverage: Coverage,
     #[serde(default)]
-    pub build: BuildPolicy,
-    #[serde(default)]
-    pub progress: bool,
+    pub coverage_explicit: bool,
+}
+impl Context {
+    pub fn new(
+        roots: Roots,
+        index_dir: PathBuf,
+        cwd: PathBuf,
+        now_ms: Timestamp,
+        time_zone: String,
+    ) -> Self {
+        Self {
+            roots,
+            index_dir,
+            now_ms,
+            cwd,
+            time_zone,
+            coverage: Coverage::default(),
+            coverage_explicit: false,
+        }
+    }
+    #[must_use]
+    pub fn with_coverage(self, coverage: Coverage, explicit: bool) -> Self {
+        Self {
+            coverage,
+            coverage_explicit: explicit,
+            ..self
+        }
+    }
 }
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -133,75 +218,7 @@ pub struct Envelope<T> {
     pub diagnostics: Vec<Diagnostic>,
     pub data: Option<T>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Fingerprint {
-    pub signature: String,
-}
-#[derive(Debug)]
-pub struct PrivateSnapshot {
-    pub directory: tempfile::TempDir,
-    pub database: PathBuf,
-}
-#[derive(Debug)]
-pub struct RawSession {
-    pub key: SessionKey,
-    pub source: String,
-    pub dependencies: Vec<PathBuf>,
-    pub fingerprint: Fingerprint,
-    pub snapshot: Option<Arc<PrivateSnapshot>>,
-    pub resume: Option<AppendState>,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AppendState {
-    pub consumed: u64,
-    pub prefix_sha256: String,
-    pub lines: u64,
-    pub entries: u64,
-    pub malformed: u64,
-    pub dev: u64,
-    pub ino: u64,
-    pub others: String,
-    pub session: Session,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Stored once per source; the shared interface keeps AppendState inline"
-)]
-pub enum SourceState {
-    Append(AppendState),
-    Content { sha256: String },
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CachedSource {
-    pub key: SessionKey,
-    pub source: String,
-    pub dependencies: Vec<PathBuf>,
-    pub fingerprint: Fingerprint,
-    pub state: Option<SourceState>,
-}
-#[derive(Debug)]
-pub struct Discovery {
-    pub sessions: Vec<RawSession>,
-    pub diagnostics: Vec<Diagnostic>,
-    pub warnings: Vec<Diagnostic>,
-    pub complete_agents: BTreeSet<Agent>,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DiscoveryCache {
-    pub by_source: BTreeMap<String, CachedSource>,
-    pub verify: bool,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ParsedSession {
-    pub session: Session,
-    pub diagnostics: Vec<Diagnostic>,
-    pub complete: bool,
-    pub state: Option<SourceState>,
-    pub recheck: bool,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexStats {
     pub discovered: u64,
     pub reused: u64,
@@ -222,6 +239,14 @@ pub struct AgentEstimate {
     pub bytes: u64,
     pub compact: Projection,
     pub full: Projection,
+}
+impl AgentEstimate {
+    pub const fn projection(&self, coverage: Coverage) -> &Projection {
+        match coverage {
+            Coverage::Compact => &self.compact,
+            Coverage::Full => &self.full,
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobEstimate {

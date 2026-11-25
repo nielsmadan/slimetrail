@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 mod support;
 use slimetrail::{
     dto::{EntryDto, SessionDto, format_timestamp},

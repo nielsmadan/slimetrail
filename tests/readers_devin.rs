@@ -1,34 +1,19 @@
+#[allow(dead_code)]
+mod support;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use slimetrail::{
     index::{self, IndexSession},
-    sources::{Source, source_for},
+    sources::{
+        CachedSource, Discovery, DiscoveryCache, ParsedSession, RawSession, Source, source_for,
+    },
     *,
 };
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    path::Path,
-};
+use std::{collections::BTreeSet, fs, path::Path};
+use support::context_at;
 
 fn context(base: &Path) -> Context {
-    Context {
-        roots: resolve_roots(
-            base,
-            &BTreeMap::from([(
-                "XDG_DATA_HOME".into(),
-                base.join("data").to_string_lossy().into_owned(),
-            )]),
-        )
-        .unwrap(),
-        index_dir: base.join("index"),
-        now_ms: 0,
-        cwd: "/fixture/project".into(),
-        time_zone: "UTC".into(),
-        coverage: slimetrail::Coverage::Compact,
-        build: slimetrail::BuildPolicy::Inline,
-        progress: false,
-    }
+    context_at(base).without_codex_home().build()
 }
 
 fn message(role: &str, source: &str, content: &str) -> Value {
@@ -204,15 +189,7 @@ fn main_session(connection: &Connection, id: &str) {
 }
 
 fn discover(source: &dyn Source, ctx: &Context) -> Discovery {
-    source
-        .discover(
-            ctx,
-            &DiscoveryCache {
-                by_source: BTreeMap::new(),
-                verify: false,
-            },
-        )
-        .unwrap()
+    source.discover(ctx, &DiscoveryCache::default()).unwrap()
 }
 
 fn parse(source: &dyn Source, raw: &RawSession) -> (ParsedSession, Vec<Entry>) {
@@ -539,6 +516,7 @@ fn devin_subagent_child_is_searchable_but_excluded_from_timeline() {
             max_snippets: 1,
             context_chars: 40,
         },
+        &RefreshOptions::QUERY,
     )
     .unwrap()
     .data
@@ -552,6 +530,7 @@ fn devin_subagent_child_is_searchable_but_excluded_from_timeline() {
             until: 1_786_406_400_000,
             idle_ms: 1_800_000,
         },
+        &RefreshOptions::QUERY,
     )
     .unwrap()
     .data
@@ -571,8 +550,8 @@ fn devin() -> BTreeSet<Agent> {
     BTreeSet::from([Agent::Devin])
 }
 
-fn refreshed(ctx: &Context, verify: bool) -> (u64, u64, u64, u64) {
-    let result = index::refresh(ctx, &devin(), verify).unwrap();
+fn refreshed(ctx: &Context, options: &RefreshOptions<'_>) -> (u64, u64, u64, u64) {
+    let result = refresh(ctx, &devin(), options).unwrap();
     assert_eq!(result.diagnostics, []);
     let stats = result.data.unwrap();
     (
@@ -585,7 +564,7 @@ fn refreshed(ctx: &Context, verify: bool) -> (u64, u64, u64, u64) {
 
 fn queried(ctx: &Context) -> (IndexSession, IndexStats) {
     let mut index = IndexSession::open(ctx).unwrap();
-    let result = index.refresh_for_query(&devin()).unwrap();
+    let result = index.refresh(&devin(), &RefreshOptions::QUERY).unwrap();
     assert_eq!(result.diagnostics, []);
     (index, result.data.unwrap())
 }
@@ -628,7 +607,7 @@ fn two_sessions(ctx: &Context) -> Connection {
             [],
         )
         .unwrap();
-    assert_eq!(refreshed(ctx, false), (3, 0, 3, 0));
+    assert_eq!(refreshed(ctx, &RefreshOptions::QUERY), (3, 0, 3, 0));
     connection
 }
 
@@ -645,7 +624,7 @@ fn devin_added_nodes_reparse_only_their_session() {
         &message("user", "user", "Unlinked addition"),
         &json!({}),
     );
-    assert_eq!(refreshed(&ctx, false), (3, 2, 1, 0));
+    assert_eq!(refreshed(&ctx, &RefreshOptions::QUERY), (3, 2, 1, 0));
     connection
         .execute("UPDATE sessions SET main_chain_id=30 WHERE id='b'", [])
         .unwrap();
@@ -665,7 +644,7 @@ fn devin_deleted_session_is_removed_by_the_next_complete_refresh() {
             "DELETE FROM message_nodes WHERE session_id='b'; DELETE FROM sessions WHERE id='b';",
         )
         .unwrap();
-    assert_eq!(refreshed(&ctx, false), (2, 2, 0, 1));
+    assert_eq!(refreshed(&ctx, &RefreshOptions::QUERY), (2, 2, 0, 1));
     let (index, _) = queried(&ctx);
     assert_eq!(visible(&index), ["a", "a/agent1"]);
 }
@@ -675,7 +654,7 @@ fn devin_in_place_edit_is_found_only_by_the_verification_sweep() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     let connection = two_sessions(&ctx);
-    assert_eq!(refreshed(&ctx, true), (3, 3, 0, 0));
+    assert_eq!(refreshed(&ctx, &RefreshOptions::FULL), (3, 3, 0, 0));
     connection
         .execute(
             "UPDATE message_nodes SET chat_message=? WHERE session_id='b' AND node_id=9",
@@ -686,7 +665,7 @@ fn devin_in_place_edit_is_found_only_by_the_verification_sweep() {
     assert_eq!((stats.reused, stats.reparsed), (3, 0));
     assert!(texts(&index, "b").contains(&"Second prompt".to_string()));
     drop(index);
-    assert_eq!(refreshed(&ctx, true), (3, 2, 1, 0));
+    assert_eq!(refreshed(&ctx, &RefreshOptions::FULL), (3, 2, 1, 0));
     let (index, stats) = queried(&ctx);
     assert_eq!((stats.reused, stats.reparsed), (3, 0));
     let found = texts(&index, "b");
@@ -694,10 +673,10 @@ fn devin_in_place_edit_is_found_only_by_the_verification_sweep() {
     assert!(!found.contains(&"Second prompt".to_string()));
     assert!(texts(&index, "a").contains(&"Second prompt".to_string()));
     drop(index);
-    assert_eq!(refreshed(&ctx, true), (3, 3, 0, 0));
+    assert_eq!(refreshed(&ctx, &RefreshOptions::FULL), (3, 3, 0, 0));
     let stored = Connection::open(ctx.index_dir.join(index::DATABASE))
         .unwrap()
-        .prepare("SELECT json_extract(state,'$.kind'), length(json_extract(state,'$.sha256')) FROM sources WHERE agent='devin'")
+        .prepare("SELECT json_extract(state,'$.state.kind'), length(json_extract(state,'$.state.sha256')) FROM sources WHERE agent='devin'")
         .unwrap()
         .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
         .unwrap()
@@ -725,7 +704,7 @@ fn devin_moved_child_head_reparses_parent_and_children_only() {
             [],
         )
         .unwrap();
-    assert_eq!(refreshed(&ctx, false), (3, 1, 2, 0));
+    assert_eq!(refreshed(&ctx, &RefreshOptions::QUERY), (3, 1, 2, 0));
     let (index, _) = queried(&ctx);
     assert_eq!(
         texts(&index, "a/agent1"),
@@ -745,7 +724,7 @@ fn devin_head_moved_back_to_an_existing_node_reparses_only_that_child() {
             [],
         )
         .unwrap();
-    assert_eq!(refreshed(&ctx, false), (3, 2, 1, 0));
+    assert_eq!(refreshed(&ctx, &RefreshOptions::QUERY), (3, 2, 1, 0));
 }
 
 #[test]
@@ -759,7 +738,11 @@ fn devin_sweep_hash_covers_every_node_column() {
         "created_at=created_at+1",
         "metadata=metadata||' '",
     ] {
-        assert_eq!(refreshed(&ctx, true), (3, 3, 0, 0), "{assignment}");
+        assert_eq!(
+            refreshed(&ctx, &RefreshOptions::FULL),
+            (3, 3, 0, 0),
+            "{assignment}"
+        );
         connection
             .execute(
                 &format!(
@@ -768,7 +751,10 @@ fn devin_sweep_hash_covers_every_node_column() {
                 [],
             )
             .unwrap();
-        let stats = index::refresh(&ctx, &devin(), true).unwrap().data.unwrap();
+        let stats = refresh(&ctx, &devin(), &RefreshOptions::FULL)
+            .unwrap()
+            .data
+            .unwrap();
         assert_eq!(
             (
                 stats.discovered,
@@ -785,7 +771,7 @@ fn devin_sweep_hash_covers_every_node_column() {
                 [],
             )
             .unwrap();
-        index::refresh(&ctx, &devin(), true).unwrap();
+        refresh(&ctx, &devin(), &RefreshOptions::FULL).unwrap();
     }
 }
 
@@ -805,7 +791,7 @@ fn devin_minimal_schema_without_head_timestamps_or_unique_indexes_works() {
         )
         .unwrap();
     main_session(&connection, "main");
-    assert_eq!(refreshed(&ctx, false), (2, 0, 2, 0));
+    assert_eq!(refreshed(&ctx, &RefreshOptions::QUERY), (2, 0, 2, 0));
     let (index, _) = queried(&ctx);
     assert_eq!(
         texts(&index, "main/agent1"),
@@ -813,7 +799,7 @@ fn devin_minimal_schema_without_head_timestamps_or_unique_indexes_works() {
     );
     assert_eq!(texts(&index, "main")[0], "needle devin café 🦀");
     drop(index);
-    assert_eq!(refreshed(&ctx, true), (2, 2, 0, 0));
+    assert_eq!(refreshed(&ctx, &RefreshOptions::FULL), (2, 2, 0, 0));
     node(
         &connection,
         "main",
@@ -825,7 +811,7 @@ fn devin_minimal_schema_without_head_timestamps_or_unique_indexes_works() {
     connection
         .execute("UPDATE subagent_heads SET chain_node_id=23", [])
         .unwrap();
-    assert_eq!(refreshed(&ctx, false), (2, 0, 2, 0));
+    assert_eq!(refreshed(&ctx, &RefreshOptions::QUERY), (2, 0, 2, 0));
     let (index, _) = queried(&ctx);
     assert_eq!(
         texts(&index, "main/agent1").last().unwrap(),

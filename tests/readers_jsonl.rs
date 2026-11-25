@@ -1,6 +1,11 @@
+#[allow(dead_code)]
+mod support;
 use serde_json::{Value, json};
 use slimetrail::{
-    sources::{Source, jsonl::fingerprint, source_for},
+    sources::{
+        AppendState, CachedSource, Discovery, DiscoveryCache, PREFIX_CHUNK, ParsedSession,
+        PrefixCheck, RawSession, Resume, Source, SourceState, jsonl::fingerprint, source_for,
+    },
     *,
 };
 use std::{
@@ -10,32 +15,8 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
+use support::{an_hour_later, context};
 
-fn context(base: &Path) -> Context {
-    Context {
-        roots: resolve_roots(
-            base,
-            &BTreeMap::from([
-                (
-                    "CODEX_HOME".into(),
-                    base.join("codex").to_string_lossy().into(),
-                ),
-                (
-                    "XDG_DATA_HOME".into(),
-                    base.join("data").to_string_lossy().into(),
-                ),
-            ]),
-        )
-        .unwrap(),
-        index_dir: base.join("index"),
-        now_ms: 0,
-        cwd: "/fixture/project".into(),
-        time_zone: "UTC".into(),
-        coverage: slimetrail::Coverage::Compact,
-        build: slimetrail::BuildPolicy::Inline,
-        progress: false,
-    }
-}
 fn root(ctx: &Context, agent: Agent) -> &Path {
     match agent {
         Agent::Claude => &ctx.roots.claude_projects,
@@ -49,14 +30,6 @@ fn write(path: &Path, text: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, text).unwrap();
 }
-fn age(path: &Path) {
-    fs::File::options()
-        .append(true)
-        .open(path)
-        .unwrap()
-        .set_modified(SystemTime::now() - Duration::from_secs(3600))
-        .unwrap();
-}
 fn fixture(agent: Agent) -> String {
     fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -65,15 +38,7 @@ fn fixture(agent: Agent) -> String {
     .unwrap()
 }
 fn discover(source: &dyn Source, ctx: &Context) -> Discovery {
-    source
-        .discover(
-            ctx,
-            &DiscoveryCache {
-                by_source: BTreeMap::new(),
-                verify: false,
-            },
-        )
-        .unwrap()
+    source.discover(ctx, &DiscoveryCache::default()).unwrap()
 }
 fn parse(source: &dyn Source, raw: &RawSession) -> (ParsedSession, Vec<Entry>) {
     let mut entries = Vec::new();
@@ -154,7 +119,7 @@ fn malformed_and_truncated_records_preserve_good_entries_and_redact_content() {
                 fixture(agent)
             ),
         );
-        age(&path);
+        let ctx = an_hour_later(&ctx, &path);
         let source = source_for(&ctx, agent).unwrap();
         let discovery = discover(source.as_ref(), &ctx);
         let (parsed, entries) = parse(source.as_ref(), &discovery.sessions[0]);
@@ -418,7 +383,7 @@ fn completed_last_record_recovers_and_unknown_metadata_stays_searchable() {
         &path,
         "{\"type\":\"user\",\"sessionId\":\"canonical\",\"message\":\"Hello\"}\n{\"type\":\"future_kind\",\"text\":\"Future metadata\"}\n{\"type\":\"assistant\",\"message\":",
     );
-    age(&path);
+    let ctx = an_hour_later(&ctx, &path);
     let source = source_for(&ctx, Agent::Claude).unwrap();
     let d = discover(source.as_ref(), &ctx);
     let (p, e) = parse(source.as_ref(), &d.sessions[0]);
@@ -557,8 +522,8 @@ fn codex_native_names_refresh_for_live_and_archived_sessions() {
         assert!(parse(source.as_ref(), &before).0.complete);
         let discovered = discover(source.as_ref(), &ctx);
         assert_eq!(discovered.diagnostics, []);
-        assert_eq!(discovered.warnings.len(), 1);
-        assert_eq!(discovered.warnings[0].code, "malformed_metadata");
+        assert_eq!(discovered.advisories.len(), 1);
+        assert_eq!(discovered.advisories[0].code, "malformed_metadata");
         fs::remove_file(&ctx.roots.codex_session_index).unwrap();
         fs::create_dir(&ctx.roots.codex_session_index).unwrap();
         let parsed = parse(source.as_ref(), &before).0;
@@ -709,7 +674,10 @@ fn resume_emits_only_new_entries_and_rejects_rewritten_prefixes() {
         )
         .unwrap();
         let (cold, all) = parse(source.as_ref(), &discovery.sessions[0]);
-        discovery.sessions[0].resume = Some(state.clone());
+        discovery.sessions[0].resume = Some(Resume {
+            state: state.clone(),
+            check: PrefixCheck::Ends,
+        });
         let (resumed, tail) = collect(source.as_ref(), &discovery.sessions[0]);
         let resumed = resumed.unwrap();
         assert_eq!(tail, all[entries.len()..], "{agent}");
@@ -724,9 +692,81 @@ fn resume_emits_only_new_entries_and_rejects_rewritten_prefixes() {
             .write_all(rewritten.as_bytes())
             .unwrap();
         let (rejected, emitted) = collect(source.as_ref(), &discovery.sessions[0]);
-        assert!(matches!(rejected, Err(Error::ResumeRejected)), "{agent}");
+        assert!(
+            matches!(&rejected, Err(Error::InvalidArgument(message)) if message == "append resume state no longer matches the source"),
+            "{agent}"
+        );
         assert_eq!(emitted, [] as [Entry; 0]);
     }
+}
+
+fn rewrite_near(path: &Path, offset: u64) {
+    let mut bytes = fs::read(path).unwrap();
+    let start = usize::try_from(offset).unwrap();
+    let found = start + bytes[start..].iter().position(|b| *b == b'x').unwrap();
+    bytes[found] = b'y';
+    let mut file = OpenOptions::new().write(true).open(path).unwrap();
+    file.write_all(&bytes).unwrap();
+}
+
+#[test]
+fn query_resumes_verify_the_prefix_ends_and_full_resumes_the_whole_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let path = ctx.roots.claude_projects.join("project/session.jsonl");
+    let record =
+        json!({"type":"user","sessionId":"long","message":"x".repeat(4000)}).to_string() + "\n";
+    let lines = usize::try_from(5 * PREFIX_CHUNK).unwrap() / record.len() + 1;
+    write(&path, &record.repeat(lines));
+    let source = source_for(&ctx, Agent::Claude).unwrap();
+    let mut raw = discover(source.as_ref(), &ctx).sessions.remove(0);
+    let (first, entries) = parse(source.as_ref(), &raw);
+    let state = append_state(&first);
+    assert_eq!(state.chunks.len(), 6);
+    let appended = json!({"type":"user","sessionId":"long","message":"resumed"}).to_string() + "\n";
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(appended.as_bytes())
+        .unwrap();
+    let cold = append_state(&parse(source.as_ref(), &raw).0);
+    let mut resumed = |check| {
+        raw.resume = Some(Resume {
+            state: state.clone(),
+            check,
+        });
+        collect(source.as_ref(), &raw)
+    };
+    for check in [PrefixCheck::Ends, PrefixCheck::Whole] {
+        let (parsed, tail) = resumed(check);
+        let spot_checked = check == PrefixCheck::Ends;
+        assert_eq!(
+            append_state(&parsed.unwrap()),
+            AppendState {
+                spot_checked,
+                ..cold.clone()
+            }
+        );
+        assert_eq!(
+            tail.iter()
+                .map(|e| (e.index, e.text.as_str()))
+                .collect::<Vec<_>>(),
+            [(entries.len() as u64, "resumed")]
+        );
+    }
+    assert!(!cold.spot_checked);
+    assert_eq!(cold.chunks[..5], state.chunks[..5]);
+    let rejected = |result: &Result<ParsedSession>| matches!(result, Err(Error::InvalidArgument(message)) if message == "append resume state no longer matches the source");
+    let original = fs::read(&path).unwrap();
+    for offset in [100, state.consumed - PREFIX_CHUNK + 100] {
+        rewrite_near(&path, offset);
+        assert!(rejected(&resumed(PrefixCheck::Ends).0), "{offset}");
+        fs::write(&path, &original).unwrap();
+    }
+    rewrite_near(&path, 2 * PREFIX_CHUNK + 100);
+    assert!(resumed(PrefixCheck::Ends).0.is_ok());
+    assert!(rejected(&resumed(PrefixCheck::Whole).0));
 }
 
 #[test]
@@ -745,7 +785,8 @@ fn torn_final_line_is_excluded_from_state_and_malformed_only_when_old() {
     let state = append_state(&parsed);
     assert_eq!(state.consumed, fixture.len() as u64);
     assert_eq!(state.malformed, 0);
-    age(&path);
+    let ctx = an_hour_later(&ctx, &path);
+    let source = source_for(&ctx, Agent::Claude).unwrap();
     let (parsed, _) = parse(source.as_ref(), raw);
     assert_eq!(
         parsed.diagnostics[0].message,

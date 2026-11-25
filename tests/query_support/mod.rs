@@ -1,35 +1,14 @@
+use crate::support::context_at;
 use serde_json::{Value, json};
 use slimetrail::*;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
 };
 
 pub(crate) fn context(base: &Path) -> Context {
-    Context {
-        roots: resolve_roots(
-            base,
-            &BTreeMap::from([
-                (
-                    "CODEX_HOME".into(),
-                    base.join("codex").to_string_lossy().into_owned(),
-                ),
-                (
-                    "XDG_DATA_HOME".into(),
-                    base.join("data").to_string_lossy().into_owned(),
-                ),
-            ]),
-        )
-        .unwrap(),
-        index_dir: base.join("index"),
-        cwd: "/fixture/project".into(),
-        now_ms: ts("2026-11-16T12:00:00Z"),
-        time_zone: "UTC".into(),
-        coverage: slimetrail::Coverage::Compact,
-        build: slimetrail::BuildPolicy::Inline,
-        progress: false,
-    }
+    context_at(base).now_ms(ts("2026-11-16T12:00:00Z")).build()
 }
 pub(crate) fn ts(text: &str) -> i64 {
     text.parse::<jiff::Timestamp>().unwrap().as_millisecond()

@@ -105,8 +105,42 @@ fn session_query(connection: &Connection) -> Result<String> {
     ))
 }
 
-fn subagent_heads(connection: &Connection) -> Result<Vec<(String, String, Value)>> {
-    let heads = columns(connection, "subagent_heads")?;
+struct Queries {
+    sessions: String,
+    heads: BTreeSet<String>,
+    nodes: String,
+}
+
+impl Queries {
+    fn new(connection: &Connection) -> Result<Self> {
+        Ok(Self {
+            sessions: session_query(connection)?,
+            heads: columns(connection, "subagent_heads")?,
+            nodes: node_select(connection)?,
+        })
+    }
+
+    fn header(&self) -> String {
+        format!("{} WHERE id=?", self.sessions)
+    }
+
+    fn head(&self) -> String {
+        format!(
+            "SELECT chain_node_id, {} FROM subagent_heads WHERE session_id=? AND agent_id=?",
+            optional(&self.heads, "updated_at"),
+        )
+    }
+
+    fn nodes_of(&self) -> String {
+        format!("{} WHERE session_id=? ORDER BY node_id", self.nodes)
+    }
+}
+
+fn subagent_heads(
+    connection: &Connection,
+    queries: &Queries,
+) -> Result<Vec<(String, String, Value)>> {
+    let heads = &queries.heads;
     if !["session_id", "agent_id", "chain_node_id"]
         .iter()
         .all(|name| heads.contains(*name))
@@ -116,7 +150,7 @@ fn subagent_heads(connection: &Connection) -> Result<Vec<(String, String, Value)
     Ok(connection
         .prepare(&format!(
             "SELECT session_id, agent_id, chain_node_id, {} FROM subagent_heads ORDER BY session_id, agent_id",
-            optional(&heads, "updated_at"),
+            optional(heads, "updated_at"),
         ))?
         .query_map([], |row| {
             Ok((
@@ -187,6 +221,10 @@ fn hash_row(hasher: &mut Sha256, tag: u8, row: &Row<'_>, count: usize) -> Result
     Ok(())
 }
 
+fn hash_node(hasher: &mut Sha256, row: &Row<'_>) -> Result<()> {
+    hash_row(hasher, b'n', row, row.as_ref().column_count() - 1)
+}
+
 fn hash_bytes(hasher: &mut Sha256, tag: u8, bytes: &[u8]) {
     hasher.update([tag]);
     hasher.update((bytes.len() as u64).to_le_bytes());
@@ -226,14 +264,21 @@ fn node_select(connection: &Connection) -> Result<String> {
     ))
 }
 
-fn node_digests(connection: &Connection) -> Result<BTreeMap<String, Vec<u8>>> {
-    let query = format!("{} ORDER BY session_id, node_id", node_select(connection)?);
+fn node_digests(
+    connection: &Connection,
+    queries: &Queries,
+    needed: &BTreeSet<&str>,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    let query = format!("{} ORDER BY session_id, node_id", queries.nodes);
     let mut statement = connection.prepare(&query)?;
     let mut rows = statement.query([])?;
     let mut digests = BTreeMap::new();
     let mut current: Option<(String, Sha256)> = None;
     while let Some(row) = rows.next()? {
-        let Some(session) = row.get::<_, Option<String>>(5)? else {
+        let Some(session) = row
+            .get::<_, Option<String>>(5)?
+            .filter(|session| needed.contains(session.as_str()))
+        else {
             continue;
         };
         if current.as_ref().is_none_or(|(id, _)| *id != session) {
@@ -243,7 +288,7 @@ fn node_digests(connection: &Connection) -> Result<BTreeMap<String, Vec<u8>>> {
             current = Some((session, Sha256::default()));
         }
         if let Some((_, hasher)) = current.as_mut() {
-            hash_row(hasher, b'n', row, row.as_ref().column_count() - 1)?;
+            hash_node(hasher, row)?;
         }
     }
     if let Some((id, hasher)) = current {
@@ -254,13 +299,14 @@ fn node_digests(connection: &Connection) -> Result<BTreeMap<String, Vec<u8>>> {
 
 fn content(
     connection: &Connection,
+    queries: &Queries,
     id: &str,
     digests: &BTreeMap<String, Vec<u8>>,
 ) -> Result<SourceState> {
     let (parent, agent) = split(id);
     let mut content = Content::default();
-    let header = load_header(connection, parent, &mut content)?;
-    chain_head(connection, parent, agent, &header, &mut content)?;
+    let header = load_header(connection, queries, parent, &mut content)?;
+    chain_head(connection, queries, parent, agent, &header, &mut content)?;
     let nodes = digests
         .get(parent)
         .cloned()
@@ -282,9 +328,9 @@ fn discovery(
     let (snapshot, _) = sqlite::snapshot_at(path, staging)?;
     let connection = sqlite::open(&snapshot)?;
     let transaction = connection.unchecked_transaction()?;
-    let query = session_query(&transaction)?;
+    let queries = Queries::new(&transaction)?;
     let rows = transaction
-        .prepare(&query)?
+        .prepare(&queries.sessions)?
         .query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -299,16 +345,11 @@ fn discovery(
         by_id.entry(id.as_str()).or_insert(row);
     }
     let nodes = aggregates(&transaction)?;
-    let digests = if previous.verify {
-        node_digests(&transaction)?
-    } else {
-        BTreeMap::new()
-    };
     let aggregate = |id: &str| nodes.get(id).cloned().unwrap_or(Value::Null);
     let parents = rows
         .iter()
         .map(|(id, row)| (id.clone(), json!(["session", row, aggregate(id)])));
-    let children = subagent_heads(&transaction)?
+    let children = subagent_heads(&transaction, &queries)?
         .into_iter()
         .filter_map(|(session, agent, head)| {
             let row = by_id.get(session.as_str())?;
@@ -318,41 +359,65 @@ fn discovery(
             ))
         })
         .collect::<Vec<_>>();
-    let mut sessions = Vec::new();
-    for (id, key) in parents.chain(children) {
-        if id.is_empty() {
-            return Err(crate::Error::InvalidArgument(
-                "Devin session has no identity".into(),
-            ));
-        }
-        let source = source_name(path, &id);
-        let fingerprint = Fingerprint {
-            signature: hex(Sha256::digest(serde_json::to_string(&key)?)),
-        };
-        let cached = previous.by_source.get(&source).filter(|cached| {
-            cached.key.agent == Agent::Devin
-                && cached.key.id == id
-                && cached.dependencies == dependencies
-                && cached.fingerprint == fingerprint
-        });
-        let reusable = cached.is_some_and(|cached| {
-            !previous.verify
-                || cached.state.as_ref().is_some_and(|state| {
-                    content(&transaction, &id, &digests).is_ok_and(|current| current == *state)
-                })
-        });
-        sessions.push(RawSession {
-            key: SessionKey {
-                agent: Agent::Devin,
-                id,
-            },
-            source,
-            dependencies: dependencies.clone(),
-            fingerprint,
-            snapshot: (!reusable).then(|| Arc::clone(&snapshot)),
-            resume: None,
-        });
-    }
+    let found = parents
+        .chain(children)
+        .map(|(id, key)| {
+            if id.is_empty() {
+                return Err(crate::Error::InvalidArgument(
+                    "Devin session has no identity".into(),
+                ));
+            }
+            let fingerprint = Fingerprint {
+                signature: hex(Sha256::digest(serde_json::to_string(&key)?)),
+                title_mark: None,
+            };
+            Ok((id, fingerprint))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let cached = |id: &str, fingerprint: &Fingerprint| {
+        previous
+            .by_source
+            .get(&source_name(path, id))
+            .filter(|cached| {
+                cached.key.agent == Agent::Devin
+                    && cached.key.id == id
+                    && cached.dependencies == dependencies
+                    && cached.fingerprint == *fingerprint
+            })
+    };
+    let needed: BTreeSet<&str> = found
+        .iter()
+        .filter(|(id, fingerprint)| previous.verify && cached(id, fingerprint).is_some())
+        .map(|(id, _)| split(id).0)
+        .collect();
+    let digests = if needed.is_empty() {
+        BTreeMap::new()
+    } else {
+        node_digests(&transaction, &queries, &needed)?
+    };
+    let sessions = found
+        .iter()
+        .map(|(id, fingerprint)| {
+            let reusable = cached(id, fingerprint).is_some_and(|cached| {
+                !previous.verify
+                    || cached.state.as_ref().is_some_and(|state| {
+                        content(&transaction, &queries, id, &digests)
+                            .is_ok_and(|current| current == *state)
+                    })
+            });
+            RawSession {
+                key: SessionKey {
+                    agent: Agent::Devin,
+                    id: id.clone(),
+                },
+                source: source_name(path, id),
+                dependencies: dependencies.clone(),
+                fingerprint: fingerprint.clone(),
+                snapshot: (!reusable).then(|| Arc::clone(&snapshot)),
+                resume: None,
+            }
+        })
+        .collect();
     Ok(sessions)
 }
 
@@ -362,23 +427,15 @@ fn seconds(value: Option<i64>) -> Option<Timestamp> {
 
 fn node_rows(
     connection: &Connection,
+    queries: &Queries,
     session: &str,
     content: &mut Content,
     mut visit: impl FnMut(&Row<'_>) -> Result<()>,
 ) -> Result<()> {
-    let query = format!(
-        "{} WHERE session_id=? ORDER BY node_id",
-        node_select(connection)?
-    );
-    let mut statement = connection.prepare(&query)?;
+    let mut statement = connection.prepare_cached(&queries.nodes_of())?;
     let mut rows = statement.query([session])?;
     while let Some(row) = rows.next()? {
-        hash_row(
-            &mut content.nodes,
-            b'n',
-            row,
-            row.as_ref().column_count() - 1,
-        )?;
+        hash_node(&mut content.nodes, row)?;
         visit(row)?;
     }
     Ok(())
@@ -386,12 +443,13 @@ fn node_rows(
 
 fn load_nodes(
     connection: &Connection,
+    queries: &Queries,
     session: &str,
     content: &mut Content,
 ) -> Result<(BTreeMap<i64, Node>, u64)> {
     let mut nodes = BTreeMap::new();
     let mut malformed = 0;
-    node_rows(connection, session, content, |row| {
+    node_rows(connection, queries, session, content, |row| {
         let message = row
             .get::<_, Option<String>>(2)?
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
@@ -484,6 +542,7 @@ struct Item {
     subtype: Option<&'static str>,
     tool_name: Option<String>,
     automated: bool,
+    searchable: Searchable,
     text: String,
 }
 
@@ -494,6 +553,7 @@ const fn item(role: &'static str, kind: Kind, subtype: Option<&'static str>, tex
         subtype,
         tool_name: None,
         automated: false,
+        searchable: Searchable::Text,
         text,
     }
 }
@@ -541,14 +601,21 @@ fn items(message: &Value) -> Vec<Item> {
             }))
             .collect()
         }
-        "tool" => vec![item("tool", Kind::Tool, Some("tool_result"), content)],
+        "tool" => vec![Item {
+            searchable: Searchable::ToolResult,
+            ..item("tool", Kind::Tool, Some("tool_result"), content)
+        }],
         _ => Vec::new(),
     }
 }
 
-fn load_header(connection: &Connection, id: &str, content: &mut Content) -> Result<Header> {
-    let query = format!("{} WHERE id=?", session_query(connection)?);
-    let mut statement = connection.prepare(&query)?;
+fn load_header(
+    connection: &Connection,
+    queries: &Queries,
+    id: &str,
+    content: &mut Content,
+) -> Result<Header> {
+    let mut statement = connection.prepare_cached(&queries.header())?;
     let mut rows = statement.query([id])?;
     let row = rows.next()?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
     content.row(b'h', row)?;
@@ -568,6 +635,7 @@ fn load_header(connection: &Connection, id: &str, content: &mut Content) -> Resu
 
 fn chain_head(
     connection: &Connection,
+    queries: &Queries,
     session: &str,
     agent: Option<&str>,
     header: &Header,
@@ -576,12 +644,7 @@ fn chain_head(
     let Some(agent) = agent else {
         return Ok((header.main_chain_id, seconds(header.last_activity_at)));
     };
-    let heads = columns(connection, "subagent_heads")?;
-    let query = format!(
-        "SELECT chain_node_id, {} FROM subagent_heads WHERE session_id=? AND agent_id=?",
-        optional(&heads, "updated_at"),
-    );
-    let mut statement = connection.prepare(&query)?;
+    let mut statement = connection.prepare_cached(&queries.head())?;
     let mut rows = statement.query([session, agent])?;
     let row = rows
         .next()?
@@ -603,23 +666,20 @@ impl Source for Devin {
         discovery(ctx, previous, self.staging.as_deref()).map_or_else(
             |_| {
                 Ok(Discovery {
-                    sessions: Vec::new(),
-                    complete_agents: BTreeSet::new(),
-                    warnings: Vec::new(),
                     diagnostics: vec![diagnostic(
                         Agent::Devin,
                         &ctx.roots.devin_sessions_db,
                         "source_unavailable",
                         "Devin sessions database could not be read consistently or has an unsupported schema",
                     )],
+                    ..Discovery::default()
                 })
             },
             |sessions| {
                 Ok(Discovery {
                     sessions,
-                    diagnostics: Vec::new(),
-                    warnings: Vec::new(),
                     complete_agents: BTreeSet::from([Agent::Devin]),
+                    ..Discovery::default()
                 })
             },
         )
@@ -633,12 +693,19 @@ impl Source for Devin {
         let snapshot = self.snapshot_for(raw)?;
         let connection = sqlite::open(&snapshot)?;
         let transaction = connection.unchecked_transaction()?;
+        let queries = Queries::new(&transaction)?;
         let (parent_id, agent_id) = split(&raw.key.id);
         let mut content = Content::default();
-        let header = load_header(&transaction, parent_id, &mut content)?;
-        let (head, freshness) =
-            chain_head(&transaction, parent_id, agent_id, &header, &mut content)?;
-        let (nodes, mut malformed) = load_nodes(&transaction, parent_id, &mut content)?;
+        let header = load_header(&transaction, &queries, parent_id, &mut content)?;
+        let (head, freshness) = chain_head(
+            &transaction,
+            &queries,
+            parent_id,
+            agent_id,
+            &header,
+            &mut content,
+        )?;
+        let (nodes, mut malformed) = load_nodes(&transaction, &queries, parent_id, &mut content)?;
         let mut order = Vec::new();
         let complete_chain =
             head.is_none_or(|head| expand(&nodes, head, &mut BTreeSet::new(), &mut order));
@@ -691,11 +758,7 @@ impl Source for Devin {
                     subtype: item.subtype.map(Into::into),
                     tool_name: item.tool_name,
                     automated: item.automated || session.parent.is_some(),
-                    searchable: if item.subtype == Some("tool_result") {
-                        Searchable::ToolResult
-                    } else {
-                        Searchable::Text
-                    },
+                    searchable: item.searchable,
                     text: item.text,
                 })?;
                 index += 1;

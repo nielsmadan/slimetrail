@@ -151,6 +151,21 @@ mod tests {
     }
 
     #[test]
+    fn load_names_the_file_when_it_is_not_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        fs::write(&file, b"coverage = \"\xff\"\n").unwrap();
+        let message = load(&file).unwrap_err().to_string();
+        assert_eq!(
+            message,
+            format!(
+                "invalid argument: invalid config file {}: not UTF-8",
+                file.display()
+            )
+        );
+    }
+
+    #[test]
     fn write_coverage_follows_symlinks_keeps_mode_and_defaults_to_0644() {
         use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();

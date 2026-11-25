@@ -101,12 +101,16 @@ grep -rni "six\b\|all six" README.md docs src tests
 
 Touchpoints, all of which a new agent needs:
 - `src/model.rs`: `Agent` variant; `Roots` field(s) for every store path.
-- `src/dto.rs`: `Display` and `FromStr`.
+- `src/dto.rs`: `Agent::as_str` (which `Display` uses) and `FromStr`.
 - `src/roots.rs`: root precedence exactly matching the harness's own env overrides.
 - `src/sources/AGENT.rs` plus `registry` and `registry_in` in `src/sources/mod.rs`.
-  - JSONL store close to an existing one: add `Agent` arms in `src/sources/jsonl.rs` (`discover` root, `header`, `update_metadata`, `normalize`), as Droid and Pi do.
-  - JSONL/JSON with a different shape: a dedicated module (Cursor precedent).
+  - JSONL store close to an existing one: add `Agent` arms in `src/sources/jsonl.rs` (`discover` root, `header_record`, `update_metadata`, `normalize`, and `archive_kind` if ringleader can archive it), as Droid and Pi do, and delegate `Source::transcript` and `Source::drifted` to `jsonl::transcript` and `jsonl::drifted` so the live file is checked for stability and grown transcripts resume. Shared line scanning is in `src/sources/jsonl/scan.rs`; Codex's title index is in `src/sources/jsonl/titles.rs`.
+  - JSONL/JSON with a different shape: a dedicated module (Cursor precedent), implementing `transcript` and `drifted` when it reads a live file.
   - SQLite: snapshot through `src/sources/sqlite.rs`, never the original, with `with_staging` (OpenCode precedent).
+- Search-kind classification: set `Entry.searchable` to `Searchable::ToolResult` on entries that hold only tool output (compact coverage searches just their last 2 KB) and `Searchable::Duplicate` on text that repeats another entry; reasoning is `Kind::Meta` with subtype `reasoning`, which compact does not search. JSONL readers get this from the helpers in `jsonl.rs` (`tool_result_block`, `codex_tool_output`, `tool_result_role`) when the record shape matches; extend them or set the field in the reader (Devin precedent). An entry combining a call and its output stays `Text`.
+- Reader contract: set `ParsedSession.recheck` when a diagnostic or value depends on anything outside the session's fingerprinted dependencies (a final line still being written, an unreadable companion file). Without it, an unchanged partial source is reused with its old diagnostics and never reread.
+- `src/index/estimate.rs`: a `calibration` arm with default bytes per millisecond and index-to-source ratio for compact and full. The match is exhaustive, so the build fails without it. Measure them with the benchmark's `--per-agent` mode on the user's store, or borrow the closest existing agent's values and record that in the notes.
+- `scripts/benchmark.py`: `AGENTS`, `roots()` (mirroring `src/roots.rs`) and a synthetic writer in `synthetic()` with reasoning, tool calls and tool results in the agent's record shape, plus a case in `scripts/test_benchmark_generator.py`.
 - `src/api.rs`: `selected()` default set.
 - `src/index/lock.rs`: a root that is a file (a database or index file) joins the file-root list in the index-overlap check. Grep for the template's root field name (e.g. `opencode_db`), not only its `Agent::` variant, to find this and the tests that enumerate root fields.
 - `src/timeline.rs`: `excluded_child` decides whether the new agent's child sessions are dropped from timeline spans.
@@ -114,7 +118,7 @@ Touchpoints, all of which a new agent needs:
 - `src/index/schema.rs`: decide whether parser changes require an index version bump (see architecture.md "Index storage and search"). Agents are stored by name, so a new `Agent` variant can go in alphabetical order; a new `Roots` field changes the namespace hash, which isolates old cached rows without a bump.
 - Tests: every `for agent in [...]` list and root-default assertion the grep found; a synthetic `tests/fixtures/jsonl/AGENT.jsonl` (or database fixture) built from the observed skeleton; a golden; a test per probe feature (child session, fork, compaction, automation, title precedence, malformed record, missing store → incomplete).
 - Goldens: the fixture generators derive goldens from the check-agent-logs reference reader, which has no reader for a new agent. Hand-write the new golden, review it entry by entry against the mapping, and keep the new agent out of `six.golden.json`'s generator unless the user also adds it to the reference reader. Record this in `docs/compatibility.md`.
-- Docs: README intro list, selector text, store root table; `docs/compatibility.md` supported-stores row and boundaries; `docs/json-protocol.md` agent values; any architecture or timeline rule the mapping introduced (e.g. child-session timeline exclusion).
+- Docs: README intro list, selector text, store root table; `docs/compatibility.md` supported-stores row and boundaries, and its compact-coverage list of what counts as a tool result; `docs/json-protocol.md` agent values; `docs/performance.md` if the calibration came from a new measurement; any architecture or timeline rule the mapping introduced (e.g. child-session timeline exclusion).
 
 ### Step 8: Verify
 
@@ -123,11 +127,12 @@ Touchpoints, all of which a new agent needs:
    ```bash
    timeout 900 just build
    mkdir -m 700 -p .local/smoke-index
+   ./target/release/slimetrail index --AGENT --index-dir .local/smoke-index --format json > "$NOTES/smoke-index.json"; echo "exit $?"
    ./target/release/slimetrail sessions --AGENT --scope all --index-dir .local/smoke-index --format json > "$NOTES/smoke-sessions.json"; echo "exit $?"
    ./target/release/slimetrail search SLIMEPROBE --AGENT --scope all --index-dir .local/smoke-index
    ```
-   Exit must be 0 (1 means incomplete — read the diagnostics). Every probe marker must be found in the expected session, `read AGENT:ID --mode log` of each probe session must show the features from the notes, subagent/injected content must be automated, and a timeline over the probe window must give plausible spans.
-3. Confirm the other readers still refresh: run `index` with the new agent plus a fast subset (e.g. `--pi --opencode`) against the same throwaway index, on the release build. Do not cold-index `--all` on the real corpus — `docs/performance.md` records that it exceeds 900 seconds.
+   Build with `index` first: a query in JSON mode builds inline only what its estimate says fits in 20 s, so on a larger store it exits 1 with `index_required` instead of indexing. Every exit must be 0 (1 means incomplete — read the diagnostics). Every probe marker must be found in the expected session, `read AGENT:ID --mode log` of each probe session must show the features from the notes, subagent/injected content must be automated, and a timeline over the probe window must give plausible spans.
+3. Confirm the other readers still refresh: run `index` with the new agent plus a fast subset (e.g. `--pi --opencode`) against the same throwaway index, on the release build. Do not cold-index `--all` on the real corpus: `docs/performance.md` records per-agent cold builds of one large corpus summing to about 12 minutes compact and 32 minutes full, and the older v2 all-agent build timing out at 900 seconds.
 4. Prove the key tests bite: mutate the reader (disable compaction recovery, disable de-duplication, drop the automation flag), confirm with grep that each edit landed, and check that a test fails for each; restore the file.
 5. Remove `.local/smoke-index`. Leave `$NOTES` for the user, and list the probe sessions left in the harness's store.
 

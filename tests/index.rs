@@ -1,42 +1,24 @@
+#[allow(dead_code)]
+mod support;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::json;
 use slimetrail::{
-    index::{self, DATABASE, IndexSession, VERSION},
+    index::{DATABASE, IndexSession},
+    sources::{AppendState, SourceState},
     *,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs,
     io::Write,
     os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
+    time::Duration,
 };
+use support::{an_hour_later, context_at};
 
 fn context(base: &Path) -> Context {
-    Context {
-        roots: resolve_roots(
-            base,
-            &BTreeMap::from([
-                (
-                    "CODEX_HOME".into(),
-                    base.join("codex").to_string_lossy().into_owned(),
-                ),
-                (
-                    "XDG_DATA_HOME".into(),
-                    base.join("data").to_string_lossy().into_owned(),
-                ),
-            ]),
-        )
-        .unwrap(),
-        index_dir: base.join("index"),
-        cwd: base.into(),
-        now_ms: 0,
-        time_zone: "UTC".into(),
-        coverage: slimetrail::Coverage::Compact,
-        build: slimetrail::BuildPolicy::Inline,
-        progress: false,
-    }
+    context_at(base).cwd(base).build()
 }
 
 fn write(path: &Path, contents: &str) {
@@ -57,15 +39,6 @@ fn claude(ctx: &Context, id: &str, text: &str) -> PathBuf {
         ),
     );
     path
-}
-
-fn age(path: &Path) {
-    fs::File::options()
-        .append(true)
-        .open(path)
-        .unwrap()
-        .set_modified(SystemTime::now() - Duration::from_secs(3600))
-        .unwrap();
 }
 
 fn selected(agent: Agent) -> BTreeSet<Agent> {
@@ -95,22 +68,57 @@ fn unchanged_touch_and_removal_are_incremental() {
     let first = claude(&ctx, "one", "old content");
     claude(&ctx, "two", "other content");
     let agents = selected(Agent::Claude);
-    let first_run = index::refresh(&ctx, &agents, false).unwrap();
+    let first_run = refresh(&ctx, &agents, &RefreshOptions::QUERY).unwrap();
     assert!(!first_run.incomplete);
     assert_eq!(first_run.data.unwrap().reparsed, 2);
-    let unchanged = index::refresh(&ctx, &agents, false).unwrap().data.unwrap();
+    let unchanged = refresh(&ctx, &agents, &RefreshOptions::QUERY)
+        .unwrap()
+        .data
+        .unwrap();
     assert_eq!((unchanged.reparsed, unchanged.reused), (0, 2));
     claude(&ctx, "one", "replacement content");
     let mut lease = IndexSession::open(&ctx).unwrap();
-    let changed = lease.refresh_under_lease(&agents).unwrap().data.unwrap();
+    let changed = lease
+        .refresh(&agents, &RefreshOptions::QUERY)
+        .unwrap()
+        .data
+        .unwrap();
     assert_eq!((changed.reparsed, changed.reused), (1, 1));
     assert_eq!(texts(&lease, &key("one")), ["replacement content"]);
     lease.verify_integrity().unwrap();
     fs::remove_file(first).unwrap();
-    let removed = lease.refresh_under_lease(&agents).unwrap().data.unwrap();
+    let removed = lease
+        .refresh(&agents, &RefreshOptions::QUERY)
+        .unwrap()
+        .data
+        .unwrap();
     assert_eq!(removed.removed, 1);
     assert!(lease.session(&key("one")).unwrap().is_none());
     lease.verify_integrity().unwrap();
+}
+
+#[test]
+fn removed_transcript_text_does_not_linger_in_the_index_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let marker = "quokka-sentinel-transcript-text";
+    let gone = claude(&ctx, "gone", &marker.repeat(400));
+    claude(&ctx, "kept", "ordinary content");
+    let agents = selected(Agent::Claude);
+    refresh(&ctx, &agents, &RefreshOptions::QUERY).unwrap();
+    fs::remove_file(gone).unwrap();
+    let removed = refresh(&ctx, &agents, &RefreshOptions::QUERY).unwrap();
+    assert_eq!(removed.data.unwrap().removed, 1);
+    let stored: Vec<u8> = ["", "-wal"]
+        .iter()
+        .filter_map(|suffix| fs::read(ctx.index_dir.join(format!("{DATABASE}{suffix}"))).ok())
+        .flatten()
+        .collect();
+    assert!(
+        !stored
+            .windows(marker.len())
+            .any(|window| window == marker.as_bytes())
+    );
 }
 
 #[test]
@@ -120,14 +128,30 @@ fn stable_partial_records_remain_incomplete_until_corrected() {
     let path = claude(&ctx, "one", "good record");
     let good = fs::read_to_string(&path).unwrap();
     write(&path, &format!("{good}{{\"type\":"));
-    age(&path);
+    let ctx = an_hour_later(&ctx, &path);
     let mut lease = IndexSession::open(&ctx).unwrap();
+    let mut replayed = Vec::new();
     for _ in 0..2 {
-        let result = lease.refresh_under_lease(&selected(Agent::Claude)).unwrap();
+        let result = lease
+            .refresh(&selected(Agent::Claude), &RefreshOptions::QUERY)
+            .unwrap();
         assert!(result.incomplete);
-        assert_eq!(result.data.unwrap().reparsed, 1);
+        let stats = result.data.as_ref().unwrap();
+        replayed.push((
+            (stats.reparsed, stats.reused, stats.failed),
+            result.diagnostics,
+        ));
         assert_eq!(texts(&lease, &key("one")), ["good record"]);
     }
+    assert_eq!(
+        replayed.iter().map(|(stats, _)| *stats).collect::<Vec<_>>(),
+        [(1, 0, 1), (0, 1, 1)]
+    );
+    assert_eq!(replayed[1].1, replayed[0].1);
+    assert_eq!(
+        replayed[1].1[0].message,
+        "1 nonempty records were not valid JSON objects"
+    );
     write(
         &path,
         &format!(
@@ -137,7 +161,7 @@ fn stable_partial_records_remain_incomplete_until_corrected() {
     );
     assert!(
         !lease
-            .refresh_under_lease(&selected(Agent::Claude))
+            .refresh(&selected(Agent::Claude), &RefreshOptions::QUERY)
             .unwrap()
             .incomplete
     );
@@ -153,11 +177,13 @@ fn unavailable_inventory_keeps_old_rows_visible_and_incomplete() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     claude(&ctx, "one", "prior text");
-    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
+    refresh(&ctx, &selected(Agent::Claude), &RefreshOptions::QUERY).unwrap();
     let moved = dir.path().join("temporarily-moved");
     fs::rename(&ctx.roots.claude_projects, &moved).unwrap();
     let mut lease = IndexSession::open(&ctx).unwrap();
-    let result = lease.refresh_under_lease(&selected(Agent::Claude)).unwrap();
+    let result = lease
+        .refresh(&selected(Agent::Claude), &RefreshOptions::QUERY)
+        .unwrap();
     assert!(result.incomplete);
     assert_eq!(result.data.unwrap().removed, 0);
     assert_eq!(texts(&lease, &key("one")), ["prior text"]);
@@ -173,7 +199,7 @@ fn unavailable_inventory_keeps_old_rows_visible_and_incomplete() {
     let mut lease = IndexSession::open(&ctx).unwrap();
     assert!(
         !lease
-            .refresh_under_lease(&selected(Agent::Claude))
+            .refresh(&selected(Agent::Claude), &RefreshOptions::QUERY)
             .unwrap()
             .incomplete
     );
@@ -185,7 +211,7 @@ fn replacement_changes_identity_and_truncation_replaces_all_entries() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     let path = claude(&ctx, "one", "first");
-    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
+    refresh(&ctx, &selected(Agent::Claude), &RefreshOptions::QUERY).unwrap();
     let other = dir.path().join("replacement");
     write(
         &other,
@@ -196,11 +222,15 @@ fn replacement_changes_identity_and_truncation_replaces_all_entries() {
     );
     fs::rename(other, &path).unwrap();
     let mut lease = IndexSession::open(&ctx).unwrap();
-    lease.refresh_under_lease(&selected(Agent::Claude)).unwrap();
+    lease
+        .refresh(&selected(Agent::Claude), &RefreshOptions::QUERY)
+        .unwrap();
     assert!(lease.session(&key("one")).unwrap().is_none());
     assert_eq!(texts(&lease, &key("new")), ["second"]);
     write(&path, "");
-    lease.refresh_under_lease(&selected(Agent::Claude)).unwrap();
+    lease
+        .refresh(&selected(Agent::Claude), &RefreshOptions::QUERY)
+        .unwrap();
     assert!(lease.session(&key("new")).unwrap().is_none());
     assert_eq!(texts(&lease, &key("one")), [] as [std::string::String; 0]);
     lease.verify_integrity().unwrap();
@@ -241,14 +271,14 @@ fn root_and_agent_changes_cannot_reuse_or_delete_other_rows() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     claude(&ctx, "one", "first root");
-    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
+    refresh(&ctx, &selected(Agent::Claude), &RefreshOptions::QUERY).unwrap();
     let mut other = ctx.clone();
     other.roots.claude_projects = dir.path().join("second-root");
     claude(&other, "one", "second root");
     let mut lease = IndexSession::open(&other).unwrap();
     assert_eq!(
         lease
-            .refresh_under_lease(&selected(Agent::Claude))
+            .refresh(&selected(Agent::Claude), &RefreshOptions::QUERY)
             .unwrap()
             .data
             .unwrap()
@@ -257,9 +287,11 @@ fn root_and_agent_changes_cannot_reuse_or_delete_other_rows() {
     );
     assert_eq!(texts(&lease, &key("one")), ["second root"]);
     drop(lease);
-    index::refresh(&ctx, &selected(Agent::Pi), false).unwrap();
+    refresh(&ctx, &selected(Agent::Pi), &RefreshOptions::QUERY).unwrap();
     let mut lease = IndexSession::open(&ctx).unwrap();
-    lease.refresh_under_lease(&selected(Agent::Claude)).unwrap();
+    lease
+        .refresh(&selected(Agent::Claude), &RefreshOptions::QUERY)
+        .unwrap();
     assert_eq!(texts(&lease, &key("one")), ["first root"]);
 }
 
@@ -294,11 +326,96 @@ fn permissions_symlinks_and_native_overlap_are_rejected_before_writes() {
     assert_eq!(fs::read_to_string(target).unwrap(), "sentinel");
 }
 
+fn private_file(path: &Path, contents: &str) {
+    fs::write(path, contents).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+const OLDER: [&str; 3] = [
+    "index-v2.sqlite3",
+    "index-v2.sqlite3-wal",
+    "index-v2.sqlite3-shm",
+];
+
+fn older_present(ctx: &Context) -> Vec<bool> {
+    OLDER
+        .iter()
+        .map(|name| ctx.index_dir.join(name).exists())
+        .collect()
+}
+
+#[test]
+fn older_index_is_kept_until_this_version_publishes_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    claude(&ctx, "one", "first text");
+    drop(IndexSession::open(&ctx).unwrap());
+    for name in OLDER {
+        private_file(&ctx.index_dir.join(name), "sentinel");
+    }
+    let gated = RefreshOptions {
+        build: BuildPolicy::Limit {
+            max_ms: 0,
+            admission: Admission::PerAgent,
+        },
+        ..RefreshOptions::QUERY
+    };
+    let skipped = refresh(&ctx, &selected(Agent::Claude), &gated).unwrap();
+    assert_eq!(codes(&skipped), ["index_required"]);
+    assert!(ctx.index_dir.join(DATABASE).exists());
+    drop(IndexSession::open(&ctx).unwrap());
+    assert_eq!(older_present(&ctx), [true, true, true]);
+    refresh(&ctx, &selected(Agent::Claude), &RefreshOptions::QUERY).unwrap();
+    drop(IndexSession::open(&ctx).unwrap());
+    assert_eq!(older_present(&ctx), [false, false, false]);
+}
+
+fn outdated_layout(ctx: &Context) {
+    let db = Connection::open(ctx.index_dir.join(DATABASE)).unwrap();
+    db.execute_batch("CREATE TABLE settings(id INTEGER PRIMARY KEY); PRAGMA user_version=3;")
+        .unwrap();
+    drop(db);
+    fs::set_permissions(
+        ctx.index_dir.join(DATABASE),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+}
+
+#[test]
+fn an_index_with_an_outdated_layout_is_rebuilt_once_no_other_process_holds_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    claude(&ctx, "one", "first text");
+    drop(IndexSession::open(&ctx).unwrap());
+    private_file(&ctx.index_dir.join(OLDER[0]), "sentinel");
+    outdated_layout(&ctx);
+    let held = fs::File::open(ctx.index_dir.join("lifecycle.lock")).unwrap();
+    held.lock_shared().unwrap();
+    let Err(Error::InvalidArgument(message)) = IndexSession::open(&ctx) else {
+        panic!("an outdated layout must not be read");
+    };
+    assert_eq!(
+        message,
+        "index layout is outdated; it is rebuilt once no other slimetrail process has it open"
+    );
+    drop(held);
+    let mut lease = IndexSession::open(&ctx).unwrap();
+    assert!(!ctx.index_dir.join(DATABASE).exists());
+    assert_eq!(older_present(&ctx), [true, false, false]);
+    let result = lease
+        .refresh(&selected(Agent::Claude), &RefreshOptions::QUERY)
+        .unwrap();
+    assert_eq!(codes(&result), [] as [&str; 0]);
+    assert_eq!(texts(&lease, &key("one")), ["first text"]);
+}
+
 #[test]
 fn private_modes_and_exact_older_version_pruning() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
-    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
+    claude(&ctx, "one", "first text");
+    refresh(&ctx, &selected(Agent::Claude), &RefreshOptions::QUERY).unwrap();
     let older = [
         "index-v0.sqlite3",
         "index-v0.sqlite3-wal",
@@ -349,10 +466,9 @@ fn private_modes_and_exact_older_version_pruning() {
 fn new_index_is_v3_in_wal_mode_with_incremental_auto_vacuum() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
-    assert_eq!((VERSION, DATABASE), (3, "index-v3.sqlite3"));
     drop(IndexSession::open(&ctx).unwrap());
     assert!(!ctx.index_dir.join(DATABASE).exists());
-    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
+    refresh(&ctx, &selected(Agent::Claude), &RefreshOptions::QUERY).unwrap();
     let db = Connection::open(ctx.index_dir.join(DATABASE)).unwrap();
     let mode: String = db
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
@@ -392,26 +508,18 @@ fn legacy_staging_is_removed_only_when_no_other_session_is_open() {
 }
 
 #[test]
-fn query_after_another_sessions_refresh_reuses_its_published_runs() {
+fn repeated_query_after_another_sessions_refresh_sees_later_transcripts() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     claude(&ctx, "one", "first text");
     let agents = selected(Agent::Claude);
-    index::refresh(&ctx, &agents, false).unwrap();
-    let mut waiting = IndexSession::open(&ctx).unwrap();
+    let mut session = IndexSession::open(&ctx).unwrap();
+    session.refresh(&agents, &RefreshOptions::QUERY).unwrap();
+    refresh(&ctx, &agents, &RefreshOptions::QUERY).unwrap();
     claude(&ctx, "two", "second text");
-    let mut other = IndexSession::open(&ctx).unwrap();
-    let refreshed = other.refresh_under_lease(&agents).unwrap();
-    assert_eq!(refreshed.data.unwrap().reparsed, 1);
-    let coalesced = waiting.refresh_for_query(&agents).unwrap();
-    assert!(!coalesced.incomplete);
-    assert_eq!(coalesced.data.unwrap().discovered, 0);
-    assert_eq!(texts(&waiting, &key("two")), ["second text"]);
-    claude(&ctx, "three", "third text");
-    let mut fresh = IndexSession::open(&ctx).unwrap();
-    let normal = fresh.refresh_for_query(&agents).unwrap().data.unwrap();
-    assert_eq!((normal.discovered, normal.reparsed), (3, 1));
-    assert_eq!(texts(&fresh, &key("three")), ["third text"]);
+    let repeated = session.refresh(&agents, &RefreshOptions::QUERY).unwrap();
+    assert!(!repeated.incomplete, "{:?}", repeated.diagnostics);
+    assert_eq!(texts(&session, &key("two")), ["second text"]);
 }
 
 #[test]
@@ -429,7 +537,9 @@ fn fts_documents_keep_original_text_and_native_titles_with_fallbacks() {
     );
     claude(&ctx, "derived", "derived prompt");
     let mut lease = IndexSession::open(&ctx).unwrap();
-    lease.refresh_under_lease(&selected(Agent::Claude)).unwrap();
+    lease
+        .refresh(&selected(Agent::Claude), &RefreshOptions::QUERY)
+        .unwrap();
     let mut docs = Vec::new();
     lease
         .visit_documents(&key("one"), Some(("unlikely", false)), &mut |doc| {
@@ -476,7 +586,7 @@ fn database_wal_changes_and_partial_cache_preserve_full_inventory() {
     writer.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE session(id TEXT,directory TEXT,title TEXT,time_created INTEGER,time_updated INTEGER); CREATE TABLE message(id TEXT,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT,message_id TEXT,time_created INTEGER,data TEXT); INSERT INTO session VALUES('one','/fixture','Title',1,2),('two','/fixture','Other',1,2); INSERT INTO message VALUES('m','one',1,'{\"role\":\"user\"}'); INSERT INTO part VALUES('p','m',1,'{\"type\":\"text\",\"text\":\"first\"}');").unwrap();
     let agents = selected(Agent::Opencode);
     assert_eq!(
-        index::refresh(&ctx, &agents, false)
+        refresh(&ctx, &agents, &RefreshOptions::QUERY)
             .unwrap()
             .data
             .unwrap()
@@ -484,7 +594,7 @@ fn database_wal_changes_and_partial_cache_preserve_full_inventory() {
         2
     );
     assert_eq!(
-        index::refresh(&ctx, &agents, false)
+        refresh(&ctx, &agents, &RefreshOptions::QUERY)
             .unwrap()
             .data
             .unwrap()
@@ -495,7 +605,7 @@ fn database_wal_changes_and_partial_cache_preserve_full_inventory() {
     db.execute_batch("PRAGMA foreign_keys=ON; DELETE FROM sources WHERE id='two';")
         .unwrap();
     drop(db);
-    let recovered = index::refresh(&ctx, &agents, false).unwrap();
+    let recovered = refresh(&ctx, &agents, &RefreshOptions::QUERY).unwrap();
     assert!(!recovered.incomplete);
     assert_eq!(
         (
@@ -513,7 +623,7 @@ fn database_wal_changes_and_partial_cache_preserve_full_inventory() {
     let mut lease = IndexSession::open(&ctx).unwrap();
     assert_eq!(
         lease
-            .refresh_under_lease(&agents)
+            .refresh(&agents, &RefreshOptions::QUERY)
             .unwrap()
             .data
             .unwrap()
@@ -560,7 +670,9 @@ fn global_document_stream_is_ordered_and_scoped_to_refreshed_agents() {
     claude(&ctx, "a-first", "needle first");
     let mut lease = IndexSession::open(&ctx).unwrap();
     assert!(lease.visit_search_documents(None, &mut |_| Ok(())).is_err());
-    lease.refresh_under_lease(&selected(Agent::Claude)).unwrap();
+    lease
+        .refresh(&selected(Agent::Claude), &RefreshOptions::QUERY)
+        .unwrap();
     let mut found = Vec::new();
     lease
         .visit_search_documents(Some(("NEEDLE", false)), &mut |doc| {
@@ -577,7 +689,9 @@ fn global_document_stream_is_ordered_and_scoped_to_refreshed_agents() {
     );
     drop(lease);
     let mut lease = IndexSession::open(&ctx).unwrap();
-    lease.refresh_under_lease(&selected(Agent::Pi)).unwrap();
+    lease
+        .refresh(&selected(Agent::Pi), &RefreshOptions::QUERY)
+        .unwrap();
     let mut count = 0;
     lease
         .visit_search_documents(None, &mut |_| {
@@ -593,7 +707,7 @@ fn foreign_keys_reject_cross_namespace_and_cross_source_links() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     claude(&ctx, "one", "content");
-    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
+    refresh(&ctx, &selected(Agent::Claude), &RefreshOptions::QUERY).unwrap();
     let db = Connection::open(ctx.index_dir.join(DATABASE)).unwrap();
     db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
     for column in ["namespace", "source"] {
@@ -612,6 +726,8 @@ fn foreign_keys_reject_cross_namespace_and_cross_source_links() {
             "tool_name",
             "automated",
             "searchable",
+            "tail_start",
+            "text_tail",
             "text",
         ];
         let select = columns
@@ -648,7 +764,7 @@ fn codex_native_title_dependency_invalidates_unchanged_transcript() {
         "{\"id\":\"one\",\"thread_name\":\"First title\"}\n",
     );
     let agents = selected(Agent::Codex);
-    index::refresh(&ctx, &agents, false).unwrap();
+    refresh(&ctx, &agents, &RefreshOptions::QUERY).unwrap();
     write(
         &ctx.roots.codex_session_index,
         "{\"id\":\"one\",\"thread_name\":\"Later title\"}\n",
@@ -656,7 +772,7 @@ fn codex_native_title_dependency_invalidates_unchanged_transcript() {
     let mut lease = IndexSession::open(&ctx).unwrap();
     assert_eq!(
         lease
-            .refresh_under_lease(&agents)
+            .refresh(&agents, &RefreshOptions::QUERY)
             .unwrap()
             .data
             .unwrap()
@@ -679,12 +795,14 @@ fn namespace_canonicalization_does_not_bypass_reader_symlink_guards() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     let path = claude(&ctx, "one", "original");
-    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
+    refresh(&ctx, &selected(Agent::Claude), &RefreshOptions::QUERY).unwrap();
     let moved = dir.path().join("other-store");
     fs::rename(&ctx.roots.claude_projects, &moved).unwrap();
     symlink(&moved, &ctx.roots.claude_projects).unwrap();
     let mut lease = IndexSession::open(&ctx).unwrap();
-    let result = lease.refresh_under_lease(&selected(Agent::Claude)).unwrap();
+    let result = lease
+        .refresh(&selected(Agent::Claude), &RefreshOptions::QUERY)
+        .unwrap();
     assert!(result.incomplete);
     assert_eq!(texts(&lease, &key("one")), [] as [std::string::String; 0]);
     assert_eq!(
@@ -742,7 +860,7 @@ fn displaced_duplicate_is_reparsed_after_incomplete_inventory() {
     let first = claude(&ctx, "one", "original winner");
     let agents = selected(Agent::Claude);
     let mut lease = IndexSession::open(&ctx).unwrap();
-    lease.refresh_under_lease(&agents).unwrap();
+    lease.refresh(&agents, &RefreshOptions::QUERY).unwrap();
     let replacement = ctx.roots.claude_projects.join("project/replacement.jsonl");
     write(
         &replacement,
@@ -762,9 +880,9 @@ fn displaced_duplicate_is_reparsed_after_incomplete_inventory() {
     write(&invalid_archive, "invalid archive");
     ctx.roots.archive = Some(invalid_archive);
     let mut lease = IndexSession::open(&ctx).unwrap();
-    lease.refresh_under_lease(&agents).unwrap();
+    lease.refresh(&agents, &RefreshOptions::QUERY).unwrap();
     fs::remove_file(&replacement).unwrap();
-    lease.refresh_under_lease(&agents).unwrap();
+    lease.refresh(&agents, &RefreshOptions::QUERY).unwrap();
     write(
         &replacement,
         &fs::read_to_string(&first)
@@ -778,18 +896,23 @@ fn displaced_duplicate_is_reparsed_after_incomplete_inventory() {
                 .set_modified(std::time::SystemTime::now() + Duration::from_secs(60)),
         )
         .unwrap();
-    assert!(lease.refresh_under_lease(&agents).unwrap().incomplete);
+    assert!(
+        lease
+            .refresh(&agents, &RefreshOptions::QUERY)
+            .unwrap()
+            .incomplete
+    );
     assert_eq!(texts(&lease, &key("one")), ["new winner"]);
     fs::remove_file(&replacement).unwrap();
     fs::remove_file(ctx.roots.archive.as_ref().unwrap()).unwrap();
-    let restored = lease.refresh_under_lease(&agents).unwrap();
+    let restored = lease.refresh(&agents, &RefreshOptions::QUERY).unwrap();
     assert!(!restored.incomplete);
     assert_eq!(restored.data.unwrap().reparsed, 1);
     assert_eq!(texts(&lease, &key("one")), ["original winner"]);
     assert!(lease.session(&key("one")).unwrap().is_some());
     assert_eq!(
         lease
-            .refresh_under_lease(&agents)
+            .refresh(&agents, &RefreshOptions::QUERY)
             .unwrap()
             .data
             .unwrap()
@@ -808,7 +931,9 @@ fn long_session_replacement_preserves_entries_foreign_keys_and_fts() {
     for count in [4000, 2000] {
         let text = (0..count).map(|ordinal| json!({"type":"user", "sessionId":"long", "uuid":format!("native-{ordinal}"), "message":format!("needle {ordinal}")}).to_string()).collect::<Vec<_>>().join("\n") + "\n";
         write(&path, &text);
-        let result = index.refresh_under_lease(&selected(Agent::Claude)).unwrap();
+        let result = index
+            .refresh(&selected(Agent::Claude), &RefreshOptions::QUERY)
+            .unwrap();
         assert!(!result.incomplete);
         assert_eq!(result.data.unwrap().reparsed, 1);
         let mut found = Vec::new();
@@ -907,7 +1032,7 @@ fn appended_records(agent: Agent) -> String {
 
 fn refreshed(ctx: &Context, agents: &BTreeSet<Agent>) -> (IndexSession, Envelope<IndexStats>) {
     let mut lease = IndexSession::open(ctx).unwrap();
-    let result = lease.refresh_under_lease(agents).unwrap();
+    let result = lease.refresh(agents, &RefreshOptions::QUERY).unwrap();
     lease.verify_integrity().unwrap();
     (lease, result)
 }
@@ -935,7 +1060,7 @@ fn cold(ctx: &Context, key: &SessionKey) -> (Session, Vec<Entry>) {
 fn source_state(ctx: &Context, path: &Path) -> Option<SourceState> {
     let db = Connection::open(ctx.index_dir.join(DATABASE)).unwrap();
     db.query_row(
-        "SELECT state FROM sources WHERE source=?1",
+        "SELECT json_extract(state,'$.state') FROM sources WHERE source=?1",
         [path.to_string_lossy()],
         |r| r.get::<_, Option<String>>(0),
     )
@@ -1075,7 +1200,7 @@ fn recent_torn_final_line_is_not_malformed_and_old_one_is() {
     assert_eq!((session, entries), cold(&ctx, &key));
     drop(lease);
     append(&path, "{\"type\":\"assistant\",\"message\":\"stalled");
-    age(&path);
+    let ctx = an_hour_later(&ctx, &path);
     let (_, result) = refreshed(&ctx, &selected(Agent::Claude));
     assert_eq!(
         result
@@ -1270,7 +1395,7 @@ fn droid_settings_change_reparses_and_codex_title_change_resumes() {
 fn titled_hits(ctx: &Context, title: &str) -> Vec<(String, Option<String>)> {
     let mut options = query_options(title);
     options.filter.agents = selected(Agent::Codex);
-    let result = search(ctx, &options).unwrap();
+    let result = search(ctx, &options, &RefreshOptions::QUERY).unwrap();
     result
         .data
         .unwrap()
@@ -1448,7 +1573,7 @@ fn unchanged_recent_torn_final_line_is_rechecked_until_it_counts_as_malformed() 
     assert_eq!(result.diagnostics, []);
     assert_eq!(counts(&result), (1, 1));
     assert_eq!(rowids(&ctx, &key), before);
-    age(&path);
+    let ctx = an_hour_later(&ctx, &path);
     let (_, result) = refreshed(&ctx, &selected(Agent::Claude));
     assert_eq!(codes(&result), ["malformed_records"]);
     assert!(result.incomplete);
@@ -1473,7 +1598,7 @@ fn unchanged_recent_torn_title_index_line_is_rechecked_until_it_counts_as_malfor
     let session = lease.session(&canonical(Agent::Codex)).unwrap().unwrap();
     assert_eq!(session.title.as_deref(), Some("First"));
     drop(lease);
-    age(names);
+    let ctx = an_hour_later(&ctx, names);
     let (_, result) = refreshed(&ctx, &selected(Agent::Codex));
     assert_eq!(codes(&result), ["malformed_metadata"]);
 }
@@ -1492,7 +1617,7 @@ fn malformed_title_index_line_is_reported_while_sessions_are_reused() {
     assert_eq!(result.diagnostics, []);
     let before = rowids(&ctx, &canonical(Agent::Codex));
     append(names, "malformed\n");
-    age(names);
+    let ctx = an_hour_later(&ctx, names);
     for _ in 0..2 {
         let (lease, result) = refreshed(&ctx, &selected(Agent::Codex));
         assert!(result.incomplete);
@@ -1529,7 +1654,7 @@ fn unchanged_recent_torn_cursor_line_is_rechecked_until_it_counts_as_malformed()
     let (_, result) = refreshed(&ctx, &selected(Agent::Cursor));
     assert_eq!(result.diagnostics, []);
     assert_eq!(counts(&result), (1, 0));
-    age(&path);
+    let ctx = an_hour_later(&ctx, &path);
     let (_, result) = refreshed(&ctx, &selected(Agent::Cursor));
     assert_eq!(codes(&result), ["malformed_records"]);
 }
@@ -1577,8 +1702,137 @@ fn partial_source_resumes_and_keeps_its_diagnostic() {
     assert_eq!(resumed_snapshot, snapshot(&cold, &key));
     let (_, result) = refreshed(&ctx, &selected(Agent::Claude));
     assert_eq!(codes(&result), ["malformed_records"]);
-    assert_eq!(counts(&result), (1, 1));
+    assert_eq!(counts(&result), (0, 2));
     assert_eq!(rowids(&ctx, &key), resumed);
+}
+
+#[test]
+fn query_resumes_spot_check_a_long_prefix_and_slimetrail_index_verifies_all_of_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let line =
+        |text: &str| json!({"type":"user","sessionId":"long","message":text}).to_string() + "\n";
+    let filler = "x".repeat(4000);
+    let record = line(&filler);
+    let count = (5 << 20) / record.len() + 1;
+    let path = ctx.roots.claude_projects.join("project/long.jsonl");
+    write(&path, &record.repeat(count));
+    let agents = selected(Agent::Claude);
+    let mut lease = IndexSession::open(&ctx).unwrap();
+    lease.refresh(&agents, &RefreshOptions::QUERY).unwrap();
+    let mut bytes = fs::read(&path).unwrap();
+    let offset = (2 << 20) + 100;
+    let changed = offset + bytes[offset..].iter().position(|b| *b == b'x').unwrap();
+    bytes[changed] = b'y';
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .write_all(&bytes)
+        .unwrap();
+    append(&path, &line("appended"));
+    let row = changed / record.len();
+    let rewritten =
+        String::from_utf8(bytes[row * record.len()..(row + 1) * record.len()].to_vec()).unwrap();
+    let rewritten: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
+    let stats = |result: Envelope<IndexStats>| {
+        assert_eq!(codes(&result), [] as [&str; 0]);
+        let stats = result.data.unwrap();
+        (stats.reparsed, stats.reused)
+    };
+    assert_eq!(
+        stats(lease.refresh(&agents, &RefreshOptions::QUERY).unwrap()),
+        (1, 0)
+    );
+    let spot_checked = texts(&lease, &key("long"));
+    assert_eq!(spot_checked.len(), count + 1);
+    assert_eq!(spot_checked[row], filler);
+    assert_eq!(
+        stats(lease.refresh(&agents, &RefreshOptions::QUERY).unwrap()),
+        (0, 1)
+    );
+    assert_eq!(
+        stats(lease.refresh(&agents, &RefreshOptions::FULL).unwrap()),
+        (1, 0)
+    );
+    let verified = texts(&lease, &key("long"));
+    assert_eq!(verified[row], rewritten["message"].as_str().unwrap());
+    assert_eq!(verified.last().map(String::as_str), Some("appended"));
+    assert_eq!(
+        stats(lease.refresh(&agents, &RefreshOptions::FULL).unwrap()),
+        (0, 1)
+    );
+    lease.verify_integrity().unwrap();
+}
+
+#[test]
+fn compact_scans_read_only_tool_result_tails_while_reads_return_the_whole_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let body = format!("headmark {} tailmark", "é".repeat(3000));
+    let path = ctx.roots.claude_projects.join("project/tool.jsonl");
+    write(
+        &path,
+        &(tool_result_line("tool", &body) + &tool_result_line("tool", "short tailmark")),
+    );
+    let agents = selected(Agent::Claude);
+    let mut lease = IndexSession::open(&ctx).unwrap();
+    lease.refresh(&agents, &RefreshOptions::QUERY).unwrap();
+    let tail_start = body.len() - 2047;
+    assert!(body.is_char_boundary(tail_start));
+    let stored: Vec<(i64, i64, i64)> = Connection::open(ctx.index_dir.join(DATABASE))
+        .unwrap()
+        .prepare("SELECT length(CAST(text AS BLOB)),tail_start,length(CAST(text_tail AS BLOB)) FROM entries ORDER BY entry_index")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let tail_start = i64::try_from(tail_start).unwrap();
+    assert_eq!(stored, [(tail_start, tail_start, 2047), (0, 0, 14)]);
+    let documents = |lease: &IndexSession, candidate| {
+        let mut found = Vec::new();
+        lease
+            .visit_documents(&key("tool"), candidate, &mut |doc| {
+                found.push(doc.text);
+                Ok(())
+            })
+            .unwrap();
+        found
+    };
+    let tail = &body[usize::try_from(tail_start).unwrap()..];
+    for candidate in [None, Some(("tailmark", false)), Some(("é", false))] {
+        assert_eq!(
+            documents(&lease, candidate),
+            [tail, "short tailmark"],
+            "{candidate:?}"
+        );
+    }
+    assert_eq!(
+        texts(&lease, &key("tool")),
+        [body.as_str(), "short tailmark"]
+    );
+    lease.verify_integrity().unwrap();
+    drop(lease);
+    let matched = |ctx: &Context, query: &str| {
+        let options = SearchOptions {
+            regex: true,
+            ..query_options(query)
+        };
+        let result = search(ctx, &options, &RefreshOptions::QUERY).unwrap();
+        result.data.unwrap().count
+    };
+    assert_eq!(
+        (matched(&ctx, "headmark"), matched(&ctx, "tailmar[k]")),
+        (0, 1)
+    );
+    let full = ctx.with_coverage(Coverage::Full, false);
+    let mut lease = IndexSession::open(&full).unwrap();
+    lease.refresh(&agents, &RefreshOptions::FULL).unwrap();
+    assert_eq!(documents(&lease, None), [body.as_str(), "short tailmark"]);
+    lease.verify_integrity().unwrap();
+    drop(lease);
+    assert_eq!(matched(&full, "headmark"), 1);
 }
 
 fn fts_counts(ctx: &Context) -> (String, i64, i64) {
@@ -1595,14 +1849,15 @@ fn tool_result_line(id: &str, text: &str) -> String {
     json!({"type":"user","sessionId":id,"message":{"content":[{"type":"tool_result","content":text}]}}).to_string() + "\n"
 }
 
+fn stats(ctx: &Context, agents: &BTreeSet<Agent>, options: &RefreshOptions<'_>) -> IndexStats {
+    refresh(ctx, agents, options).unwrap().data.unwrap()
+}
+
 #[test]
 fn contentless_fts_survives_cascaded_deletes_appends_and_coverage_flips() {
     let dir = tempfile::tempdir().unwrap();
     let compact = context(dir.path());
-    let full = Context {
-        coverage: Coverage::Full,
-        ..compact.clone()
-    };
+    let full = compact.clone().with_coverage(Coverage::Full, false);
     let agents = selected(Agent::Claude);
     let many = compact.roots.claude_projects.join("project/many.jsonl");
     let lines: String = (0..10_050)
@@ -1620,7 +1875,7 @@ fn contentless_fts_survives_cascaded_deletes_appends_and_coverage_flips() {
     let long = format!("early {} late", "y".repeat(4096));
     write(&tool, &tool_result_line("tool", &long));
     let doomed = claude(&compact, "doomed", "short lived");
-    index::refresh(&compact, &agents, false).unwrap();
+    refresh(&compact, &agents, &RefreshOptions::QUERY).unwrap();
     let (sql, documents, rows) = fts_counts(&compact);
     assert!(sql.contains("contentless_delete=1"), "{sql}");
     assert_eq!((documents, rows), (10_052, 10_052));
@@ -1629,22 +1884,14 @@ fn contentless_fts_survives_cascaded_deletes_appends_and_coverage_flips() {
         .verify_integrity()
         .unwrap();
     fs::remove_file(&doomed).unwrap();
-    assert_eq!(
-        index::refresh(&compact, &agents, false)
-            .unwrap()
-            .data
-            .unwrap()
-            .removed,
-        1
-    );
+    assert_eq!(stats(&compact, &agents, &RefreshOptions::QUERY).removed, 1);
     let (_, documents, rows) = fts_counts(&compact);
     assert_eq!((documents, rows), (10_051, 10_051));
     IndexSession::open(&compact)
         .unwrap()
         .verify_integrity()
         .unwrap();
-    let stats = index::refresh(&full, &agents, true).unwrap().data.unwrap();
-    assert_eq!(stats.reparsed, 0);
+    assert_eq!(stats(&full, &agents, &RefreshOptions::FULL).reparsed, 0);
     let (_, documents, rows) = fts_counts(&full);
     assert_eq!((documents, rows), (20_101, 20_101));
     let lease = IndexSession::open(&full).unwrap();
@@ -1652,11 +1899,10 @@ fn contentless_fts_survives_cascaded_deletes_appends_and_coverage_flips() {
     assert_eq!(lease.coverage().unwrap(), Coverage::Full);
     drop(lease);
     append(&tool, &tool_result_line("tool", &format!("again {long}")));
-    age(&tool);
-    let appended = index::refresh(&full, &agents, false).unwrap().data.unwrap();
-    assert_eq!(appended.reparsed, 1);
+    let full = an_hour_later(&full, &tool);
+    assert_eq!(stats(&full, &agents, &RefreshOptions::QUERY).reparsed, 1);
     let mut lease = IndexSession::open(&full).unwrap();
-    lease.refresh_under_lease(&agents).unwrap();
+    lease.refresh(&agents, &RefreshOptions::QUERY).unwrap();
     let mut hits = Vec::new();
     lease
         .visit_documents(&key("tool"), Some(("early", false)), &mut |doc| {
@@ -1667,9 +1913,9 @@ fn contentless_fts_survives_cascaded_deletes_appends_and_coverage_flips() {
     assert_eq!(hits, [(Some(0), long.len()), (Some(1), long.len() + 6)]);
     lease.verify_integrity().unwrap();
     drop(lease);
-    index::refresh(&compact, &agents, true).unwrap();
+    refresh(&compact, &agents, &RefreshOptions::FULL).unwrap();
     let mut lease = IndexSession::open(&compact).unwrap();
-    lease.refresh_under_lease(&agents).unwrap();
+    lease.refresh(&agents, &RefreshOptions::QUERY).unwrap();
     let mut tails = Vec::new();
     lease
         .visit_documents(&key("tool"), None, &mut |doc| {
@@ -1695,17 +1941,22 @@ fn contentless_fts_survives_cascaded_deletes_appends_and_coverage_flips() {
     );
 }
 
-fn limited(ctx: &Context, max_ms: u64) -> Context {
-    Context {
-        build: BuildPolicy::Limit {
-            max_ms,
-            whole: false,
-        },
-        ..ctx.clone()
+const fn gate(max_ms: u64, admission: Admission) -> RefreshOptions<'static> {
+    RefreshOptions {
+        build: BuildPolicy::Limit { max_ms, admission },
+        ..RefreshOptions::QUERY
     }
 }
 
-fn listed(ctx: &Context, agents: &[Agent]) -> Envelope<Vec<Session>> {
+const fn limited(max_ms: u64) -> RefreshOptions<'static> {
+    gate(max_ms, Admission::PerAgent)
+}
+
+const fn all_or_nothing(max_ms: u64) -> RefreshOptions<'static> {
+    gate(max_ms, Admission::AllOrNothing)
+}
+
+fn listed(ctx: &Context, refresh: &RefreshOptions<'_>, agents: &[Agent]) -> Envelope<Vec<Session>> {
     sessions(
         ctx,
         &Filter {
@@ -1716,6 +1967,7 @@ fn listed(ctx: &Context, agents: &[Agent]) -> Envelope<Vec<Session>> {
             days: None,
             kinds: BTreeSet::new(),
         },
+        refresh,
     )
     .unwrap()
 }
@@ -1750,10 +2002,11 @@ fn over_limit_first_build_reports_the_estimate_and_writes_nothing() {
     let pi = transcript(&ctx, Agent::Pi, "session");
     write(&pi, &jsonl_fixture(Agent::Pi));
     let size = |path: &Path| fs::metadata(path).unwrap().len();
-    let mut index = IndexSession::open(&limited(&ctx, 1)).unwrap();
-    let Err(Error::IndexRequired(estimate)) =
-        index.refresh_for_query(&BTreeSet::from([Agent::Claude, Agent::Pi]))
-    else {
+    let mut index = IndexSession::open(&ctx).unwrap();
+    let Err(Error::IndexRequired(estimate)) = index.refresh(
+        &BTreeSet::from([Agent::Claude, Agent::Pi]),
+        &all_or_nothing(1),
+    ) else {
         panic!("expected IndexRequired");
     };
     let found: Vec<_> = estimate
@@ -1774,13 +2027,18 @@ fn over_limit_first_build_reports_the_estimate_and_writes_nothing() {
     );
     drop(index);
     assert_eq!(index_rows(&ctx), (0, 0));
-    let Err(Error::IndexRequired(_)) = search(&limited(&ctx, 1), &{
-        let mut opt = query_options("text");
-        opt.filter.agents = selected(Agent::Claude);
-        opt
-    }) else {
-        panic!("expected IndexRequired from search");
-    };
+    let mut options = query_options("text");
+    options.filter.agents = selected(Agent::Claude);
+    let unavailable = search(&ctx, &options, &limited(1)).unwrap();
+    assert!(unavailable.incomplete);
+    let required: Vec<_> = unavailable
+        .diagnostics
+        .iter()
+        .map(|d| (d.code.as_str(), d.agent))
+        .collect();
+    assert_eq!(required, [("index_required", Some(Agent::Claude))]);
+    let data = unavailable.data.unwrap();
+    assert_eq!((data.agents, data.count), (vec![Agent::Claude], 0));
     assert_eq!(index_rows(&ctx), (0, 0));
 }
 
@@ -1809,13 +2067,13 @@ fn gated_agent_with_a_published_state_is_served_stale_while_small_agents_refresh
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     claude(&ctx, "old", "published text");
-    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
+    refresh(&ctx, &selected(Agent::Claude), &RefreshOptions::QUERY).unwrap();
     large(&ctx, "new");
     write(
         &transcript(&ctx, Agent::Pi, "session"),
         &jsonl_fixture(Agent::Pi),
     );
-    let result = listed(&limited(&ctx, 50), &[Agent::Claude, Agent::Pi]);
+    let result = listed(&ctx, &limited(50), &[Agent::Claude, Agent::Pi]);
     assert!(result.incomplete);
     let required: Vec<_> = result
         .diagnostics
@@ -1825,7 +2083,7 @@ fn gated_agent_with_a_published_state_is_served_stale_while_small_agents_refresh
     assert_eq!(required, [("index_required", Some(Agent::Claude))]);
     assert!(result.diagnostics[0].message.contains("slimetrail index"));
     assert_eq!(ids(&result), ["claude:old", "pi:pi-canonical"]);
-    let built = listed(&ctx, &[Agent::Claude, Agent::Pi]);
+    let built = listed(&ctx, &RefreshOptions::QUERY, &[Agent::Claude, Agent::Pi]);
     assert!(!built.incomplete, "{:?}", built.diagnostics);
     assert_eq!(ids(&built), ["claude:new", "claude:old", "pi:pi-canonical"]);
 }
@@ -1835,23 +2093,14 @@ fn whole_gate_requires_the_index_when_any_agent_is_over_the_limit() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     claude(&ctx, "old", "published text");
-    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
+    refresh(&ctx, &selected(Agent::Claude), &RefreshOptions::QUERY).unwrap();
     let new = large(&ctx, "new");
-    write(
-        &transcript(&ctx, Agent::Pi, "session"),
-        &jsonl_fixture(Agent::Pi),
-    );
+    let pi = transcript(&ctx, Agent::Pi, "session");
+    write(&pi, &jsonl_fixture(Agent::Pi));
     let before = index_rows(&ctx);
-    let whole = Context {
-        build: BuildPolicy::Limit {
-            max_ms: 50,
-            whole: true,
-        },
-        coverage: slimetrail::Coverage::Full,
-        ..ctx.clone()
-    };
+    let full = ctx.clone().with_coverage(Coverage::Full, false);
     let Err(Error::IndexRequired(estimate)) = sessions(
-        &whole,
+        &full,
         &Filter {
             agents: BTreeSet::from([Agent::Claude, Agent::Pi]),
             cwd: ctx.cwd.clone(),
@@ -1860,59 +2109,64 @@ fn whole_gate_requires_the_index_when_any_agent_is_over_the_limit() {
             days: None,
             kinds: BTreeSet::new(),
         },
+        &all_or_nothing(50),
     ) else {
         panic!("expected IndexRequired");
     };
-    let gated: Vec<_> = estimate
+    let pending: Vec<_> = estimate
         .agents
         .iter()
         .map(|a| (a.agent, a.sessions, a.bytes))
         .collect();
     assert_eq!(
-        gated,
-        [(Agent::Claude, 1, fs::metadata(&new).unwrap().len())]
+        pending,
+        [
+            (Agent::Claude, 1, fs::metadata(&new).unwrap().len()),
+            (Agent::Pi, 1, fs::metadata(&pi).unwrap().len())
+        ]
     );
     assert_eq!(
         (estimate.coverage, estimate.coverage_locked),
         (slimetrail::Coverage::Compact, true)
     );
     assert_eq!(index_rows(&ctx), before);
-    let small = Context {
-        build: BuildPolicy::Limit {
-            max_ms: 50,
-            whole: true,
-        },
-        ..ctx
-    };
-    assert_eq!(ids(&listed(&small, &[Agent::Pi])), ["pi:pi-canonical"]);
+    assert_eq!(
+        ids(&listed(&ctx, &all_or_nothing(50), &[Agent::Pi])),
+        ["pi:pi-canonical"]
+    );
 }
 
+#[cfg(feature = "test-hooks")]
 #[test]
 fn incremental_backlogs_are_gated_by_size() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     claude(&ctx, "old", "published text");
-    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
+    refresh(&ctx, &selected(Agent::Claude), &RefreshOptions::QUERY).unwrap();
     claude(&ctx, "small", "small backlog");
-    let small = listed(&limited(&ctx, 10), &[Agent::Claude]);
+    let small = listed(&ctx, &limited(10), &[Agent::Claude]);
     assert!(!small.incomplete, "{:?}", small.diagnostics);
     assert_eq!(ids(&small), ["claude:old", "claude:small"]);
     large(&ctx, "large");
-    let gated = listed(&limited(&ctx, 10), &[Agent::Claude]);
+    let gated = listed(&ctx, &limited(10), &[Agent::Claude]);
     assert!(gated.incomplete);
     assert_eq!(gated.diagnostics[0].code, "index_required");
     assert_eq!(ids(&gated), ["claude:old", "claude:small"]);
-    let estimate = api::estimate(&ctx, &selected(Agent::Claude)).unwrap();
+    let estimate = IndexSession::open(&ctx)
+        .unwrap()
+        .estimate(&selected(Agent::Claude))
+        .unwrap();
     assert_eq!(estimate.agents.len(), 1);
     assert_eq!(estimate.agents[0].sessions, 1);
 }
 
+#[cfg(feature = "test-hooks")]
 #[test]
 fn observed_throughput_is_recorded_per_coverage_and_drives_later_estimates() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     claude(&ctx, "one", "first text");
-    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
+    refresh(&ctx, &selected(Agent::Claude), &RefreshOptions::QUERY).unwrap();
     let db = Connection::open(ctx.index_dir.join(DATABASE)).unwrap();
     let observed = |db: &Connection| -> Vec<(String, u64, String)> {
         db.prepare("SELECT coverage,bytes,typeof(micros) FROM throughput WHERE agent='claude'")
@@ -1925,7 +2179,10 @@ fn observed_throughput_is_recorded_per_coverage_and_drives_later_estimates() {
     assert_eq!(observed(&db), []);
     let two = claude(&ctx, "two", "second text");
     let bytes = fs::metadata(&two).unwrap().len();
-    let estimate = api::estimate(&ctx, &selected(Agent::Claude)).unwrap();
+    let estimate = IndexSession::open(&ctx)
+        .unwrap()
+        .estimate(&selected(Agent::Claude))
+        .unwrap();
     assert_eq!(
         estimate.agents[0].compact.millis,
         bytes.div_ceil(31_000) + 2
@@ -1935,7 +2192,10 @@ fn observed_throughput_is_recorded_per_coverage_and_drives_later_estimates() {
         [],
     )
     .unwrap();
-    let estimate = api::estimate(&ctx, &selected(Agent::Claude)).unwrap();
+    let estimate = IndexSession::open(&ctx)
+        .unwrap()
+        .estimate(&selected(Agent::Claude))
+        .unwrap();
     assert_eq!(estimate.agents[0].compact.millis, bytes + 2);
     assert_eq!(estimate.agents[0].full.millis, bytes.div_ceil(14_000) + 2);
     db.execute(
@@ -1943,23 +2203,26 @@ fn observed_throughput_is_recorded_per_coverage_and_drives_later_estimates() {
         [],
     )
     .unwrap();
-    let estimate = api::estimate(&ctx, &selected(Agent::Claude)).unwrap();
+    let estimate = IndexSession::open(&ctx)
+        .unwrap()
+        .estimate(&selected(Agent::Claude))
+        .unwrap();
     assert_eq!(estimate.agents[0].full.millis, 2 * bytes + 2);
     assert_eq!(estimate.agents[0].compact.millis, bytes + 2);
-    let gated = listed(&limited(&ctx, bytes), &[Agent::Claude]);
+    let gated = listed(&ctx, &limited(bytes), &[Agent::Claude]);
     assert_eq!(gated.diagnostics[0].code, "index_required");
     assert_eq!(ids(&gated), ["claude:one"]);
-    let admitted = listed(&limited(&ctx, bytes + 2), &[Agent::Claude]);
+    let admitted = listed(&ctx, &limited(bytes + 2), &[Agent::Claude]);
     assert!(!admitted.incomplete, "{:?}", admitted.diagnostics);
     assert_eq!(ids(&admitted), ["claude:one", "claude:two"]);
 
     let full_dir = tempfile::tempdir().unwrap();
-    let full = Context {
-        coverage: Coverage::Full,
-        ..context(full_dir.path())
-    };
+    let full = context_at(full_dir.path())
+        .cwd(full_dir.path())
+        .coverage(Coverage::Full)
+        .build();
     let three = large(&full, "three");
-    index::refresh(&full, &selected(Agent::Claude), false).unwrap();
+    refresh(&full, &selected(Agent::Claude), &RefreshOptions::QUERY).unwrap();
     let db = Connection::open(full.index_dir.join(DATABASE)).unwrap();
     assert_eq!(
         observed(&db),
@@ -1991,7 +2254,7 @@ fn learned_throughput_counts_only_ingests_of_at_least_one_mebibyte() {
     let first = large(&ctx, "first");
     let first_bytes = fs::metadata(&first).unwrap().len();
     assert!(first_bytes >= 1 << 20);
-    index::refresh(&ctx, &agents, false).unwrap();
+    refresh(&ctx, &agents, &RefreshOptions::QUERY).unwrap();
     let (bytes, micros) = throughput_row(&ctx).unwrap();
     assert_eq!(bytes, first_bytes);
     assert!(micros > 0);
@@ -2004,23 +2267,27 @@ fn learned_throughput_counts_only_ingests_of_at_least_one_mebibyte() {
             ),
         );
         claude(&ctx, &format!("small-{round}"), "small session");
-        let stats = index::refresh(&ctx, &agents, false).unwrap().data.unwrap();
+        let stats = refresh(&ctx, &agents, &RefreshOptions::QUERY)
+            .unwrap()
+            .data
+            .unwrap();
         assert_eq!(stats.reparsed, 2);
         assert_eq!(throughput_row(&ctx), Some((bytes, micros)));
     }
     let second = large(&ctx, "second");
-    index::refresh(&ctx, &agents, false).unwrap();
+    refresh(&ctx, &agents, &RefreshOptions::QUERY).unwrap();
     let (summed, more) = throughput_row(&ctx).unwrap();
     assert_eq!(summed, first_bytes + fs::metadata(&second).unwrap().len());
     assert!(more > micros);
 }
 
+#[cfg(feature = "test-hooks")]
 #[test]
 fn small_appends_to_large_indexed_transcripts_are_costed_as_hashing() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     let path = large(&ctx, "big");
-    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
+    refresh(&ctx, &selected(Agent::Claude), &RefreshOptions::QUERY).unwrap();
     let consumed = fs::metadata(&path).unwrap().len();
     fs::File::options()
         .append(true)
@@ -2038,26 +2305,38 @@ fn small_appends_to_large_indexed_transcripts_are_costed_as_hashing() {
     let full_parse = size.div_ceil(31_000) + 2;
     let limit = 20;
     assert!(full_parse > limit, "{full_parse}");
-    let estimate = api::estimate(&ctx, &selected(Agent::Claude)).unwrap();
-    assert_eq!(estimate.agents[0].bytes, size);
+    let estimate = IndexSession::open(&ctx)
+        .unwrap()
+        .estimate(&selected(Agent::Claude))
+        .unwrap();
+    assert_eq!(estimate.agents[0].bytes, size - consumed);
+    assert_eq!(
+        estimate.agents[0].compact.index_bytes,
+        ((size - consumed) * 64).div_ceil(100)
+    );
     assert_eq!(
         estimate.agents[0].compact.millis,
         (size - consumed).div_ceil(31_000) + consumed.div_ceil(1_000_000) + 2
     );
-    let mut index = IndexSession::open(&limited(&ctx, limit)).unwrap();
-    let admitted = index.refresh_for_query(&selected(Agent::Claude)).unwrap();
+    let mut index = IndexSession::open(&ctx).unwrap();
+    let admitted = index
+        .refresh(&selected(Agent::Claude), &limited(limit))
+        .unwrap();
     assert!(!admitted.incomplete, "{:?}", admitted.diagnostics);
     assert_eq!(admitted.data.unwrap().reparsed, 1);
     assert_eq!(texts(&index, &key("big")).last().unwrap(), "appended text");
 }
 
+#[cfg(feature = "test-hooks")]
 #[test]
 fn first_build_after_a_refused_query_takes_the_chosen_coverage() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     claude(&ctx, "one", "first text");
-    let mut refused = IndexSession::open(&limited(&ctx, 0)).unwrap();
-    let Err(Error::IndexRequired(_)) = refused.refresh_for_query(&selected(Agent::Claude)) else {
+    let mut refused = IndexSession::open(&ctx).unwrap();
+    let Err(Error::IndexRequired(_)) =
+        refused.refresh(&selected(Agent::Claude), &all_or_nothing(0))
+    else {
         panic!("expected IndexRequired");
     };
     drop(refused);
@@ -2068,17 +2347,17 @@ fn first_build_after_a_refused_query_takes_the_chosen_coverage() {
             .unwrap()
     };
     assert_eq!(stored(&ctx), "compact");
-    let full = Context {
-        coverage: Coverage::Full,
-        ..ctx.clone()
-    };
+    let full = ctx.clone().with_coverage(Coverage::Full, false);
     let unlocked = |ctx: &Context| {
-        let estimate = api::estimate(ctx, &selected(Agent::Claude)).unwrap();
+        let estimate = IndexSession::open(ctx)
+            .unwrap()
+            .estimate(&selected(Agent::Claude))
+            .unwrap();
         (estimate.coverage, estimate.coverage_locked)
     };
     assert_eq!(unlocked(&full), (Coverage::Full, false));
     assert_eq!(unlocked(&ctx), (Coverage::Compact, false));
-    let built = listed(&full, &[Agent::Claude]);
+    let built = listed(&full, &RefreshOptions::QUERY, &[Agent::Claude]);
     assert!(!built.incomplete, "{:?}", built.diagnostics);
     assert_eq!(stored(&ctx), "full");
     assert_eq!(
@@ -2088,6 +2367,7 @@ fn first_build_after_a_refused_query_takes_the_chosen_coverage() {
     assert_eq!(unlocked(&ctx), (Coverage::Full, true));
 }
 
+#[cfg(feature = "test-hooks")]
 #[test]
 fn shared_database_bytes_are_split_across_its_sessions() {
     let dir = tempfile::tempdir().unwrap();
@@ -2099,7 +2379,10 @@ fn shared_database_bytes_are_split_across_its_sessions() {
         .iter()
         .map(|path| fs::metadata(path).map_or(0, |m| m.len()).div_ceil(3) * 3)
         .sum();
-    let estimate = api::estimate(&ctx, &selected(Agent::Opencode)).unwrap();
+    let estimate = IndexSession::open(&ctx)
+        .unwrap()
+        .estimate(&selected(Agent::Opencode))
+        .unwrap();
     assert_eq!(estimate.agents.len(), 1);
     assert_eq!(estimate.agents[0].sessions, 3);
     assert_eq!(estimate.agents[0].bytes, expected);
@@ -2111,7 +2394,7 @@ fn integrity_check_rejects_fts_text_that_no_longer_matches_its_document() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = context(dir.path());
     claude(&ctx, "one", "genuine searchable words");
-    index::refresh(&ctx, &selected(Agent::Claude), false).unwrap();
+    refresh(&ctx, &selected(Agent::Claude), &RefreshOptions::QUERY).unwrap();
     IndexSession::open(&ctx)
         .unwrap()
         .verify_integrity()
@@ -2141,22 +2424,61 @@ fn integrity_check_rejects_fts_text_that_no_longer_matches_its_document() {
 }
 
 #[test]
+fn integrity_check_samples_large_indexes_reproducibly() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let path = claude(&ctx, "many", "entry text 0");
+    let more: String = (1..300)
+        .map(|i| {
+            json!({"type":"user","sessionId":"many","cwd":"/fixture/project","message":{"content":format!("entry text {i}")}})
+                .to_string()
+                + "\n"
+        })
+        .collect();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(more.as_bytes())
+        .unwrap();
+    refresh(&ctx, &selected(Agent::Claude), &RefreshOptions::QUERY).unwrap();
+    let db = Connection::open(ctx.index_dir.join(DATABASE)).unwrap();
+    let (first, documents): (i64, i64) = db
+        .query_row(
+            "SELECT min(document_id),count(*) FROM search_documents",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(documents >= 300, "{documents}");
+    db.execute("DELETE FROM search_fts WHERE rowid=?1", [first])
+        .unwrap();
+    db.execute(
+        "INSERT INTO search_fts(rowid,ascii_lower) VALUES(?1,'unrelated words')",
+        [first],
+    )
+    .unwrap();
+    drop(db);
+    let index = IndexSession::open(&ctx).unwrap();
+    for _ in 0..5 {
+        assert!(index.verify_integrity().is_err());
+    }
+}
+
+#[test]
 fn an_interrupted_first_build_keeps_its_stored_coverage() {
     let dir = tempfile::tempdir().unwrap();
     let compact = context(dir.path());
-    let full = Context {
-        coverage: Coverage::Full,
-        ..compact.clone()
-    };
+    let full = compact.clone().with_coverage(Coverage::Full, false);
     claude(&compact, "one", "first text");
     let agents = selected(Agent::Claude);
-    index::refresh(&compact, &agents, false).unwrap();
+    refresh(&compact, &agents, &RefreshOptions::QUERY).unwrap();
     let db = Connection::open(compact.index_dir.join(DATABASE)).unwrap();
     db.execute("UPDATE refresh_runs SET published=0", [])
         .unwrap();
     drop(db);
     claude(&compact, "two", "second text");
-    index::refresh(&full, &agents, false).unwrap();
+    refresh(&full, &agents, &RefreshOptions::QUERY).unwrap();
     let session = IndexSession::open(&full).unwrap();
     assert_eq!(session.coverage().unwrap(), Coverage::Compact);
     session.verify_integrity().unwrap();

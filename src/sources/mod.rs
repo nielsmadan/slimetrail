@@ -7,8 +7,12 @@ pub mod jsonl;
 pub mod opencode;
 pub mod pi;
 pub mod sqlite;
+mod state;
 
-use crate::{Agent, Context, Discovery, DiscoveryCache, Entry, ParsedSession, RawSession, Result};
+pub use state::*;
+
+use crate::{Agent, Context, Entry, Result};
+use std::path::Path;
 
 pub(crate) fn derive_title(
     session: &mut crate::Session,
@@ -37,6 +41,12 @@ pub trait Source {
         raw: &RawSession,
         emit: &mut dyn FnMut(Entry) -> Result<()>,
     ) -> Result<ParsedSession>;
+    fn transcript<'a>(&self, _raw: &'a RawSession) -> Option<&'a Path> {
+        None
+    }
+    fn drifted(&self, _raw: &RawSession) -> bool {
+        false
+    }
 }
 
 pub fn registry(ctx: &Context) -> Vec<Box<dyn Source>> {

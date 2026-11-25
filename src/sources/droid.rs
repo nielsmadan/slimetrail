@@ -1,5 +1,9 @@
-use super::{Source, jsonl::FileReader};
+use super::{
+    Source,
+    jsonl::{self, FileReader},
+};
 use crate::{Agent, Context, Discovery, DiscoveryCache, Entry, ParsedSession, RawSession, Result};
+use std::path::Path;
 
 pub struct Droid(FileReader);
 
@@ -22,5 +26,11 @@ impl Source for Droid {
         emit: &mut dyn FnMut(Entry) -> Result<()>,
     ) -> Result<ParsedSession> {
         self.0.parse(raw, emit)
+    }
+    fn transcript<'a>(&self, raw: &'a RawSession) -> Option<&'a Path> {
+        jsonl::transcript(raw)
+    }
+    fn drifted(&self, raw: &RawSession) -> bool {
+        jsonl::drifted(raw)
     }
 }

@@ -6,7 +6,7 @@ use crate::{
         Document, IndexSession,
         coverage::{TOOL_RESULT_TAIL, mismatch},
     },
-    read::{kind_name, python_whitespace},
+    read::python_whitespace,
 };
 use regex::{Regex, RegexBuilder};
 use std::{
@@ -93,23 +93,18 @@ pub(crate) fn run(
     })
 }
 
-pub(crate) fn coverage_note(
+pub(crate) fn coverage_notes(
     index: Coverage,
     config: Coverage,
+    explicit: bool,
     kinds: &BTreeSet<Kind>,
-) -> Option<Diagnostic> {
-    let mismatch = mismatch(index, config);
+) -> Vec<Diagnostic> {
     let note = |code: &str, message: String| Diagnostic {
         agent: None,
         source: None,
         code: code.into(),
-        message: format!("{message} {}", mismatch.unwrap_or_default())
-            .trim()
-            .into(),
+        message,
     };
-    if index == Coverage::Full {
-        return mismatch.map(|_| note("search_coverage", String::new()));
-    }
     let tail = format!("{} KB", TOOL_RESULT_TAIL / 1024);
     let limited: Vec<String> = [
         (
@@ -127,22 +122,28 @@ pub(crate) fn coverage_note(
     .filter(|(kind, _)| kinds.contains(kind))
     .map(|(_, text)| text)
     .collect();
-    Some(if limited.is_empty() {
-        note(
-            "search_coverage",
-            format!(
-                "Compact coverage: reasoning is not searched, and only the last {tail} of each tool result is searched; run `slimetrail index --coverage full` to search everything."
-            ),
-        )
-    } else {
-        note(
+    let coverage = match (index, limited.is_empty()) {
+        (Coverage::Full, _) => None,
+        (Coverage::Compact, false) => Some(note(
             "coverage_excluded",
             format!(
-                "{}; run `slimetrail index --coverage full` to search everything.",
+                "{}; run `slimetrail index --coverage full` to search everything",
                 limited.join("; ")
             ),
-        )
-    })
+        )),
+        (Coverage::Compact, true) => (!explicit).then(|| {
+            note(
+                "search_coverage",
+                format!(
+                    "Compact coverage: reasoning is not searched, and only the last {tail} of each tool result is searched; run `slimetrail index --coverage full` to search everything"
+                ),
+            )
+        }),
+    };
+    coverage
+        .into_iter()
+        .chain(mismatch(index, config).map(|text| note("coverage_mismatch", text.into())))
+        .collect()
 }
 
 fn retain(results: &mut Vec<SearchHit>, hit: SearchHit, options: &SearchOptions) {
@@ -180,7 +181,7 @@ fn accumulate(hit: &mut SearchHit, document: &Document, options: &SearchOptions,
             .filter
             .kinds
             .iter()
-            .any(|kind| kind_name(*kind) == document.kind)
+            .any(|kind| kind.as_str() == document.kind)
     {
         return;
     }
@@ -238,4 +239,34 @@ fn snippet(text: &str, start: usize, end: usize, context: usize) -> String {
         if left > 0 { "…" } else { "" },
         if right < text.len() { "…" } else { "" }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn codes(index: Coverage, config: Coverage, explicit: bool, kinds: &[Kind]) -> Vec<String> {
+        coverage_notes(index, config, explicit, &kinds.iter().copied().collect())
+            .into_iter()
+            .map(|d| d.code)
+            .collect()
+    }
+
+    #[test]
+    fn coverage_notes_follow_explicit_config_kinds_and_mismatch() {
+        let compact = Coverage::Compact;
+        let full = Coverage::Full;
+        assert_eq!(codes(compact, compact, false, &[]), ["search_coverage"]);
+        assert_eq!(codes(compact, compact, true, &[]), Vec::<String>::new());
+        assert_eq!(
+            codes(compact, compact, true, &[Kind::Tool]),
+            ["coverage_excluded"]
+        );
+        assert_eq!(
+            codes(compact, full, true, &[Kind::Meta]),
+            ["coverage_excluded", "coverage_mismatch"]
+        );
+        assert_eq!(codes(full, compact, false, &[]), ["coverage_mismatch"]);
+        assert_eq!(codes(full, full, true, &[Kind::Meta]), Vec::<String>::new());
+    }
 }

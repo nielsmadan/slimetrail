@@ -1,10 +1,15 @@
-use super::{IndexSession, REFRESH_WAIT, Writer, estimate, store};
-use crate::{
-    Agent, AgentEstimate, BuildPolicy, Coverage, Diagnostic, Discovery, DiscoveryCache, Envelope,
-    Error, IndexStats, JobEstimate, RawSession, Result, SourceState,
-    sources::{self, Source},
+use super::{
+    IndexSession, Refreshed, Writer,
+    estimate::{self, Gate, Work},
+    store::{self, SourceStatus},
 };
-use rusqlite::{Connection, params};
+use crate::{
+    Agent, AgentEstimate, AppendState, CachedSource, Coverage, Diagnostic, Discovery,
+    DiscoveryCache, Envelope, Error, IndexStats, JobEstimate, Observer, ParsedSession, Progress,
+    RawSession, Rebuild, RefreshEvent, RefreshMode, RefreshOptions, Result, SourceState,
+    sources::{PrefixCheck, Resume, Source},
+};
+use rusqlite::Connection;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -48,15 +53,6 @@ fn stable(before: &Stat, after: Option<&Stat>) -> bool {
     })
 }
 
-fn live_transcript(raw: &RawSession) -> Option<&Path> {
-    match raw.key.agent {
-        Agent::Claude | Agent::Codex | Agent::Cursor | Agent::Droid | Agent::Pi => {
-            raw.dependencies.first().map(PathBuf::as_path)
-        }
-        Agent::Devin | Agent::Opencode => None,
-    }
-}
-
 enum Outcome {
     Stable {
         complete: bool,
@@ -64,22 +60,28 @@ enum Outcome {
     },
     Changed,
     Failed,
+    Rejected,
 }
 
 fn ingest(
     index: &IndexSession,
     writer: &mut Writer,
     source: &dyn Source,
-    raw: &mut RawSession,
+    raw: &RawSession,
     generation: i64,
-) -> Result<Outcome> {
+) -> Result<(Outcome, bool)> {
     if raw.resume.is_some() {
-        match ingest_once(index, writer, source, raw, generation) {
-            Err(Error::ResumeRejected) => raw.resume = None,
-            outcome => return outcome,
+        match ingest_once(index, writer, source, raw, generation)? {
+            Outcome::Rejected => {}
+            outcome => return Ok((outcome, true)),
         }
+        let fresh = raw.without_resume();
+        return Ok((
+            ingest_once(index, writer, source, &fresh, generation)?,
+            false,
+        ));
     }
-    ingest_once(index, writer, source, raw, generation)
+    Ok((ingest_once(index, writer, source, raw, generation)?, false))
 }
 
 fn ingest_once(
@@ -89,7 +91,7 @@ fn ingest_once(
     raw: &RawSession,
     generation: i64,
 ) -> Result<Outcome> {
-    let before = match live_transcript(raw) {
+    let before = match source.transcript(raw) {
         Some(path) => match stat(path) {
             Some(before) => Some((path, before)),
             None => return Ok(Outcome::Changed),
@@ -98,29 +100,8 @@ fn ingest_once(
     };
     let coverage = writer.coverage;
     let transaction = writer.connection.savepoint()?;
-    store::source(
-        &transaction,
-        &index.namespace,
-        raw,
-        "pending",
-        &[],
-        generation,
-        None,
-    )?;
-    let resume = raw.resume.as_ref().map(|state| state.entries);
-    if let Some(entries) = resume {
-        store::truncate(&transaction, &index.namespace, raw, entries)?;
-    } else {
-        transaction.execute(
-            "DELETE FROM sessions WHERE namespace=?1 AND agent=?2 AND (id=?3 OR source=?4)",
-            params![
-                index.namespace,
-                raw.key.agent.to_string(),
-                raw.key.id,
-                raw.source
-            ],
-        )?;
-    }
+    let resume = raw.resume.as_ref().map(|resume| resume.state.entries);
+    prepare_rows(&transaction, &index.namespace, raw, resume, generation)?;
     let mut write_failed = false;
     let mut expected_index = resume.unwrap_or(0);
     let parsed = source.parse(raw, &mut |entry| {
@@ -139,25 +120,68 @@ fn ingest_once(
             Error::InvalidArgument("source swallowed an index write failure".into())
         }));
     }
-    if resume.is_some() && matches!(parsed, Err(Error::ResumeRejected)) {
-        return Err(Error::ResumeRejected);
+    if resume.is_some() && parsed.is_err() {
+        return Ok(Outcome::Rejected);
     }
     if let Some((path, before)) = &before
         && !stable(before, stat(path).as_ref())
     {
         return Ok(Outcome::Changed);
     }
-    let Ok(mut parsed) = parsed else {
+    let Ok(parsed) = parsed else {
         return Ok(Outcome::Failed);
     };
     if parsed.session.key != raw.key || parsed.session.source != raw.source {
-        let drifted = before.is_some() && sources::jsonl::drifted(raw);
-        return Ok(if drifted {
+        return Ok(if source.drifted(raw) {
             Outcome::Changed
         } else {
             Outcome::Failed
         });
     }
+    let outcome = record(
+        &transaction,
+        &index.namespace,
+        raw,
+        parsed,
+        resume.is_some(),
+        generation,
+    )?;
+    if matches!(outcome, Outcome::Stable { .. }) {
+        transaction.commit()?;
+    }
+    Ok(outcome)
+}
+
+fn prepare_rows(
+    connection: &Connection,
+    namespace: &str,
+    raw: &RawSession,
+    resume: Option<u64>,
+    generation: i64,
+) -> Result<()> {
+    store::source(
+        connection,
+        namespace,
+        raw,
+        SourceStatus::Pending,
+        &[],
+        generation,
+        None,
+    )?;
+    resume.map_or_else(
+        || store::delete_session(connection, namespace, raw),
+        |entries| store::truncate(connection, namespace, raw, entries),
+    )
+}
+
+fn record(
+    connection: &Connection,
+    namespace: &str,
+    raw: &RawSession,
+    mut parsed: ParsedSession,
+    resumed: bool,
+    generation: i64,
+) -> Result<Outcome> {
     if !parsed.complete && parsed.diagnostics.is_empty() {
         parsed.diagnostics.push(diagnostic(
             raw.key.agent,
@@ -167,80 +191,69 @@ fn ingest_once(
         ));
     }
     let complete = parsed.complete && parsed.diagnostics.is_empty();
-    if resume.is_none() {
-        store::session(&transaction, &index.namespace, raw, &parsed.session)?;
-    } else if !store::update_session(&transaction, &index.namespace, raw, &parsed.session)? {
-        return Err(Error::ResumeRejected);
+    if !resumed {
+        store::session(connection, namespace, raw, &parsed.session)?;
+    } else if !store::update_session(connection, namespace, raw, &parsed.session)? {
+        return Ok(Outcome::Rejected);
     }
-    // Partial sources are never reused, so a recent torn final line is rechecked next refresh.
-    let fresh = complete && !parsed.recheck;
+    let status = match (complete, parsed.recheck) {
+        (_, true) => SourceStatus::Recheck,
+        (true, false) => SourceStatus::Fresh,
+        (false, false) => SourceStatus::Partial,
+    };
     store::source(
-        &transaction,
-        &index.namespace,
+        connection,
+        namespace,
         raw,
-        if fresh { "fresh" } else { "partial" },
+        status,
         &parsed.diagnostics,
         generation,
         parsed.state.as_ref(),
     )?;
-    transaction.commit()?;
     Ok(Outcome::Stable {
         complete,
         diagnostics: parsed.diagnostics,
     })
 }
 
-pub(super) fn run(
+pub(super) fn full(
     index: &mut IndexSession,
     agents: &BTreeSet<Agent>,
-    notice: bool,
-    verify: bool,
-) -> Result<Envelope<IndexStats>> {
-    let readers = sources::registry_in(&index.context, &index.staging.path);
-    run_noting(index, agents, readers, notice, verify)
-}
-
-#[cfg(test)]
-fn run_sources(
-    index: &mut IndexSession,
-    agents: &BTreeSet<Agent>,
+    options: &RefreshOptions<'_>,
     readers: Vec<Box<dyn Source>>,
-) -> Result<Envelope<IndexStats>> {
-    run_noting(index, agents, readers, false, false)
-}
-
-fn run_noting(
-    index: &mut IndexSession,
-    agents: &BTreeSet<Agent>,
-    readers: Vec<Box<dyn Source>>,
-    notice: bool,
-    verify: bool,
-) -> Result<Envelope<IndexStats>> {
+) -> Result<Refreshed> {
     let mut writer = index
-        .writer(REFRESH_WAIT, notice)?
+        .writer(options.wait, options.observer)?
         .ok_or(Error::IndexBusy)?;
+    let started = Instant::now();
+    writer.persist_coverage()?;
     let target = index.context.coverage;
-    if !verify && writer.pending.is_some() {
-        let started = Instant::now();
-        drop(writer);
-        index.reopen()?;
-        return Ok(super::skipped(vec![super::rebuild_pending()], started));
-    }
-    if verify && (writer.coverage != target || writer.pending.is_some()) {
-        store::rebuild_documents(&mut writer.connection, target)?;
+    if writer.coverage != target || writer.pending.is_some() {
+        store::rebuild_documents(
+            &mut writer.connection,
+            target,
+            &mut |entries, total_entries| {
+                emit(
+                    options.observer,
+                    RefreshEvent::Rebuilding(Rebuild {
+                        entries,
+                        total_entries,
+                    }),
+                );
+            },
+        )?;
         writer.coverage = target;
         writer.pending = None;
     }
-    let result = write(
-        index,
-        &mut writer,
-        agents,
-        readers,
-        verify,
-        BuildPolicy::Inline,
-    )?;
+    let result = write(index, &mut writer, agents, readers, options, started)?;
     index.publish(writer, false)?;
     Ok(result)
+}
+
+fn emit(observer: Option<&dyn Observer>, event: RefreshEvent) {
+    if let Some(observer) = observer {
+        observer.observe(event);
+    }
 }
 
 fn elapsed_micros(started: Instant) -> u64 {
@@ -255,10 +268,10 @@ struct Ingested {
 }
 
 impl Ingested {
-    const fn add(&mut self, micros: u64, bytes: u64, hashed: u64) {
+    const fn add(&mut self, micros: u64, work: Work) {
         self.micros = self.micros.saturating_add(micros);
-        self.parsed = self.parsed.saturating_add(bytes.saturating_sub(hashed));
-        self.hashed = self.hashed.saturating_add(hashed);
+        self.parsed = self.parsed.saturating_add(work.parsed());
+        self.hashed = self.hashed.saturating_add(work.hashed);
     }
 
     fn observation(&self) -> Option<(u64, u64)> {
@@ -266,22 +279,94 @@ impl Ingested {
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-hooks")]
 thread_local! {
     static DISCOVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(debug_assertions)]
-#[doc(hidden)]
+#[cfg(feature = "test-hooks")]
 pub fn discoveries() -> usize {
     DISCOVERIES.with(std::cell::Cell::get)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Step {
+    Reuse(Vec<Diagnostic>),
+    Parse(Work),
+}
+
+enum Inventory {
+    Ready(Discovery, Vec<Step>),
+    Released,
+    Unavailable,
+}
+
 pub(super) struct Planned {
     source: Box<dyn Source>,
-    discovery: Option<Discovery>,
-    work: Vec<Option<(u64, u64)>>,
+    inventory: Inventory,
     pub(super) estimate: AgentEstimate,
+}
+
+impl Planned {
+    fn released(self) -> Self {
+        match &self.inventory {
+            Inventory::Ready(discovery, _)
+                if discovery.sessions.iter().any(|raw| raw.snapshot.is_some()) =>
+            {
+                Self {
+                    inventory: Inventory::Released,
+                    ..self
+                }
+            }
+            _ => self,
+        }
+    }
+}
+
+const fn spot_checked(cached: &CachedSource) -> bool {
+    matches!(&cached.state, Some(SourceState::Append(state)) if state.spot_checked)
+}
+
+fn reusable(raw: &RawSession, previous: &DiscoveryCache) -> bool {
+    raw.snapshot.is_none()
+        && previous.by_source.get(&raw.source).is_some_and(|cached| {
+            cached.key == raw.key
+                && cached.dependencies == raw.dependencies
+                && cached.fingerprint == raw.fingerprint
+                && !(previous.verify && spot_checked(cached))
+        })
+}
+
+fn resume_state(
+    raw: &RawSession,
+    previous: &DiscoveryCache,
+    recheck: &BTreeMap<String, CachedSource>,
+) -> Option<AppendState> {
+    let cached = previous
+        .by_source
+        .get(&raw.source)
+        .or_else(|| recheck.get(&raw.source))?;
+    match &cached.state {
+        Some(SourceState::Append(append))
+            if cached.key == raw.key && cached.dependencies == raw.dependencies =>
+        {
+            Some(append.clone())
+        }
+        _ => None,
+    }
+}
+
+const fn prefix_check(mode: RefreshMode) -> PrefixCheck {
+    match mode {
+        RefreshMode::Query => PrefixCheck::Ends,
+        RefreshMode::Full => PrefixCheck::Whole,
+    }
+}
+
+fn file_size(sizes: &mut BTreeMap<PathBuf, u64>, path: &Path) -> u64 {
+    *sizes
+        .entry(path.to_path_buf())
+        .or_insert_with(|| fs::metadata(path).map_or(0, |m| m.len()))
 }
 
 pub(super) fn plan(
@@ -289,326 +374,534 @@ pub(super) fn plan(
     connection: &Connection,
     agents: &BTreeSet<Agent>,
     readers: Vec<Box<dyn Source>>,
-    verify: bool,
+    mode: RefreshMode,
 ) -> Result<Vec<Planned>> {
-    let mut planned = Vec::new();
-    let selected = readers
+    readers
         .into_iter()
-        .filter(|s| agents.is_empty() || agents.contains(&s.agent()));
-    for source in selected {
-        let agent = source.agent();
-        let previous = DiscoveryCache {
-            verify,
-            ..store::cache(connection, &index.namespace, agent)?
-        };
-        let partial = store::partial(connection, &index.namespace, agent)?;
-        #[cfg(debug_assertions)]
-        DISCOVERIES.with(|n| n.set(n.get() + 1));
-        let mut discovery = source.discover(&index.context, &previous).ok();
-        let work = if let Some(discovery) = &mut discovery {
-            let mut reusable = Vec::with_capacity(discovery.sessions.len());
-            for raw in &mut discovery.sessions {
-                reusable.push(
-                    raw.snapshot.is_none()
-                        && previous.by_source.get(&raw.source).is_some_and(|cached| {
-                            cached.key == raw.key
-                                && cached.dependencies == raw.dependencies
-                                && cached.fingerprint == raw.fingerprint
-                        }),
-                );
-                if matches!(
-                    agent,
-                    Agent::Claude | Agent::Codex | Agent::Droid | Agent::Pi
-                ) {
-                    raw.resume = previous
-                        .by_source
-                        .get(&raw.source)
-                        .or_else(|| partial.get(&raw.source))
-                        .and_then(|cached| match &cached.state {
-                            Some(SourceState::Append(append))
-                                if cached.key == raw.key
-                                    && cached.dependencies == raw.dependencies =>
-                            {
-                                Some(append.clone())
-                            }
-                            _ => None,
-                        });
-                }
-            }
-            let mut sizes = estimate::Sizes::new(&discovery.sessions);
-            discovery
-                .sessions
-                .iter()
-                .zip(reusable)
-                .map(|(raw, reusable)| (!reusable).then(|| sizes.work(raw)))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let compact = store::throughput(connection, agent, Coverage::Compact)?;
-        let full = store::throughput(connection, agent, Coverage::Full)?;
-        let hashed = work.iter().flatten().map(|(_, hashed)| hashed).sum();
-        let estimate = estimate::agent(
-            agent,
-            work.iter().flatten().count() as u64,
-            (work.iter().flatten().map(|(bytes, _)| bytes).sum(), hashed),
-            |coverage| match coverage {
-                Coverage::Compact => compact,
-                Coverage::Full => full,
-            },
-        );
-        planned.push(Planned {
-            source,
-            discovery,
-            work,
-            estimate,
-        });
-    }
-    Ok(planned)
+        .filter(|s| agents.is_empty() || agents.contains(&s.agent()))
+        .map(|source| plan_agent(index, connection, source, mode))
+        .collect()
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "Keep the transaction lifecycle visible"
-)]
+fn steps(
+    source: &dyn Source,
+    discovery: &mut Discovery,
+    cached: &store::Cached,
+    recheck: &BTreeMap<String, CachedSource>,
+    mode: RefreshMode,
+) -> Vec<Step> {
+    for raw in &mut discovery.sessions {
+        raw.resume = resume_state(raw, &cached.discovery, recheck).map(|state| Resume {
+            state,
+            check: prefix_check(mode),
+        });
+    }
+    let sizes = estimate::Sizes::new(&discovery.sessions);
+    let mut lengths = BTreeMap::new();
+    let mut size = |path: &Path| file_size(&mut lengths, path);
+    discovery
+        .sessions
+        .iter()
+        .map(|raw| {
+            if reusable(raw, &cached.discovery) {
+                Step::Reuse(
+                    cached
+                        .diagnostics
+                        .get(&raw.source)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+            } else {
+                Step::Parse(sizes.work(raw, source.transcript(raw), &mut size))
+            }
+        })
+        .collect()
+}
+
+fn plan_agent(
+    index: &IndexSession,
+    connection: &Connection,
+    source: Box<dyn Source>,
+    mode: RefreshMode,
+) -> Result<Planned> {
+    let agent = source.agent();
+    let mut cached = store::cache(connection, &index.namespace, agent)?;
+    cached.discovery.verify = mode == RefreshMode::Full;
+    let recheck = store::rechecked(connection, &index.namespace, agent)?;
+    #[cfg(feature = "test-hooks")]
+    DISCOVERIES.with(|n| n.set(n.get() + 1));
+    let inventory = source.discover(&index.context, &cached.discovery).map_or(
+        Inventory::Unavailable,
+        |mut discovery| {
+            let steps = steps(source.as_ref(), &mut discovery, &cached, &recheck, mode);
+            Inventory::Ready(discovery, steps)
+        },
+    );
+    let parsed: Vec<Work> = match &inventory {
+        Inventory::Ready(_, steps) => steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Parse(work) => Some(*work),
+                Step::Reuse(_) => None,
+            })
+            .collect(),
+        Inventory::Released | Inventory::Unavailable => Vec::new(),
+    };
+    let compact = store::throughput(connection, agent, Coverage::Compact)?;
+    let full = store::throughput(connection, agent, Coverage::Full)?;
+    let estimate = estimate::agent(
+        agent,
+        parsed.len() as u64,
+        parsed.into_iter().sum(),
+        |coverage| match coverage {
+            Coverage::Compact => compact,
+            Coverage::Full => full,
+        },
+    );
+    Ok(Planned {
+        source,
+        inventory,
+        estimate,
+    })
+}
+
+struct Tracker<'a> {
+    progress: Progress,
+    observer: Option<&'a dyn Observer>,
+}
+
+impl<'a> Tracker<'a> {
+    fn start(observer: Option<&'a dyn Observer>, progress: Progress) -> Self {
+        let tracker = Self { progress, observer };
+        tracker.emit(RefreshEvent::Started(progress));
+        tracker
+    }
+
+    fn emit(&self, event: RefreshEvent) {
+        emit(self.observer, event);
+    }
+
+    fn advance(&mut self, bytes: u64) {
+        self.progress = self.progress.advanced(bytes);
+        self.emit(RefreshEvent::Advanced(self.progress));
+    }
+
+    const fn replan(&mut self, before: &AgentEstimate, after: &AgentEstimate) {
+        self.progress = self.progress.replanned(
+            (before.sessions, before.bytes),
+            (after.sessions, after.bytes),
+        );
+    }
+
+    fn finish(&self) {
+        self.emit(RefreshEvent::Finished(self.progress));
+    }
+}
+
 pub(super) fn write(
     index: &mut IndexSession,
     writer: &mut Writer,
     agents: &BTreeSet<Agent>,
     readers: Vec<Box<dyn Source>>,
-    verify: bool,
-    policy: BuildPolicy,
-) -> Result<Envelope<IndexStats>> {
-    let started = Instant::now();
+    options: &RefreshOptions<'_>,
+    started: Instant,
+) -> Result<Refreshed> {
     let coverage = writer.coverage;
     let seq = store::begin_run(&writer.connection)?;
-    let planned = plan(index, &writer.connection, agents, readers, verify)?;
-    let (limit, whole) = match policy {
-        BuildPolicy::Inline => (None, false),
-        BuildPolicy::Limit { max_ms, whole } => (Some(max_ms), whole),
-    };
-    let admitted = estimate::admit(
-        &planned
-            .iter()
-            .map(|p| {
-                let millis = estimate::projection(&p.estimate, coverage).millis;
-                (p.estimate.agent, p.estimate.sessions, millis)
-            })
-            .collect::<Vec<_>>(),
-        limit,
-    );
-    let (planned, gated): (Vec<_>, Vec<_>) = planned
-        .into_iter()
-        .partition(|p| admitted.contains(&p.estimate.agent));
-    let published = |agent| store::has_published(&writer.connection, &index.namespace, agent);
-    if !gated.is_empty() {
-        let mut data = false;
-        if !whole {
-            for p in gated.iter().chain(&planned) {
-                let admitted_work = admitted.contains(&p.estimate.agent) && p.estimate.sessions > 0;
-                data |= admitted_work || published(p.estimate.agent)?;
-            }
-        }
-        if !data {
+    let planned = plan(index, &writer.connection, agents, readers, options.mode)?;
+    let estimates: Vec<_> = planned.iter().map(|p| p.estimate.clone()).collect();
+    let decision = estimate::gate(&estimates, coverage, options.build, &mut |agent| {
+        store::has_published(&writer.connection, &index.namespace, agent)
+    })?;
+    let admitted = match decision {
+        Gate::Build(admitted) => admitted,
+        Gate::Abort(pending) => {
             return Err(Error::IndexRequired(Box::new(JobEstimate {
-                agents: gated.into_iter().map(|p| p.estimate).collect(),
+                agents: pending,
                 coverage,
                 coverage_locked: writer.locked,
             })));
         }
-    }
-    let mut diagnostics = Vec::new();
-    for p in gated {
-        let agent = p.estimate.agent;
-        index.refreshed.remove(&agent);
-        index.stale.insert(agent);
-        diagnostics.push(estimate::required(&p.estimate, coverage));
-    }
-    let mut stats = IndexStats {
-        discovered: 0,
-        reused: 0,
-        reparsed: 0,
-        removed: 0,
-        failed: 0,
-        elapsed_ms: 0,
+        Gate::Skip(pending) => {
+            for &agent in agents {
+                index.mark_stale(agent);
+            }
+            let diagnostics = pending
+                .iter()
+                .map(|e| estimate::required(e, coverage))
+                .collect();
+            return Ok(Refreshed {
+                status: super::skipped(diagnostics, started),
+                available: false,
+            });
+        }
     };
-    let mut progress = estimate::Progress::new(
-        index.context.progress,
-        planned.iter().map(|p| p.estimate.sessions).sum(),
-        planned.iter().map(|p| p.estimate.bytes).sum(),
-    );
-    for planned in planned {
-        let Planned {
-            source,
-            discovery,
-            work,
-            estimate: _,
-        } = planned;
-        let agent = source.agent();
-        let mut ingested = Ingested::default();
-        index.refreshed.remove(&agent);
-        let Some(discovery) = discovery else {
-            let failed = [diagnostic(
-                agent,
-                None,
-                "source_unavailable",
-                "Selected source could not be enumerated",
-            )];
-            store::discovery_failed(&writer.connection, &index.namespace, agent, &failed, seq)?;
-            diagnostics.extend(failed);
-            index.refreshed.insert(agent);
-            continue;
-        };
-        let generation = store::next_generation(&writer.connection, &index.namespace, agent)?;
-        let mut enumeration_complete =
-            discovery.complete_agents.contains(&agent) && discovery.diagnostics.is_empty();
-        let mut agent_diagnostics = discovery.diagnostics;
-        let sessions = discovery.sessions;
-        if !enumeration_complete && agent_diagnostics.is_empty() {
-            agent_diagnostics.push(diagnostic(
-                agent,
-                None,
-                "incomplete_inventory",
-                "Selected source inventory is incomplete",
-            ));
-        }
-        agent_diagnostics.extend(discovery.warnings);
-        stats.discovered += sessions.len() as u64;
-        let mut identities = BTreeSet::new();
-        let mut seen = BTreeSet::new();
-        let mut reused = BTreeSet::new();
-        for (mut raw, work) in sessions.into_iter().zip(work) {
-            seen.insert(raw.source.clone());
-            if raw.key.agent != agent || !identities.insert(raw.key.id.clone()) {
-                if let Some((bytes, _)) = work {
-                    progress.advance(bytes);
-                }
-                enumeration_complete = false;
-                stats.failed += 1;
-                agent_diagnostics.push(diagnostic(
-                    agent,
-                    Some(raw.source),
-                    "duplicate_identity",
-                    "Source inventory contains an invalid or duplicate identity",
-                ));
-                continue;
-            }
-            let Some((bytes, hashed)) = work else {
-                reused.insert(raw.source.clone());
-                stats.reused += 1;
-                continue;
-            };
-            let timer = Instant::now();
-            let mut outcome = ingest(index, writer, source.as_ref(), &mut raw, generation)?;
-            let mut micros = elapsed_micros(timer);
-            if matches!(outcome, Outcome::Changed) {
-                enumeration_complete = false;
-                agent_diagnostics.push(diagnostic(
-                    agent,
-                    Some(raw.source.clone()),
-                    "source_changed",
-                    "Source changed during refresh; inventory will be reconciled again",
-                ));
-                let empty = DiscoveryCache {
-                    by_source: BTreeMap::new(),
-                    verify: false,
-                };
-                if let Ok(mut discovery) = source.discover(&index.context, &empty)
-                    && let Some(found) = discovery
-                        .sessions
-                        .iter()
-                        .position(|s| s.source == raw.source)
-                        .or_else(|| discovery.sessions.iter().position(|s| s.key == raw.key))
-                {
-                    raw = discovery.sessions.swap_remove(found);
-                    seen.insert(raw.source.clone());
-                    let timer = Instant::now();
-                    outcome = ingest(index, writer, source.as_ref(), &mut raw, generation)?;
-                    micros = micros.saturating_add(elapsed_micros(timer));
-                }
-            }
-            if matches!(outcome, Outcome::Stable { .. }) {
-                let hashed = if raw.resume.is_some() { hashed } else { 0 };
-                ingested.add(micros, bytes, hashed);
-            }
-            match outcome {
-                Outcome::Stable {
-                    complete,
-                    diagnostics: found,
-                } => {
-                    stats.reparsed += 1;
-                    if !complete {
-                        stats.failed += 1;
-                    }
-                    agent_diagnostics.extend(found);
-                }
-                Outcome::Changed | Outcome::Failed => {
-                    stats.failed += 1;
-                    let failed = diagnostic(
-                        agent,
-                        Some(raw.source.clone()),
-                        "source_unavailable",
-                        "Source could not be parsed consistently; previous entries are excluded",
-                    );
-                    store::source(
-                        &writer.connection,
-                        &index.namespace,
-                        &raw,
-                        "failed",
-                        std::slice::from_ref(&failed),
-                        generation,
-                        None,
-                    )?;
-                    agent_diagnostics.push(failed);
-                }
-            }
-            progress.advance(bytes);
-        }
-        let transaction = writer.connection.transaction()?;
-        transaction.execute(
-            "UPDATE sources SET generation=?1 WHERE namespace=?2 AND agent=?3 AND status='fresh' AND source IN (SELECT value FROM json_each(?4))",
-            params![generation, index.namespace, agent.to_string(), store::encode(&reused)?],
-        )?;
-        if enumeration_complete {
-            stats.removed += transaction.execute(
-                "DELETE FROM sources WHERE namespace=?1 AND agent=?2 AND generation<>?3",
-                params![index.namespace, agent.to_string(), generation],
-            )? as u64;
-        } else {
-            store::carry_forward(&transaction, &index.namespace, agent, generation, &seen)?;
-        }
-        let complete = enumeration_complete && agent_diagnostics.is_empty();
-        transaction.execute(
-            "UPDATE refresh_runs SET status=?1,diagnostics=?2,published=generation,published_seq=?3 WHERE namespace=?4 AND agent=?5",
-            params![
-                if complete { "complete" } else { "incomplete" },
-                store::encode(&agent_diagnostics)?,
-                seq,
-                index.namespace,
-                agent.to_string()
-            ],
-        )?;
-        if let Some((parsed, spent)) = ingested.observation() {
-            store::observe(&transaction, agent, coverage, parsed, spent)?;
-        }
-        transaction.commit()?;
-        diagnostics.extend(agent_diagnostics);
-        index.refreshed.insert(agent);
+    let (planned, gated): (Vec<_>, Vec<_>) = planned
+        .into_iter()
+        .partition(|p| admitted.contains(&p.estimate.agent));
+    let gated: Vec<_> = gated.into_iter().map(|p| p.estimate).collect();
+    for estimate in &gated {
+        index.mark_stale(estimate.agent);
     }
-    progress.finish();
+    let mut diagnostics: Vec<_> = gated
+        .iter()
+        .map(|e| estimate::required(e, coverage))
+        .collect();
+    let planned: Vec<_> = planned
+        .into_iter()
+        .enumerate()
+        .map(|(position, p)| if position == 0 { p } else { p.released() })
+        .collect();
+    let mut tracker = Tracker::start(
+        options.observer,
+        Progress::new(
+            planned.iter().map(|p| p.estimate.sessions).sum(),
+            planned.iter().map(|p| p.estimate.bytes).sum(),
+        ),
+    );
+    let mut stats = IndexStats::default();
+    for planned in planned {
+        let agent = planned.source.agent();
+        index.mark_refreshing(agent);
+        let planned = if matches!(planned.inventory, Inventory::Released) {
+            let replanned = plan_agent(index, &writer.connection, planned.source, options.mode)?;
+            tracker.replan(&planned.estimate, &replanned.estimate);
+            replanned
+        } else {
+            planned
+        };
+        let (found, totals) = refresh_agent(index, writer, planned, seq, &mut tracker)?;
+        stats = combined(&stats, &totals);
+        diagnostics.extend(found);
+        index.mark_refreshed(agent);
+    }
+    store::reclaim(&writer.connection)?;
+    tracker.finish();
     stats.elapsed_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
-    Ok(Envelope {
+    Ok(Refreshed::available(Envelope {
         version: 1,
         incomplete: !diagnostics.is_empty(),
         diagnostics,
         data: Some(stats),
+    }))
+}
+
+fn refresh_agent(
+    index: &IndexSession,
+    writer: &mut Writer,
+    planned: Planned,
+    seq: i64,
+    tracker: &mut Tracker<'_>,
+) -> Result<(Vec<Diagnostic>, IndexStats)> {
+    let source = planned.source.as_ref();
+    let agent = source.agent();
+    let Inventory::Ready(discovery, steps) = planned.inventory else {
+        let failed = vec![diagnostic(
+            agent,
+            None,
+            "source_unavailable",
+            "Selected source could not be enumerated",
+        )];
+        store::discovery_failed(&writer.connection, &index.namespace, agent, &failed, seq)?;
+        return Ok((failed, IndexStats::default()));
+    };
+    let generation = store::next_generation(&writer.connection, &index.namespace, agent)?;
+    let run = ingest_agent(index, writer, source, discovery, steps, generation, tracker)?;
+    publish_agent(
+        &mut writer.connection,
+        &index.namespace,
+        agent,
+        (generation, seq),
+        writer.coverage,
+        run,
+    )
+}
+
+const fn combined(total: &IndexStats, run: &IndexStats) -> IndexStats {
+    IndexStats {
+        discovered: total.discovered + run.discovered,
+        reused: total.reused + run.reused,
+        reparsed: total.reparsed + run.reparsed,
+        removed: total.removed + run.removed,
+        failed: total.failed + run.failed,
+        elapsed_ms: total.elapsed_ms,
+    }
+}
+
+struct AgentRun {
+    diagnostics: Vec<Diagnostic>,
+    enumeration_complete: bool,
+    seen: BTreeSet<String>,
+    reused: BTreeSet<String>,
+    ingested: Ingested,
+    stats: IndexStats,
+}
+
+impl AgentRun {
+    fn note(&mut self, diagnostics: Vec<Diagnostic>) {
+        let unseen: Vec<_> = diagnostics
+            .into_iter()
+            .filter(|d| !self.diagnostics.contains(d))
+            .collect();
+        self.diagnostics.extend(unseen);
+    }
+
+    fn reuse(&mut self, source: String, diagnostics: Vec<Diagnostic>) {
+        self.reused.insert(source);
+        self.stats.reused += 1;
+        if !diagnostics.is_empty() {
+            self.stats.failed += 1;
+            self.note(diagnostics);
+        }
+    }
+
+    fn record(
+        &mut self,
+        connection: &Connection,
+        namespace: &str,
+        raw: &RawSession,
+        generation: i64,
+        (work, result): (Work, Attempt),
+    ) -> Result<()> {
+        match result.outcome {
+            Outcome::Stable {
+                complete,
+                diagnostics,
+            } => {
+                let work = if result.resumed {
+                    work
+                } else {
+                    work.reparsed()
+                };
+                self.ingested.add(result.micros, work);
+                self.stats.reparsed += 1;
+                if !complete {
+                    self.stats.failed += 1;
+                }
+                self.note(diagnostics);
+            }
+            Outcome::Changed | Outcome::Failed | Outcome::Rejected => {
+                self.stats.failed += 1;
+                let failed = diagnostic(
+                    raw.key.agent,
+                    Some(raw.source.clone()),
+                    "source_unavailable",
+                    "Source could not be parsed consistently; previous entries are excluded",
+                );
+                store::source(
+                    connection,
+                    namespace,
+                    raw,
+                    SourceStatus::Failed,
+                    std::slice::from_ref(&failed),
+                    generation,
+                    None,
+                )?;
+                self.diagnostics.push(failed);
+            }
+        }
+        Ok(())
+    }
+}
+
+struct Attempt {
+    outcome: Outcome,
+    resumed: bool,
+    micros: u64,
+}
+
+fn attempt(
+    index: &IndexSession,
+    writer: &mut Writer,
+    source: &dyn Source,
+    raw: &RawSession,
+    generation: i64,
+) -> Result<Attempt> {
+    let timer = Instant::now();
+    let (outcome, resumed) = ingest(index, writer, source, raw, generation)?;
+    Ok(Attempt {
+        outcome,
+        resumed,
+        micros: elapsed_micros(timer),
     })
+}
+
+fn rediscover(index: &IndexSession, source: &dyn Source, raw: &RawSession) -> Option<RawSession> {
+    let mut discovery = source
+        .discover(&index.context, &DiscoveryCache::default())
+        .ok()?;
+    let found = discovery
+        .sessions
+        .iter()
+        .position(|s| s.source == raw.source)
+        .or_else(|| discovery.sessions.iter().position(|s| s.key == raw.key))?;
+    Some(discovery.sessions.swap_remove(found))
+}
+
+struct Settled {
+    raw: RawSession,
+    attempt: Attempt,
+    changed_from: Option<String>,
+}
+
+fn settle(
+    index: &IndexSession,
+    writer: &mut Writer,
+    source: &dyn Source,
+    raw: RawSession,
+    generation: i64,
+) -> Result<Settled> {
+    let first = attempt(index, writer, source, &raw, generation)?;
+    if !matches!(first.outcome, Outcome::Changed) {
+        return Ok(Settled {
+            raw,
+            attempt: first,
+            changed_from: None,
+        });
+    }
+    let changed_from = Some(raw.source.clone());
+    Ok(match rediscover(index, source, &raw) {
+        Some(live) => {
+            let retry = attempt(index, writer, source, &live, generation)?;
+            let micros = first.micros.saturating_add(retry.micros);
+            Settled {
+                raw: live,
+                attempt: Attempt { micros, ..retry },
+                changed_from,
+            }
+        }
+        None => Settled {
+            raw,
+            attempt: first,
+            changed_from,
+        },
+    })
+}
+
+fn ingest_agent(
+    index: &IndexSession,
+    writer: &mut Writer,
+    source: &dyn Source,
+    discovery: Discovery,
+    steps: Vec<Step>,
+    generation: i64,
+    tracker: &mut Tracker<'_>,
+) -> Result<AgentRun> {
+    let agent = source.agent();
+    let enumeration_complete =
+        discovery.complete_agents.contains(&agent) && discovery.diagnostics.is_empty();
+    let mut run = AgentRun {
+        diagnostics: discovery.diagnostics,
+        enumeration_complete,
+        seen: BTreeSet::new(),
+        reused: BTreeSet::new(),
+        ingested: Ingested::default(),
+        stats: IndexStats {
+            discovered: discovery.sessions.len() as u64,
+            ..IndexStats::default()
+        },
+    };
+    if !enumeration_complete && run.diagnostics.is_empty() {
+        run.diagnostics.push(diagnostic(
+            agent,
+            None,
+            "incomplete_inventory",
+            "Selected source inventory is incomplete",
+        ));
+    }
+    run.diagnostics.extend(discovery.advisories);
+    let mut identities = BTreeSet::new();
+    for (raw, step) in discovery.sessions.into_iter().zip(steps) {
+        run.seen.insert(raw.source.clone());
+        if raw.key.agent != agent || !identities.insert(raw.key.id.clone()) {
+            if let Step::Parse(work) = step {
+                tracker.advance(work.parsed());
+            }
+            run.enumeration_complete = false;
+            run.stats.failed += 1;
+            run.diagnostics.push(diagnostic(
+                agent,
+                Some(raw.source),
+                "duplicate_identity",
+                "Source inventory contains an invalid or duplicate identity",
+            ));
+            continue;
+        }
+        let work = match step {
+            Step::Reuse(diagnostics) => {
+                run.reuse(raw.source, diagnostics);
+                continue;
+            }
+            Step::Parse(work) => work,
+        };
+        let settled = settle(index, writer, source, raw, generation)?;
+        if let Some(original) = settled.changed_from {
+            run.enumeration_complete = false;
+            run.diagnostics.push(diagnostic(
+                agent,
+                Some(original),
+                "source_changed",
+                "Source changed during refresh; inventory will be reconciled again",
+            ));
+            run.seen.insert(settled.raw.source.clone());
+        }
+        run.record(
+            &writer.connection,
+            &index.namespace,
+            &settled.raw,
+            generation,
+            (work, settled.attempt),
+        )?;
+        tracker.advance(work.parsed());
+    }
+    Ok(run)
+}
+
+fn publish_agent(
+    connection: &mut Connection,
+    namespace: &str,
+    agent: Agent,
+    (generation, seq): (i64, i64),
+    coverage: Coverage,
+    run: AgentRun,
+) -> Result<(Vec<Diagnostic>, IndexStats)> {
+    let transaction = connection.transaction()?;
+    store::keep_reused(&transaction, namespace, agent, generation, &run.reused)?;
+    let removed = if run.enumeration_complete {
+        store::remove_unlisted(&transaction, namespace, agent, generation)?
+    } else {
+        store::carry_forward(&transaction, namespace, agent, generation, &run.seen)?;
+        0
+    };
+    let complete = run.enumeration_complete && run.diagnostics.is_empty();
+    store::publish_run(
+        &transaction,
+        namespace,
+        agent,
+        complete,
+        &run.diagnostics,
+        seq,
+    )?;
+    if let Some((parsed, spent)) = run.ingested.observation() {
+        store::observe(&transaction, agent, coverage, parsed, spent)?;
+    }
+    transaction.commit()?;
+    Ok((
+        run.diagnostics,
+        IndexStats {
+            removed,
+            ..run.stats
+        },
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Context, Entry, ParsedSession, SessionKey};
+    use crate::{
+        Context, Entry, SessionKey, sources,
+        testing::{context, context_at},
+    };
     use std::{
         cell::Cell,
         fs,
@@ -647,6 +940,12 @@ mod tests {
                 Ok(parsed)
             }
         }
+        fn transcript<'a>(&self, raw: &'a RawSession) -> Option<&'a Path> {
+            self.reader.transcript(raw)
+        }
+        fn drifted(&self, raw: &RawSession) -> bool {
+            self.reader.drifted(raw)
+        }
     }
 
     struct HookedSource {
@@ -674,6 +973,12 @@ mod tests {
             }
             Ok(parsed)
         }
+        fn transcript<'a>(&self, raw: &'a RawSession) -> Option<&'a Path> {
+            self.reader.transcript(raw)
+        }
+        fn drifted(&self, raw: &RawSession) -> bool {
+            self.reader.drifted(raw)
+        }
     }
 
     struct EditedDiscovery {
@@ -695,6 +1000,12 @@ mod tests {
         ) -> Result<ParsedSession> {
             self.reader.parse(raw, emit)
         }
+        fn transcript<'a>(&self, raw: &'a RawSession) -> Option<&'a Path> {
+            self.reader.transcript(raw)
+        }
+        fn drifted(&self, raw: &RawSession) -> bool {
+            self.reader.drifted(raw)
+        }
     }
 
     fn rollout(text: &str) -> String {
@@ -705,6 +1016,16 @@ mod tests {
         .iter()
         .map(|r| r.to_string() + "\n")
         .collect()
+    }
+
+    fn run_sources(
+        index: &mut IndexSession,
+        agents: &BTreeSet<Agent>,
+        readers: Vec<Box<dyn Source>>,
+    ) -> Result<Envelope<IndexStats>> {
+        Ok(index
+            .refresh_from(agents, &RefreshOptions::QUERY, readers)?
+            .status)
     }
 
     fn retry(ctx: &Context, hook: Box<dyn Fn()>) -> (IndexSession, Envelope<IndexStats>) {
@@ -745,19 +1066,6 @@ mod tests {
         fs::write(path, line(id, text)).unwrap();
     }
 
-    fn context(base: &Path) -> Context {
-        Context {
-            roots: crate::resolve_roots(base, &BTreeMap::new()).unwrap(),
-            index_dir: base.join("index"),
-            now_ms: 0,
-            cwd: base.into(),
-            time_zone: "UTC".into(),
-            coverage: crate::Coverage::Compact,
-            build: crate::BuildPolicy::Inline,
-            progress: false,
-        }
-    }
-
     #[test]
     fn changing_source_retries_once_and_excludes_unstable_old_rows() {
         for changes in [1, 2] {
@@ -767,7 +1075,7 @@ mod tests {
             write(&path, "original");
             let agents = BTreeSet::from([Agent::Claude]);
             let mut index = IndexSession::open(&ctx).unwrap();
-            index.refresh_under_lease(&agents).unwrap();
+            index.refresh(&agents, &RefreshOptions::QUERY).unwrap();
             write(&path, "before change");
             let calls = Rc::new(Cell::new(0));
             let reader = ChangingSource {
@@ -803,7 +1111,12 @@ mod tests {
                     "original"
                 );
             }
-            assert!(!index.refresh_under_lease(&agents).unwrap().incomplete);
+            assert!(
+                !index
+                    .refresh(&agents, &RefreshOptions::QUERY)
+                    .unwrap()
+                    .incomplete
+            );
             index.verify_integrity().unwrap();
         }
     }
@@ -816,7 +1129,7 @@ mod tests {
         write(&path, "original");
         let agents = BTreeSet::from([Agent::Claude]);
         let mut index = IndexSession::open(&ctx).unwrap();
-        index.refresh_under_lease(&agents).unwrap();
+        index.refresh(&agents, &RefreshOptions::QUERY).unwrap();
         write(&path, "replacement");
         let reader = ChangingSource {
             reader: sources::source_for(&ctx, Agent::Claude).unwrap(),
@@ -868,13 +1181,19 @@ mod tests {
             if raw.resume.is_some() {
                 self.resumed.set(true);
                 self.reader.parse(raw, emit)?;
-                return Err(Error::ResumeRejected);
+                return Err(Error::InvalidArgument("synthetic resume rejection".into()));
             }
             if self.fallback {
                 self.reader.parse(raw, emit)
             } else {
                 Err(Error::InvalidArgument("synthetic parse failure".into()))
             }
+        }
+        fn transcript<'a>(&self, raw: &'a RawSession) -> Option<&'a Path> {
+            self.reader.transcript(raw)
+        }
+        fn drifted(&self, raw: &RawSession) -> bool {
+            self.reader.drifted(raw)
         }
     }
 
@@ -925,7 +1244,7 @@ mod tests {
         write(&path, &large);
         let agents = BTreeSet::from([Agent::Claude]);
         let mut index = IndexSession::open(&ctx).unwrap();
-        index.refresh_under_lease(&agents).unwrap();
+        index.refresh(&agents, &RefreshOptions::QUERY).unwrap();
         let before = learned(&index);
         assert!(before.is_some());
         for revision in ["first", "second"] {
@@ -951,7 +1270,7 @@ mod tests {
         write(&path, &"large text ".repeat(100_000));
         let agents = BTreeSet::from([Agent::Claude]);
         let mut index = IndexSession::open(&ctx).unwrap();
-        index.refresh_under_lease(&agents).unwrap();
+        index.refresh(&agents, &RefreshOptions::QUERY).unwrap();
         let (bytes, _) = learned(&index).unwrap();
         fs::write(
             &path,
@@ -982,7 +1301,7 @@ mod tests {
             fs::write(&path, line("stable", "original") + &format!("{title}\n")).unwrap();
             let agents = BTreeSet::from([Agent::Claude]);
             let mut index = IndexSession::open(&ctx).unwrap();
-            index.refresh_under_lease(&agents).unwrap();
+            index.refresh(&agents, &RefreshOptions::QUERY).unwrap();
             let before = rows(&index);
             assert!(before.1.iter().any(|(_, entry, _)| entry.is_none()));
             fs::write(
@@ -1001,12 +1320,11 @@ mod tests {
             let key = stable_key(Agent::Claude);
             if fallback {
                 assert_eq!(codes(&result), [] as [&str; 0]);
-                let cold = Context {
-                    index_dir: dir.path().join("cold"),
-                    ..context(dir.path())
-                };
+                let cold = context_at(dir.path())
+                    .index_dir(dir.path().join("cold"))
+                    .build();
                 let mut other = IndexSession::open(&cold).unwrap();
-                other.refresh_under_lease(&agents).unwrap();
+                other.refresh(&agents, &RefreshOptions::QUERY).unwrap();
                 assert_eq!(indexed(&index, &key), indexed(&other, &key));
             } else {
                 assert_eq!(codes(&result), ["source_unavailable"]);
@@ -1058,7 +1376,12 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         let agents = BTreeSet::from([Agent::Codex]);
-        assert!(!index.refresh_under_lease(&agents).unwrap().incomplete);
+        assert!(
+            !index
+                .refresh(&agents, &RefreshOptions::QUERY)
+                .unwrap()
+                .incomplete
+        );
         index.verify_integrity().unwrap();
     }
 
@@ -1160,16 +1483,8 @@ mod tests {
         .unwrap();
         let mut index = IndexSession::open(&ctx).unwrap();
         let reader = sources::source_for(&ctx, Agent::Codex).unwrap();
-        let discovered = reader
-            .discover(
-                &ctx,
-                &DiscoveryCache {
-                    by_source: BTreeMap::new(),
-                    verify: false,
-                },
-            )
-            .unwrap();
-        assert!(!sources::jsonl::drifted(&discovered.sessions[0]));
+        let discovered = reader.discover(&ctx, &DiscoveryCache::default()).unwrap();
+        assert!(!reader.drifted(&discovered.sessions[0]));
         let edits = Cell::new(0);
         let reader = EditedDiscovery {
             reader,
@@ -1218,7 +1533,7 @@ mod tests {
             .unwrap();
         assert_eq!(status, "fresh");
         let next = index
-            .refresh_under_lease(&BTreeSet::from([Agent::Claude]))
+            .refresh(&BTreeSet::from([Agent::Claude]), &RefreshOptions::QUERY)
             .unwrap();
         assert_eq!(next.data.unwrap().reparsed, 1);
         assert_eq!(texts(&index, &key), ["original", "appended"]);
@@ -1268,10 +1583,7 @@ mod tests {
             .unwrap();
         let mut index = IndexSession::open(&ctx).unwrap();
         let reader = staged(&index, Agent::Cursor);
-        let empty = DiscoveryCache {
-            by_source: BTreeMap::new(),
-            verify: false,
-        };
+        let empty = DiscoveryCache::default();
         let discovery = reader.discover(&index.context, &empty).unwrap();
         assert!(discovery.sessions[0].snapshot.is_some());
         drop(discovery);
@@ -1329,8 +1641,76 @@ mod tests {
         assert_eq!(result.data.unwrap().reparsed, 1);
         let key = stable_key(Agent::Devin);
         assert_eq!(texts(&index, &key), ["first"]);
-        index.refresh_under_lease(&agents).unwrap();
+        index.refresh(&agents, &RefreshOptions::QUERY).unwrap();
         assert_eq!(texts(&index, &key), ["first", "second"]);
+    }
+
+    struct StagingProbe {
+        reader: Box<dyn Source>,
+        staging: PathBuf,
+        held: Rc<std::cell::RefCell<Vec<usize>>>,
+    }
+
+    impl Source for StagingProbe {
+        fn agent(&self) -> Agent {
+            self.reader.agent()
+        }
+        fn discover(&self, ctx: &Context, previous: &DiscoveryCache) -> Result<Discovery> {
+            self.reader.discover(ctx, previous)
+        }
+        fn parse(
+            &self,
+            raw: &RawSession,
+            emit: &mut dyn FnMut(Entry) -> Result<()>,
+        ) -> Result<ParsedSession> {
+            let snapshots = fs::read_dir(&self.staging)
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("slimetrail-snapshot-")
+                })
+                .count();
+            self.held.borrow_mut().push(snapshots);
+            self.reader.parse(raw, emit)
+        }
+        fn transcript<'a>(&self, raw: &'a RawSession) -> Option<&'a Path> {
+            self.reader.transcript(raw)
+        }
+    }
+
+    #[test]
+    fn later_agents_release_their_snapshots_until_their_own_ingest() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        write(
+            &ctx.roots.claude_projects.join("project/source.jsonl"),
+            "claude text",
+        );
+        fs::create_dir_all(ctx.roots.opencode_db.parent().unwrap()).unwrap();
+        rusqlite::Connection::open(&ctx.roots.opencode_db)
+            .unwrap()
+            .execute_batch("CREATE TABLE session(id TEXT,directory TEXT,title TEXT,time_created INTEGER,time_updated INTEGER); CREATE TABLE message(id TEXT,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT,message_id TEXT,time_created INTEGER,data TEXT); INSERT INTO session VALUES('stable','/fixture','OpenCode title',1,2);")
+            .unwrap();
+        let mut index = IndexSession::open(&ctx).unwrap();
+        let held = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let probe = |agent| -> Box<dyn Source> {
+            Box::new(StagingProbe {
+                reader: staged(&index, agent),
+                staging: index.staging.path.clone(),
+                held: Rc::clone(&held),
+            })
+        };
+        let readers = vec![probe(Agent::Claude), probe(Agent::Opencode)];
+        let agents = BTreeSet::from([Agent::Claude, Agent::Opencode]);
+        let result = run_sources(&mut index, &agents, readers).unwrap();
+        assert_eq!(codes(&result), [] as [&str; 0]);
+        assert_eq!(result.data.unwrap().reparsed, 2);
+        assert_eq!(held.take(), [0, 1]);
+        assert_eq!(keys(&index), ["claude:stable", "opencode:stable"]);
     }
 
     fn two_sessions(ctx: &Context) -> IndexSession {
@@ -1345,7 +1725,7 @@ mod tests {
         }
         let mut index = IndexSession::open(ctx).unwrap();
         let result = index
-            .refresh_under_lease(&BTreeSet::from([Agent::Claude]))
+            .refresh(&BTreeSet::from([Agent::Claude]), &RefreshOptions::QUERY)
             .unwrap();
         assert_eq!(codes(&result), [] as [&str; 0]);
         index
@@ -1404,7 +1784,7 @@ mod tests {
         assert_eq!(codes(&result), [] as [&str; 0]);
         assert_eq!(keys(&index), ["claude:one"]);
         let mut late = opened.borrow_mut().take().unwrap();
-        let status = late.refresh_for_query(&agents).unwrap();
+        let status = late.refresh(&agents, &RefreshOptions::QUERY).unwrap();
         assert!(!status.incomplete, "{:?}", status.diagnostics);
         assert!(status.data.unwrap().discovered > 0);
         assert_eq!(keys(&late), ["claude:late", "claude:one"]);
@@ -1421,7 +1801,7 @@ mod tests {
             .unwrap();
         drop(db);
         let agents = BTreeSet::from([Agent::Claude]);
-        let result = index.refresh_under_lease(&agents).unwrap();
+        let result = index.refresh(&agents, &RefreshOptions::QUERY).unwrap();
         assert!(result.incomplete);
         assert_eq!(codes(&result), ["coverage_rebuild_pending"]);
         assert_eq!(run_row(&index).0, generation);
@@ -1475,7 +1855,7 @@ mod tests {
         assert_eq!(codes(&result), ["source_unavailable"]);
         assert_eq!(run_row(&index), (0, "incomplete".into()));
         assert_eq!(keys(&index), [] as [&str; 0]);
-        let result = index.refresh_under_lease(&agents).unwrap();
+        let result = index.refresh(&agents, &RefreshOptions::QUERY).unwrap();
         assert_eq!(codes(&result), [] as [&str; 0]);
         assert_eq!(run_row(&index), (1, "complete".into()));
         assert_eq!(keys(&index), ["claude:one"]);
@@ -1539,6 +1919,12 @@ mod tests {
                 std::io::stdin().read_line(&mut String::new()).unwrap();
             }
             Ok(parsed)
+        }
+        fn transcript<'a>(&self, raw: &'a RawSession) -> Option<&'a Path> {
+            self.reader.transcript(raw)
+        }
+        fn drifted(&self, raw: &RawSession) -> bool {
+            self.reader.drifted(raw)
         }
     }
 
@@ -1617,7 +2003,13 @@ mod tests {
         };
         let mut stale = IndexSession::open(&ctx).unwrap();
         let result = stale
-            .prepare(&agents, std::time::Duration::from_millis(50))
+            .refresh(
+                &agents,
+                &RefreshOptions {
+                    wait: std::time::Duration::from_millis(50),
+                    ..RefreshOptions::QUERY
+                },
+            )
             .unwrap();
         assert_eq!(codes(&result), ["refresh_in_progress"]);
         assert_eq!(keys(&stale), ["claude:one", "claude:two"]);
@@ -1632,7 +2024,7 @@ mod tests {
         drop(stale);
         drop(child);
         let mut next = IndexSession::open(&ctx).unwrap();
-        let result = next.refresh_for_query(&agents).unwrap();
+        let result = next.refresh(&agents, &RefreshOptions::QUERY).unwrap();
         assert_eq!(codes(&result), [] as [&str; 0]);
         let stats = result.data.unwrap();
         assert_eq!((stats.reused, stats.reparsed), (1, 1));
@@ -1640,5 +2032,466 @@ mod tests {
             assert_eq!(texts(&next, &session(id)), [format!("{id} replaced")]);
         }
         next.verify_integrity().unwrap();
+    }
+
+    fn planned_raw(id: &str, dependencies: &[&str], signature: &str) -> RawSession {
+        RawSession {
+            key: stable_key(Agent::Claude),
+            source: id.into(),
+            dependencies: dependencies.iter().map(PathBuf::from).collect(),
+            fingerprint: crate::Fingerprint {
+                signature: signature.into(),
+                title_mark: None,
+            },
+            snapshot: None,
+            resume: None,
+        }
+    }
+
+    fn append(consumed: u64) -> AppendState {
+        AppendState {
+            consumed,
+            chunks: Vec::new(),
+            spot_checked: false,
+            lines: 0,
+            entries: 0,
+            malformed: 0,
+            dev: 0,
+            ino: 0,
+            others: String::new(),
+            session: crate::Session {
+                key: stable_key(Agent::Claude),
+                title: None,
+                title_origin: None,
+                source_updated_at: None,
+                cwd: None,
+                branch: None,
+                started_at: None,
+                updated_at: None,
+                parent: None,
+                source: "t".into(),
+                archived: false,
+            },
+        }
+    }
+
+    fn cached(raw: &RawSession, state: Option<SourceState>) -> CachedSource {
+        CachedSource {
+            key: raw.key.clone(),
+            source: raw.source.clone(),
+            dependencies: raw.dependencies.clone(),
+            fingerprint: raw.fingerprint.clone(),
+            state,
+        }
+    }
+
+    fn by_source(sources: Vec<CachedSource>) -> BTreeMap<String, CachedSource> {
+        sources
+            .into_iter()
+            .map(|cached| (cached.source.clone(), cached))
+            .collect()
+    }
+
+    #[test]
+    fn only_unchanged_unsnapshotted_sources_are_reused() {
+        let raw = planned_raw("t", &["t"], "same");
+        let previous = DiscoveryCache {
+            by_source: by_source(vec![cached(&raw, None)]),
+            verify: false,
+        };
+        assert!(reusable(&raw, &previous));
+        assert!(!reusable(&planned_raw("t", &["t"], "changed"), &previous));
+        assert!(!reusable(
+            &planned_raw("t", &["t", "settings"], "same"),
+            &previous
+        ));
+        let snapshot = crate::PrivateSnapshot {
+            directory: tempfile::tempdir().unwrap(),
+            database: PathBuf::from("db"),
+        };
+        let snapshotted = RawSession {
+            snapshot: Some(std::sync::Arc::new(snapshot)),
+            ..planned_raw("t", &["t"], "same")
+        };
+        assert!(!reusable(&snapshotted, &previous));
+    }
+
+    #[test]
+    fn resume_uses_a_fresh_then_partial_append_state_with_the_same_key_and_dependencies() {
+        let raw = planned_raw("t", &["t"], "grown");
+        let fresh = DiscoveryCache {
+            by_source: by_source(vec![cached(&raw, Some(SourceState::Append(append(10))))]),
+            verify: false,
+        };
+        let partial = by_source(vec![cached(&raw, Some(SourceState::Append(append(20))))]);
+        assert_eq!(resume_state(&raw, &fresh, &partial), Some(append(10)));
+        assert_eq!(
+            resume_state(&raw, &DiscoveryCache::default(), &partial),
+            Some(append(20))
+        );
+        let moved = planned_raw("t", &["t", "settings"], "grown");
+        assert_eq!(resume_state(&moved, &fresh, &BTreeMap::new()), None);
+        let content = DiscoveryCache {
+            by_source: by_source(vec![cached(
+                &raw,
+                Some(SourceState::Content {
+                    sha256: String::new(),
+                }),
+            )]),
+            verify: false,
+        };
+        assert_eq!(resume_state(&raw, &content, &partial), None);
+    }
+
+    struct ResumeRecorder {
+        reader: Box<dyn Source>,
+        resumed: Rc<std::cell::RefCell<Vec<bool>>>,
+    }
+
+    impl Source for ResumeRecorder {
+        fn agent(&self) -> Agent {
+            self.reader.agent()
+        }
+        fn discover(&self, ctx: &Context, previous: &DiscoveryCache) -> Result<Discovery> {
+            self.reader.discover(ctx, previous)
+        }
+        fn parse(
+            &self,
+            raw: &RawSession,
+            emit: &mut dyn FnMut(Entry) -> Result<()>,
+        ) -> Result<ParsedSession> {
+            self.resumed.borrow_mut().push(raw.resume.is_some());
+            self.reader.parse(raw, emit)
+        }
+        fn transcript<'a>(&self, raw: &'a RawSession) -> Option<&'a Path> {
+            self.reader.transcript(raw)
+        }
+        fn drifted(&self, raw: &RawSession) -> bool {
+            self.reader.drifted(raw)
+        }
+    }
+
+    fn append_line(path: &Path, text: &str) {
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        std::io::Write::write_all(&mut file, line("stable", text).as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn undecodable_append_state_falls_back_to_a_full_reparse() {
+        for stored in ["state", "json_extract(state,'$.state')", "'not json'"] {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = context(dir.path());
+            let path = ctx.roots.claude_projects.join("project/source.jsonl");
+            write(&path, "original");
+            let agents = BTreeSet::from([Agent::Claude]);
+            let mut index = IndexSession::open(&ctx).unwrap();
+            index.refresh(&agents, &RefreshOptions::QUERY).unwrap();
+            rusqlite::Connection::open(ctx.index_dir.join(crate::index::DATABASE))
+                .unwrap()
+                .execute(&format!("UPDATE sources SET state={stored}"), [])
+                .unwrap();
+            append_line(&path, "appended");
+            let resumed = Rc::new(std::cell::RefCell::new(Vec::new()));
+            let recorder = |resumed: &Rc<std::cell::RefCell<Vec<bool>>>| {
+                Box::new(ResumeRecorder {
+                    reader: sources::source_for(&ctx, Agent::Claude).unwrap(),
+                    resumed: Rc::clone(resumed),
+                })
+            };
+            let result = run_sources(&mut index, &agents, vec![recorder(&resumed)]).unwrap();
+            assert_eq!(codes(&result), [] as [&str; 0]);
+            assert_eq!(result.data.unwrap().reparsed, 1);
+            assert_eq!(resumed.take(), [stored == "state"], "{stored}");
+            let key = stable_key(Agent::Claude);
+            assert_eq!(texts(&index, &key), ["original", "appended"]);
+            append_line(&path, "third");
+            run_sources(&mut index, &agents, vec![recorder(&resumed)]).unwrap();
+            assert_eq!(resumed.take(), [true]);
+            assert_eq!(texts(&index, &key), ["original", "appended", "third"]);
+        }
+    }
+
+    mod codex_titles {
+        use crate::{
+            Agent, Context, DiscoveryCache, SessionKey, TitleOrigin,
+            sources::jsonl::{FAILING_TITLE_READS, FileReader, hashed},
+            testing::context,
+        };
+        use std::{
+            collections::BTreeSet,
+            fs::{self, File},
+            path::PathBuf,
+            time::{Duration, SystemTime},
+        };
+
+        #[test]
+        fn title_read_failures_keep_each_sessions_cached_title() {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = context(dir.path());
+            fs::create_dir_all(&ctx.roots.codex_sessions).unwrap();
+            for id in ["one", "two"] {
+                fs::write(
+                    ctx.roots.codex_sessions.join(format!("{id}.jsonl")),
+                    format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\"}}}}\n"),
+                )
+                .unwrap();
+            }
+            let names = &ctx.roots.codex_session_index;
+            fs::write(names, "{\"id\":\"one\",\"thread_name\":\"Named\"}\n").unwrap();
+            let agents = BTreeSet::from([Agent::Codex]);
+            let refresh = || crate::refresh(&ctx, &agents, &crate::RefreshOptions::QUERY).unwrap();
+            let counts = |result: &crate::Envelope<crate::IndexStats>| {
+                let stats = result.data.as_ref().unwrap();
+                (stats.reused, stats.reparsed)
+            };
+            let codes = |result: &crate::Envelope<crate::IndexStats>| -> Vec<String> {
+                result.diagnostics.iter().map(|d| d.code.clone()).collect()
+            };
+            assert_eq!(counts(&refresh()), (0, 2));
+            let empty = DiscoveryCache::default();
+            let reader = FileReader::new(Agent::Codex, &ctx);
+            let readable = DiscoveryCache {
+                by_source: reader
+                    .discover(&ctx, &empty)
+                    .unwrap()
+                    .sessions
+                    .into_iter()
+                    .map(|raw| {
+                        let cached = crate::CachedSource {
+                            key: raw.key,
+                            source: raw.source.clone(),
+                            dependencies: raw.dependencies,
+                            fingerprint: raw.fingerprint,
+                            state: None,
+                        };
+                        (raw.source, cached)
+                    })
+                    .collect(),
+                verify: false,
+            };
+            FAILING_TITLE_READS.set(1);
+            let retried = refresh();
+            assert_eq!(FAILING_TITLE_READS.get(), 0);
+            assert!(!retried.incomplete, "{:?}", retried.diagnostics);
+            assert_eq!(counts(&retried), (2, 0));
+            fs::remove_file(names).unwrap();
+            fs::create_dir(names).unwrap();
+            let mut index = crate::index::IndexSession::open(&ctx).unwrap();
+            let failing = index
+                .refresh(&agents, &crate::RefreshOptions::QUERY)
+                .unwrap();
+            assert!(failing.incomplete);
+            assert_eq!(codes(&failing), ["source_unavailable"]);
+            assert_eq!(failing.diagnostics[0].source.as_deref(), names.to_str());
+            assert_eq!(counts(&failing), (2, 0));
+            let one = SessionKey {
+                agent: Agent::Codex,
+                id: "one".into(),
+            };
+            assert_eq!(
+                index.session(&one).unwrap().unwrap().title.as_deref(),
+                Some("Named")
+            );
+            let three = ctx.roots.codex_sessions.join("three.jsonl");
+            fs::write(
+                &three,
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"three\"}}\n",
+            )
+            .unwrap();
+            let outage = FileReader::new(Agent::Codex, &ctx)
+                .discover(&ctx, &readable)
+                .unwrap();
+            fs::remove_file(&three).unwrap();
+            assert_eq!(outage.sessions.len(), 3);
+            for raw in &outage.sessions {
+                let mark = raw.fingerprint.title_mark.as_deref().unwrap();
+                match readable.by_source.get(&raw.source) {
+                    Some(cached) => assert_eq!(cached.fingerprint, raw.fingerprint),
+                    None => assert_eq!(
+                        (raw.key.id.as_str(), mark),
+                        ("three", hashed("unavailable").as_str())
+                    ),
+                }
+            }
+            drop(index);
+            fs::remove_dir(names).unwrap();
+            fs::write(names, "{\"id\":\"one\",\"thread_name\":\"Named\"}\n").unwrap();
+            let recovered = refresh();
+            assert!(!recovered.incomplete, "{:?}", recovered.diagnostics);
+            assert_eq!(counts(&recovered), (2, 0));
+        }
+
+        fn write_codex(ctx: &Context, id: &str, lines: &[&str]) -> PathBuf {
+            let path = ctx.roots.codex_sessions.join(format!("{id}.jsonl"));
+            let meta = format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\"}}}}");
+            let text: String = std::iter::once(meta.as_str())
+                .chain(lines.iter().copied())
+                .flat_map(|line| [line, "\n"])
+                .collect();
+            fs::create_dir_all(&ctx.roots.codex_sessions).unwrap();
+            fs::write(&path, text).unwrap();
+            path
+        }
+
+        fn codes(result: &crate::Envelope<crate::IndexStats>) -> Vec<&str> {
+            result.diagnostics.iter().map(|d| d.code.as_str()).collect()
+        }
+
+        fn key(id: &str) -> SessionKey {
+            SessionKey {
+                agent: Agent::Codex,
+                id: id.into(),
+            }
+        }
+
+        #[test]
+        fn malformed_title_lines_do_not_keep_deleted_sessions() {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = context(dir.path());
+            write_codex(&ctx, "one", &[]);
+            let two = write_codex(&ctx, "two", &[]);
+            let names = &ctx.roots.codex_session_index;
+            fs::write(
+                names,
+                "{\"id\":\"one\",\"thread_name\":\"Named\"}\nmalformed\n",
+            )
+            .unwrap();
+            File::options()
+                .write(true)
+                .open(names)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(10))
+                .unwrap();
+            let agents = BTreeSet::from([Agent::Codex]);
+            let first = crate::refresh(&ctx, &agents, &crate::RefreshOptions::QUERY).unwrap();
+            assert_eq!(codes(&first), ["malformed_metadata"]);
+            fs::remove_file(two).unwrap();
+            let mut index = crate::index::IndexSession::open(&ctx).unwrap();
+            let removed = index
+                .refresh(&agents, &crate::RefreshOptions::QUERY)
+                .unwrap();
+            assert!(removed.incomplete);
+            assert_eq!(codes(&removed), ["malformed_metadata"]);
+            assert_eq!(removed.data.as_ref().unwrap().removed, 1);
+            assert_eq!(index.session(&key("two")).unwrap(), None);
+            assert_eq!(
+                index
+                    .session(&key("one"))
+                    .unwrap()
+                    .unwrap()
+                    .title
+                    .as_deref(),
+                Some("Named")
+            );
+        }
+
+        #[test]
+        fn rollouts_appended_during_a_title_outage_are_indexed_as_partial() {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = context(dir.path());
+            let reply = |text: &str| {
+                serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":text}}).to_string()
+            };
+            let first = reply("first message");
+            write_codex(&ctx, "one", &[&first]);
+            fs::write(
+                &ctx.roots.codex_session_index,
+                "{\"id\":\"one\",\"thread_name\":\"Named\"}\n",
+            )
+            .unwrap();
+            let agents = BTreeSet::from([Agent::Codex]);
+            crate::refresh(&ctx, &agents, &crate::RefreshOptions::QUERY).unwrap();
+            FAILING_TITLE_READS.set(usize::MAX);
+            let appended = reply("outage needle");
+            write_codex(&ctx, "one", &[&first, &appended]);
+            let status = || -> String {
+                rusqlite::Connection::open(ctx.index_dir.join(crate::index::DATABASE))
+                    .unwrap()
+                    .query_row("SELECT status FROM sources WHERE id='one'", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap()
+            };
+            let mut index = crate::index::IndexSession::open(&ctx).unwrap();
+            let outage = index
+                .refresh(&agents, &crate::RefreshOptions::QUERY)
+                .unwrap();
+            assert!(outage.incomplete);
+            assert_eq!(codes(&outage), ["source_unavailable"]);
+            let counts = outage.data.as_ref().unwrap();
+            assert_eq!((counts.reparsed, counts.failed), (1, 1));
+            let session = index.session(&key("one")).unwrap().unwrap();
+            assert_ne!(session.title_origin, Some(TitleOrigin::Native));
+            let mut found = 0;
+            index
+                .visit_search_documents(Some(("outage needle", false)), &mut |doc| {
+                    found += usize::from(doc.text.contains("outage needle"));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(found, 1);
+            drop(index);
+            assert_eq!(status(), "partial");
+            FAILING_TITLE_READS.set(0);
+            let mut index = crate::index::IndexSession::open(&ctx).unwrap();
+            let recovered = index
+                .refresh(&agents, &crate::RefreshOptions::QUERY)
+                .unwrap();
+            assert!(!recovered.incomplete, "{:?}", recovered.diagnostics);
+            assert_eq!(
+                index
+                    .session(&key("one"))
+                    .unwrap()
+                    .unwrap()
+                    .title
+                    .as_deref(),
+                Some("Named")
+            );
+            drop(index);
+            assert_eq!(status(), "fresh");
+        }
+
+        #[test]
+        fn a_title_mark_packed_into_a_stored_signature_reparses_once() {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = context(dir.path());
+            write_codex(&ctx, "one", &[]);
+            fs::write(
+                &ctx.roots.codex_session_index,
+                "{\"id\":\"one\",\"thread_name\":\"Named\"}\n",
+            )
+            .unwrap();
+            let agents = BTreeSet::from([Agent::Codex]);
+            let refresh = || crate::refresh(&ctx, &agents, &crate::RefreshOptions::QUERY).unwrap();
+            let counts = |result: &crate::Envelope<crate::IndexStats>| {
+                let stats = result.data.as_ref().unwrap();
+                (stats.reused, stats.reparsed)
+            };
+            assert_eq!(counts(&refresh()), (0, 1));
+            rusqlite::Connection::open(ctx.index_dir.join(crate::index::DATABASE))
+                .unwrap()
+                .execute(
+                    "UPDATE sources SET fingerprint=json_object('signature',json_extract(fingerprint,'$.signature')||char(10)||'title:'||json_extract(fingerprint,'$.title_mark')) WHERE id='one'",
+                    [],
+                )
+                .unwrap();
+            let migrated = refresh();
+            assert!(!migrated.incomplete, "{:?}", migrated.diagnostics);
+            assert_eq!(counts(&migrated), (0, 1));
+            let mut index = crate::index::IndexSession::open(&ctx).unwrap();
+            let reused = index
+                .refresh(&agents, &crate::RefreshOptions::QUERY)
+                .unwrap();
+            assert_eq!(counts(&reused), (1, 0));
+            assert_eq!(
+                index
+                    .session(&key("one"))
+                    .unwrap()
+                    .unwrap()
+                    .title
+                    .as_deref(),
+                Some("Named")
+            );
+        }
     }
 }

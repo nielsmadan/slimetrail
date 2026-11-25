@@ -1,7 +1,7 @@
 use crate::{
     Result,
     model::{
-        Agent, Entry, Kind, ReadMode, ReadPage, SearchResult, Session, SessionKey, Sort,
+        Agent, Coverage, Entry, Kind, ReadMode, ReadPage, SearchResult, Session, SessionKey, Sort,
         TimelineResult, Timestamp,
     },
 };
@@ -92,9 +92,9 @@ impl SessionKey {
     }
 }
 
-impl std::fmt::Display for Agent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
+impl Agent {
+    pub const fn as_str(self) -> &'static str {
+        match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Cursor => "cursor",
@@ -102,7 +102,23 @@ impl std::fmt::Display for Agent {
             Self::Droid => "droid",
             Self::Opencode => "opencode",
             Self::Pi => "pi",
-        })
+        }
+    }
+}
+
+impl std::fmt::Display for Agent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Kind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::Tool => "tool",
+            Self::Meta => "meta",
+        }
     }
 }
 
@@ -118,6 +134,32 @@ impl std::str::FromStr for Agent {
             "opencode" => Ok(Self::Opencode),
             "pi" => Ok(Self::Pi),
             _ => Err(crate::Error::InvalidArgument("unknown agent".into())),
+        }
+    }
+}
+
+impl Coverage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Full => "full",
+        }
+    }
+}
+
+impl std::fmt::Display for Coverage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Coverage {
+    type Err = crate::Error;
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "compact" => Ok(Self::Compact),
+            "full" => Ok(Self::Full),
+            _ => Err(crate::Error::InvalidArgument("coverage is invalid".into())),
         }
     }
 }

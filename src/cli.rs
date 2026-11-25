@@ -1,12 +1,15 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{
+    Args, Parser, Subcommand,
+    builder::{PossibleValuesParser, TypedValueParser},
+};
 use jiff::{Timestamp, civil, tz::TimeZone};
 use serde::Serialize;
 use slimetrail::{
-    Agent, BuildPolicy, Context, Coverage, Diagnostic, Entry, Envelope, Error, Filter, JobEstimate,
-    Kind, ReadMode, ReadOptions, Result, Scope, SearchOptions, SearchResult, Session, SessionKey,
-    Sort, TimelineOptions, TimelineResult, api, config,
+    Admission, Agent, BuildPolicy, Context, Coverage, Diagnostic, Entry, Envelope, Error, Filter,
+    JobEstimate, Kind, Observer, ReadMode, ReadOptions, RefreshOptions, Result, Scope,
+    SearchOptions, Session, SessionKey, Sort, TimelineOptions, config,
     dto::{EntryDto, ReadDataDto, SearchDataDto, SessionDto, SessionsDataDto, TimelineDataDto},
-    entries, index, read, refresh, resolve_roots, search, sessions, timeline,
+    entries, read, refresh, resolve_roots, search, sessions, timeline,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -14,11 +17,16 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod progress;
 mod prompt;
 mod search_text;
 
+const INTERACTIVE_BUILD_MS: u64 = 120_000;
+const BATCH_BUILD_MS: u64 = 20_000;
+
 struct Terminal<'a> {
     tty: bool,
+    stderr: bool,
     input: &'a mut dyn BufRead,
     prompt: &'a mut dyn Write,
 }
@@ -123,8 +131,12 @@ enum Command {
     },
     #[command(about = "Refresh the local search index")]
     Index {
-        #[arg(long, value_parser = ["compact", "full"], help = "Set search coverage in the config file and rebuild the search index to match")]
-        coverage: Option<String>,
+        #[arg(
+            long,
+            value_parser = PossibleValuesParser::new(["compact", "full"]).try_map(|v| v.parse::<Coverage>()),
+            help = "Set search coverage in the config file and rebuild the search index to match"
+        )]
+        coverage: Option<Coverage>,
     },
     #[command(about = "List session metadata")]
     Sessions,
@@ -151,12 +163,14 @@ pub(crate) fn run() -> i32 {
     let cli = Cli::parse();
     let env = std::env::vars().collect::<BTreeMap<_, _>>();
     let mut stdout = io::stdout().lock();
+    let stderr = io::stderr().is_terminal();
     let terminal = Terminal {
-        tty: io::stdin().is_terminal() && io::stderr().is_terminal(),
+        tty: io::stdin().is_terminal() && stderr,
+        stderr,
         input: &mut io::stdin().lock(),
         prompt: &mut io::stderr(),
     };
-    match execute(&cli, &env, &mut stdout, terminal) {
+    match execute(&cli, &env, build_limit(&env), &mut stdout, terminal) {
         Ok(code) => code,
         Err(error) if broken_pipe(&error) => 0,
         Err(error) => {
@@ -189,6 +203,7 @@ pub(crate) fn run() -> i32 {
 fn execute(
     cli: &Cli,
     env: &BTreeMap<String, String>,
+    build_limit: Option<u64>,
     out: &mut dyn Write,
     terminal: Terminal<'_>,
 ) -> Result<i32> {
@@ -198,55 +213,22 @@ fn execute(
         .map(PathBuf::from)
         .ok_or_else(|| Error::InvalidArgument("HOME is required to resolve store roots".into()))?;
     let cwd = std::env::current_dir().map_err(output_error)?;
-    let zone = zone(cli.common.time_zone.as_deref(), env)?;
-    let index_dir = cli.common.index_dir.clone().unwrap_or_else(|| {
-        env.get("XDG_DATA_HOME")
-            .filter(|s| !s.is_empty())
-            .map_or_else(|| home.join(".local/share"), PathBuf::from)
-            .join("slimetrail")
-    });
+    let time_zone = zone(cli.common.time_zone.as_deref(), env)?;
     let config_path = config::path(&home, env);
-    let config = if let Command::Index {
-        coverage: Some(coverage),
-    } = &cli.command
-    {
-        let coverage = if coverage == "full" {
-            Coverage::Full
-        } else {
-            Coverage::Compact
-        };
-        config::write_coverage(&config_path, coverage)?;
-        config::Config {
-            coverage,
-            explicit: true,
-        }
-    } else {
-        config::load(&config_path)?
-    };
+    let config = configure(&cli.command, &config_path)?;
     let is_json = cli.common.format == "json";
     let indexing = matches!(cli.command, Command::Index { .. });
     let interactive = !indexing && !is_json && !env.contains_key("CI") && terminal.tty;
-    let ctx = Context {
-        roots: resolve_roots(&home, env)?,
-        index_dir,
-        now_ms: Timestamp::now().as_millisecond(),
-        cwd: cwd.clone(),
-        time_zone: zone,
-        coverage: config.coverage,
-        build: if indexing {
-            BuildPolicy::Inline
-        } else {
-            BuildPolicy::Limit {
-                max_ms: build_limit(env).unwrap_or(if interactive { 120_000 } else { 20_000 }),
-                whole: interactive,
-            }
-        },
-        progress: if indexing {
-            io::stderr().is_terminal()
+    let ctx = context(&cli.common, env, &home, &cwd, time_zone, config)?;
+    let stderr = progress::Stderr::new(
+        indexing && terminal.stderr,
+        if indexing {
+            terminal.stderr
         } else {
             interactive
         },
-    };
+    );
+    let refreshing = refresh_options(indexing, interactive, build_limit, &stderr);
     let mut gate = Gate {
         config,
         path: config_path,
@@ -277,21 +259,11 @@ fn execute(
                 max_snippets: *max_snippets,
                 context_chars: *context,
             };
-            let result = gated(
-                &ctx,
-                &mut gate,
-                |ctx| convert(search(ctx, &options)?, |v| SearchDataDto::try_from(v)),
-                || {
-                    SearchDataDto::try_from(&SearchResult {
-                        query: options.query.clone(),
-                        agents: api::selected(&options.filter.agents).into_iter().collect(),
-                        sort: options.sort,
-                        count: 0,
-                        results: Vec::new(),
-                    })
-                    .map(Some)
-                },
-            )?;
+            let result = gated(&ctx, refreshing, &mut gate, |ctx, refreshing| {
+                convert(search(ctx, &options, refreshing)?, |v| {
+                    SearchDataDto::try_from(v)
+                })
+            })?;
             if is_json {
                 emit(out, &result, true)
             } else {
@@ -316,12 +288,11 @@ fn execute(
                 max_chars: *max_chars,
                 offset: *offset,
             };
-            let result = gated(
-                &ctx,
-                &mut gate,
-                |ctx| convert(read(ctx, session, &options)?, |v| ReadDataDto::try_from(v)),
-                || Ok(None),
-            )?;
+            let result = gated(&ctx, refreshing, &mut gate, |ctx, refreshing| {
+                convert(read(ctx, session, &options, refreshing)?, |v| {
+                    ReadDataDto::try_from(v)
+                })
+            })?;
             if is_json {
                 emit(out, &result, true)
             } else {
@@ -356,108 +327,167 @@ fn execute(
                 until,
                 idle_ms,
             };
-            let result = gated(
-                &ctx,
-                &mut gate,
-                |ctx| convert(timeline(ctx, &options)?, |v| TimelineDataDto::try_from(v)),
-                || {
-                    TimelineDataDto::try_from(&TimelineResult {
-                        sessions: Vec::new(),
-                        daily_active_ms: BTreeMap::new(),
-                    })
-                    .map(Some)
-                },
-            )?;
+            let result = gated(&ctx, refreshing, &mut gate, |ctx, refreshing| {
+                convert(timeline(ctx, &options, refreshing)?, |v| {
+                    TimelineDataDto::try_from(v)
+                })
+            })?;
             emit(out, &result, is_json)
         }
-        Command::Index { .. } => emit(out, &refresh(&ctx, &filter.agents, true)?, is_json),
+        Command::Index { .. } => emit(out, &refresh(&ctx, &filter.agents, &refreshing)?, is_json),
         Command::Sessions => {
-            let result = gated(
-                &ctx,
-                &mut gate,
-                |ctx| {
-                    convert(sessions(ctx, &filter)?, |s| {
-                        SessionsDataDto::try_from(s.as_slice())
-                    })
-                },
-                || SessionsDataDto::try_from([].as_slice()).map(Some),
-            )?;
+            let result = gated(&ctx, refreshing, &mut gate, |ctx, refreshing| {
+                convert(sessions(ctx, &filter, refreshing)?, |s| {
+                    SessionsDataDto::try_from(s.as_slice())
+                })
+            })?;
             emit(out, &result, is_json)
         }
         Command::Entries { session } => {
             validate_key(session, &filter.agents)?;
-            stream_entries(&ctx, &mut gate, session, out, is_json)
+            stream_entries(&ctx, refreshing, &mut gate, session, out, is_json)
         }
     }
 }
 
+#[cfg(feature = "test-hooks")]
 fn build_limit(env: &BTreeMap<String, String>) -> Option<u64> {
-    if cfg!(debug_assertions) {
-        env.get("SLIMETRAIL_TEST_BUILD_LIMIT_MS")?.parse().ok()
+    env.get("SLIMETRAIL_TEST_BUILD_LIMIT_MS")?.parse().ok()
+}
+
+#[cfg(not(feature = "test-hooks"))]
+const fn build_limit(_: &BTreeMap<String, String>) -> Option<u64> {
+    None
+}
+
+fn configure(command: &Command, path: &Path) -> Result<config::Config> {
+    if let Command::Index {
+        coverage: Some(coverage),
+    } = command
+    {
+        config::write_coverage(path, *coverage)?;
+        return Ok(config::Config {
+            coverage: *coverage,
+            explicit: true,
+        });
+    }
+    config::load(path)
+}
+
+fn context(
+    common: &Common,
+    env: &BTreeMap<String, String>,
+    home: &Path,
+    cwd: &Path,
+    time_zone: String,
+    config: config::Config,
+) -> Result<Context> {
+    let index_dir = common.index_dir.clone().unwrap_or_else(|| {
+        env.get("XDG_DATA_HOME")
+            .filter(|s| !s.is_empty())
+            .map_or_else(|| home.join(".local/share"), PathBuf::from)
+            .join("slimetrail")
+    });
+    Ok(Context::new(
+        resolve_roots(home, env)?,
+        index_dir,
+        cwd.to_path_buf(),
+        Timestamp::now().as_millisecond(),
+        time_zone,
+    )
+    .with_coverage(config.coverage, config.explicit))
+}
+
+fn refresh_options(
+    indexing: bool,
+    interactive: bool,
+    build_limit: Option<u64>,
+    observer: &dyn Observer,
+) -> RefreshOptions<'_> {
+    if indexing {
+        return RefreshOptions {
+            observer: Some(observer),
+            ..RefreshOptions::FULL
+        };
+    }
+    let (max_ms, admission) = if interactive {
+        (INTERACTIVE_BUILD_MS, Admission::AllOrNothing)
     } else {
-        None
+        (BATCH_BUILD_MS, Admission::PerAgent)
+    };
+    RefreshOptions {
+        build: BuildPolicy::Limit {
+            max_ms: build_limit.unwrap_or(max_ms),
+            admission,
+        },
+        observer: Some(observer),
+        ..RefreshOptions::QUERY
     }
 }
 
-fn required(estimate: &JobEstimate) -> Vec<Diagnostic> {
-    estimate
-        .agents
-        .iter()
-        .map(|agent| index::estimate::required(agent, estimate.coverage))
-        .collect()
-}
-
-const fn whole(ctx: &Context) -> bool {
-    matches!(ctx.build, BuildPolicy::Limit { whole: true, .. })
-}
-
-fn rerun(ctx: &Context, gate: &mut Gate<'_>, estimate: &JobEstimate) -> Result<Context> {
-    let chosen = prompt::ask(
+fn rerun<'a>(
+    ctx: &Context,
+    refreshing: RefreshOptions<'a>,
+    gate: &mut Gate<'_>,
+    estimate: &JobEstimate,
+) -> Result<(Context, RefreshOptions<'a>)> {
+    let limit_ms = match refreshing.build {
+        BuildPolicy::Limit { max_ms, .. } => Some(max_ms),
+        BuildPolicy::Inline => None,
+    };
+    let choice = prompt::ask(
         estimate,
         gate.config,
-        &gate.path,
+        limit_ms,
         gate.terminal.input,
         gate.terminal.prompt,
     )?;
-    Ok(match (chosen, ctx.build) {
-        (Some(coverage), _) => Context {
-            build: BuildPolicy::Inline,
-            progress: true,
-            coverage: if estimate.coverage_locked {
-                ctx.coverage
-            } else {
-                coverage
-            },
-            ..ctx.clone()
-        },
-        (None, BuildPolicy::Limit { max_ms, .. }) => Context {
-            build: BuildPolicy::Limit {
+    let Some(choice) = choice else {
+        let build = match refreshing.build {
+            BuildPolicy::Limit { max_ms, .. } => BuildPolicy::Limit {
                 max_ms,
-                whole: false,
+                admission: Admission::PerAgent,
             },
-            ..ctx.clone()
+            BuildPolicy::Inline => BuildPolicy::Inline,
+        };
+        return Ok((
+            ctx.clone(),
+            RefreshOptions {
+                build,
+                ..refreshing
+            },
+        ));
+    };
+    if choice.save {
+        config::write_coverage(&gate.path, choice.coverage)?;
+    }
+    let locked = estimate.coverage_locked;
+    let ctx = ctx.clone().with_coverage(
+        if locked {
+            ctx.coverage
+        } else {
+            choice.coverage
         },
-        (None, BuildPolicy::Inline) => ctx.clone(),
-    })
+        ctx.coverage_explicit || !locked,
+    );
+    let refreshing = RefreshOptions {
+        build: BuildPolicy::Inline,
+        ..refreshing
+    };
+    Ok((ctx, refreshing))
 }
 
 fn gated<T>(
     ctx: &Context,
+    refreshing: RefreshOptions<'_>,
     gate: &mut Gate<'_>,
-    run: impl Fn(&Context) -> Result<Envelope<T>>,
-    empty: impl FnOnce() -> Result<Option<T>>,
+    run: impl Fn(&Context, &RefreshOptions<'_>) -> Result<Envelope<T>>,
 ) -> Result<Envelope<T>> {
-    let result = match run(ctx) {
-        Err(Error::IndexRequired(estimate)) if whole(ctx) => run(&rerun(ctx, gate, &estimate)?),
-        other => other,
-    };
-    match result {
-        Err(Error::IndexRequired(estimate)) => Ok(Envelope {
-            version: 1,
-            incomplete: true,
-            diagnostics: required(&estimate),
-            data: empty()?,
-        }),
+    match run(ctx, &refreshing) {
+        Err(Error::IndexRequired(estimate)) => {
+            let (ctx, refreshing) = rerun(ctx, refreshing, gate, &estimate)?;
+            run(&ctx, &refreshing)
+        }
         other => other,
     }
 }
@@ -681,27 +711,18 @@ fn broken_pipe(error: &Error) -> bool {
 
 fn stream_entries(
     ctx: &Context,
+    refreshing: RefreshOptions<'_>,
     gate: &mut Gate<'_>,
     key: &SessionKey,
     out: &mut dyn Write,
     is_json: bool,
 ) -> Result<i32> {
-    let mut ctx = ctx.clone();
-    if whole(&ctx) {
-        match write_entries(out, is_json, |emit| entries(&ctx, key, emit)) {
-            Err(Error::IndexRequired(estimate)) => ctx = rerun(&ctx, gate, &estimate)?,
+    let (ctx, refreshing) =
+        match write_entries(out, is_json, |emit| entries(ctx, key, &refreshing, emit)) {
+            Err(Error::IndexRequired(estimate)) => rerun(ctx, refreshing, gate, &estimate)?,
             other => return other,
-        }
-    }
-    write_entries(out, is_json, |emit| match entries(&ctx, key, emit) {
-        Err(Error::IndexRequired(estimate)) => Ok(Envelope {
-            version: 1,
-            incomplete: true,
-            diagnostics: required(&estimate),
-            data: None,
-        }),
-        other => other,
-    })
+        };
+    write_entries(out, is_json, |emit| entries(&ctx, key, &refreshing, emit))
 }
 
 fn write_entries(
@@ -758,6 +779,7 @@ fn write_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use slimetrail::index;
     use std::fs;
 
     struct Run {
@@ -799,16 +821,17 @@ mod tests {
             ("CODEX_HOME".into(), path("codex")),
             ("XDG_DATA_HOME".into(), path("data")),
             ("SLIMETRAIL_CONFIG".into(), path("config.toml")),
-            ("SLIMETRAIL_TEST_BUILD_LIMIT_MS".into(), limit.to_string()),
             ("TZ".into(), "UTC".into()),
         ]);
         let (mut stdout, mut prompt) = (Vec::new(), Vec::new());
         let code = execute(
             &cli,
             &env,
+            Some(limit),
             &mut stdout,
             Terminal {
                 tty: true,
+                stderr: false,
                 input: &mut answer.as_bytes(),
                 prompt: &mut prompt,
             },
@@ -840,6 +863,31 @@ mod tests {
 
     const SEARCH: [&str; 3] = ["--codex", "search", "needle"];
 
+    #[cfg(feature = "test-hooks")]
+    fn only_pi_fits(root: &Path, limit: u64) {
+        let ctx = Context::new(
+            resolve_roots(root, &BTreeMap::new()).unwrap(),
+            root.join("index"),
+            root.into(),
+            0,
+            "UTC".into(),
+        );
+        let estimate = index::IndexSession::open(&ctx)
+            .unwrap()
+            .estimate(&BTreeSet::from([Agent::Claude, Agent::Pi]))
+            .unwrap();
+        let millis = |agent| {
+            estimate
+                .agents
+                .iter()
+                .find(|a| a.agent == agent)
+                .unwrap()
+                .compact
+                .millis
+        };
+        assert!(millis(Agent::Pi) <= limit && millis(Agent::Claude) > limit);
+    }
+
     #[test]
     fn interactive_query_with_nothing_to_build_runs_once_without_prompting() {
         let dir = tempfile::tempdir().unwrap();
@@ -847,8 +895,10 @@ mod tests {
         codex(root, "Published needle");
         assert_eq!(invoke(root, &["--codex", "index"], 0, "").code, 0);
         let before: i64 = settings(root, "refresh_seq");
+        #[cfg(feature = "test-hooks")]
         let discovered = index::discoveries();
         let run = invoke(root, &SEARCH, 0, "y\n");
+        #[cfg(feature = "test-hooks")]
         assert_eq!(index::discoveries() - discovered, 1);
         assert_eq!(run.code, 0);
         assert_eq!(run.prompt, "");
@@ -913,37 +963,15 @@ mod tests {
             serde_json::json!({"type":"user","sessionId":"large","cwd":"/fixture/app","message":{"content":text}}).to_string() + "\n",
         )
         .unwrap();
-        let estimate = api::estimate(
-            &Context {
-                roots: resolve_roots(root, &BTreeMap::new()).unwrap(),
-                index_dir: root.join("index"),
-                cwd: root.into(),
-                now_ms: 0,
-                time_zone: "UTC".into(),
-                coverage: Coverage::Compact,
-                build: BuildPolicy::Inline,
-                progress: false,
-            },
-            &BTreeSet::from([Agent::Claude, Agent::Pi]),
-        )
-        .unwrap();
-        let millis = |agent| {
-            estimate
-                .agents
-                .iter()
-                .find(|a| a.agent == agent)
-                .unwrap()
-                .compact
-                .millis
-        };
-        assert!(millis(Agent::Pi) <= 20 && millis(Agent::Claude) > 20);
+        #[cfg(feature = "test-hooks")]
+        only_pi_fits(root, 20);
         let run = invoke(root, &["--claude", "--pi", "sessions"], 20, "f\n");
         assert_eq!(run.code, 0, "{}", run.prompt);
         assert!(run.prompt.contains("\n  compact "), "{}", run.prompt);
         assert!(run.prompt.contains("\n  full "), "{}", run.prompt);
         assert!(
             run.prompt
-                .ends_with("Build now? [c]ompact / [f]ull / [N]o: ")
+                .ends_with("Build now? [c]ompact or [y]es / [f]ull / [N]o: ")
         );
         assert_eq!(stored_coverage(root), "full");
         assert_eq!(
@@ -963,13 +991,17 @@ mod tests {
         let declined = invoke(root, &SEARCH, 0, "\n");
         assert_eq!(declined.code, 1);
         let lines: Vec<_> = declined.prompt.lines().collect();
-        assert_eq!(lines.len(), 4, "{}", declined.prompt);
+        assert_eq!(lines.len(), 5, "{}", declined.prompt);
         assert!(lines[1].starts_with("  compact "), "{}", lines[1]);
         assert_eq!(
             lines[2],
             "The config asks for full coverage but the index is compact; run `slimetrail index` to rebuild it."
         );
-        assert_eq!(lines[3], "Build now? [y/N]: ");
+        assert_eq!(
+            lines[3],
+            "No builds only what fits in 1 s; `slimetrail index` builds the rest."
+        );
+        assert_eq!(lines[4], "Build now? [y/N]: ");
         assert_eq!(
             declined
                 .stdout

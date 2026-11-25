@@ -125,9 +125,6 @@ impl Source for Opencode {
             let legacy =
                 !ctx.roots.opencode_db.exists() && ctx.roots.opencode_legacy_storage.exists();
             Ok(Discovery {
-                sessions: Vec::new(),
-                complete_agents: BTreeSet::new(),
-                warnings: Vec::new(),
                 diagnostics: vec![diagnostic(
                     Agent::Opencode,
                     &ctx.roots.opencode_db,
@@ -142,12 +139,12 @@ impl Source for Opencode {
                         "OpenCode database could not be read consistently or has an unsupported schema"
                     },
                 )],
+                ..Discovery::default()
             })
         }, |sessions| Ok(Discovery {
             sessions,
-            diagnostics: Vec::new(),
-            warnings: Vec::new(),
             complete_agents: BTreeSet::from([Agent::Opencode]),
+            ..Discovery::default()
         }))
     }
 

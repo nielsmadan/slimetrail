@@ -12,41 +12,35 @@ pub fn searchable_start(
     match (coverage, searchable) {
         (_, Searchable::Duplicate) => None,
         (Coverage::Compact, _) if kind == Kind::Meta && subtype == Some("reasoning") => None,
-        (Coverage::Compact, Searchable::ToolResult) => {
-            let mut start = text.len().saturating_sub(TOOL_RESULT_TAIL);
-            while !text.is_char_boundary(start) {
-                start += 1;
-            }
-            Some(start)
-        }
+        (Coverage::Compact, Searchable::ToolResult) => Some(tail_start(text)),
         (Coverage::Full, _) | (Coverage::Compact, Searchable::Text) => Some(0),
+    }
+}
+
+pub const fn tail_start(text: &str) -> usize {
+    let mut start = text.len().saturating_sub(TOOL_RESULT_TAIL);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    start
+}
+
+pub(crate) const fn stored_split(searchable: Searchable, text: &str) -> usize {
+    match searchable {
+        Searchable::ToolResult => tail_start(text),
+        Searchable::Text | Searchable::Duplicate => text.len(),
     }
 }
 
 pub const fn mismatch(index: Coverage, config: Coverage) -> Option<&'static str> {
     match (index, config) {
         (Coverage::Compact, Coverage::Full) => Some(
-            "The config asks for full coverage but the index is compact; run `slimetrail index` to rebuild it.",
+            "The config asks for full coverage but the index is compact; run `slimetrail index` to rebuild it",
         ),
         (Coverage::Full, Coverage::Compact) => Some(
-            "The config asks for compact coverage but the index is full; run `slimetrail index` to rebuild it.",
+            "The config asks for compact coverage but the index is full; run `slimetrail index` to rebuild it",
         ),
         _ => None,
-    }
-}
-
-pub(crate) const fn coverage_name(coverage: Coverage) -> &'static str {
-    match coverage {
-        Coverage::Compact => "compact",
-        Coverage::Full => "full",
-    }
-}
-
-pub(crate) fn parse_coverage(name: &str) -> Result<Coverage> {
-    match name {
-        "compact" => Ok(Coverage::Compact),
-        "full" => Ok(Coverage::Full),
-        _ => Err(Error::InvalidArgument("index coverage is invalid".into())),
     }
 }
 

@@ -24,7 +24,10 @@ Rustup must be able to install the declared toolchain/components before running 
 | `just install` / `just uninstall` | Cargo installation; respects `CARGO_INSTALL_ROOT` |
 
 Checks use command deadlines. The benchmark has no latency threshold, and coverage is
-reported without an arbitrary minimum. See the [performance procedure](tests/search-performance/README.md).
+reported without an arbitrary minimum. Tests and lint run with `--all-features`, which
+enables the `test-hooks` feature: a build-limit override (`SLIMETRAIL_TEST_BUILD_LIMIT_MS`)
+and a discovery counter that some integration tests need. Release builds leave it off, so
+plain `cargo test` skips those tests. See the [performance procedure](tests/search-performance/README.md).
 The pre-commit hook checks changed Rust/Python file types and scans staged changes for
 secrets; pre-push runs `just check-all`. Secret scans never follow symlinks, and the worktree
 scan includes tracked/unignored files only, excluding private `.local` indexes.

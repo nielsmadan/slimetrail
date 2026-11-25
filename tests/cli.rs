@@ -776,10 +776,9 @@ fn coverage_flag_rebuilds_search_documents_without_reparsing() {
     let back = fixture.json(&["index", "--codex", "--coverage", "compact"], 0);
     assert_eq!(back["data"]["reparsed"], 0);
     assert_eq!(index_settings(&fixture), ("compact".into(), None));
-    assert_eq!(
-        fixture.json(&search_args("early-literal"), 0)["data"]["count"],
-        0
-    );
+    let chosen = fixture.json(&search_args("early-literal"), 0);
+    assert_eq!(chosen["data"]["count"], 0);
+    assert_eq!(chosen["diagnostics"], json!([]));
 }
 
 #[test]
@@ -834,7 +833,7 @@ fn config_mismatch_is_noted_by_queries_and_reconciled_only_by_index() {
     let noted = run(&search_args("early-literal"), 0);
     assert_eq!(noted["data"]["count"], 0);
     assert_eq!(noted["incomplete"], false);
-    assert_eq!(codes(&noted), ["search_coverage"]);
+    assert_eq!(codes(&noted), ["coverage_mismatch"]);
     let message = noted["diagnostics"][0]["message"].as_str().unwrap();
     assert!(message.contains("config asks for full"), "{message}");
     assert!(message.contains("run `slimetrail index`"), "{message}");
@@ -846,7 +845,8 @@ fn config_mismatch_is_noted_by_queries_and_reconciled_only_by_index() {
     assert_eq!(full["diagnostics"], json!([]));
     let mismatch = fixture.json(&search_args("early-literal"), 0);
     assert_eq!(mismatch["data"]["count"], 1);
-    assert_eq!(codes(&mismatch), ["search_coverage"]);
+    assert_eq!(mismatch["incomplete"], false);
+    assert_eq!(codes(&mismatch), ["coverage_mismatch"]);
     assert!(
         mismatch["diagnostics"][0]["message"]
             .as_str()
@@ -962,8 +962,11 @@ fn config_file_location_and_validation() {
     fs::write(&explicit, "coverage = \"full\"\nextra = 1\n").unwrap();
     let output = run(&[("SLIMETRAIL_CONFIG", explicit.as_path())]);
     assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains(&explicit.display().to_string()), "{stderr}");
+    assert!(stderr.contains("unknown field `extra`"), "{stderr}");
     let value: Value = serde_json::from_slice(&run(&[]).stdout).unwrap();
-    assert_eq!(codes(&value), ["search_coverage"]);
+    assert_eq!(codes(&value), ["coverage_mismatch"]);
     assert!(
         value["diagnostics"][0]["message"]
             .as_str()
@@ -972,6 +975,7 @@ fn config_file_location_and_validation() {
     );
 }
 
+#[cfg(feature = "test-hooks")]
 #[test]
 fn non_interactive_over_limit_queries_return_index_required_shapes() {
     let fixture = Fixture::new();
@@ -1022,6 +1026,7 @@ fn non_interactive_over_limit_queries_return_index_required_shapes() {
     assert!(String::from_utf8_lossy(&text.stderr).contains("index_required: [codex]"));
 }
 
+#[cfg(feature = "test-hooks")]
 #[test]
 fn index_command_builds_regardless_of_the_estimate() {
     let fixture = Fixture::new();
@@ -1048,6 +1053,7 @@ fn index_command_builds_regardless_of_the_estimate() {
     assert_eq!(value["data"]["count"], 1);
 }
 
+#[cfg(feature = "test-hooks")]
 #[test]
 fn index_required_names_the_index_coverage_when_config_differs() {
     let fixture = Fixture::new();
@@ -1077,6 +1083,7 @@ fn index_required_names_the_index_coverage_when_config_differs() {
     assert!(message.contains("at compact coverage"), "{message}");
 }
 
+#[cfg(feature = "test-hooks")]
 #[test]
 fn non_interactive_stale_entries_stream_once_with_index_required() {
     let fixture = Fixture::new();

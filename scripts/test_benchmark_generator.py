@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import benchmark
 
@@ -89,6 +90,108 @@ class DevinStoreTests(unittest.TestCase):
                 )
             for marker in ("thinking", "tool_calls", "tool_call_id"):
                 self.assertIn(marker, text)
+
+
+class AggregateIndexTests(unittest.TestCase):
+    def test_entry_bytes_count_split_tool_result_tails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            index = Path(directory)
+            with contextlib.closing(
+                sqlite3.connect(index / "index-v3.sqlite3")
+            ) as connection:
+                connection.executescript(
+                    "CREATE TABLE sessions(id TEXT);"
+                    "CREATE TABLE entries(text_tail TEXT, text TEXT);"
+                    "CREATE TABLE search_documents(has_non_ascii INTEGER, has_nul INTEGER);"
+                    "INSERT INTO entries VALUES('tail', 'head'), ('', 'plain é');"
+                )
+            self.assertEqual(benchmark.aggregate_index(index)["entry_bytes"], 16)
+
+    def test_index_bytes_include_pages_still_in_the_wal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            index = Path(directory)
+            path = index / "index-v3.sqlite3"
+            with contextlib.closing(sqlite3.connect(path)) as writer:
+                writer.executescript(
+                    "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;"
+                    "CREATE TABLE sessions(id TEXT);"
+                    "CREATE TABLE entries(text_tail TEXT, text TEXT);"
+                    "CREATE TABLE search_documents(has_non_ascii INTEGER, has_nul INTEGER);"
+                )
+                writer.execute("INSERT INTO entries VALUES('', ?)", ("x" * 300_000,))
+                writer.commit()
+                dimensions = benchmark.aggregate_index(index)
+            self.assertGreater(dimensions["index_bytes"], 300_000)
+            self.assertEqual(dimensions["index_bytes"], path.stat().st_size)
+
+
+class PerAgentTests(unittest.TestCase):
+    def run_agent(self, invoke):
+        emitted = []
+        with tempfile.TemporaryDirectory() as directory:
+            fresh = Path(directory) / "index-pi"
+            fresh.mkdir()
+            with (
+                mock.patch.object(benchmark, "invoke", invoke),
+                mock.patch.object(benchmark, "emit", emitted.append),
+                mock.patch.object(
+                    benchmark, "agent_dimensions", return_value={"sessions": 2}
+                ),
+            ):
+                try:
+                    benchmark.measure_agent(
+                        "slimetrail",
+                        fresh,
+                        {},
+                        "pi",
+                        {"files": 3, "bytes": 40},
+                        "compact",
+                        10,
+                        0,
+                    )
+                finally:
+                    removed = not fresh.exists()
+        return emitted, removed
+
+    def test_record_is_emitted_after_its_index_is_removed(self):
+        result = {"seconds": 1.5, "exit": 0, "diagnostic_counts": {}}
+        emitted, removed = self.run_agent(lambda *_: result)
+        self.assertTrue(removed)
+        self.assertEqual(
+            emitted,
+            [
+                {
+                    "per_agent": "pi",
+                    "coverage": "compact",
+                    "source_files": 3,
+                    "source_bytes": 40,
+                    "cold_ms": 1500,
+                    "exit": 0,
+                    "incomplete": None,
+                    "diagnostic_counts": {},
+                    "counters": {},
+                    "sessions": 2,
+                }
+            ],
+        )
+
+    def test_fatal_exit_is_recorded_then_raised(self):
+        result = {"seconds": 1, "exit": 2, "diagnostic_counts": {"fatal": 1}}
+        with self.assertRaisesRegex(RuntimeError, "cli_fatal"):
+            self.run_agent(lambda *_: result)
+
+    def test_failure_is_recorded_then_reraised(self):
+        def timeout(*_):
+            raise TimeoutError
+
+        emitted = []
+        with mock.patch.object(benchmark, "emit", emitted.append):
+            with self.assertRaises(TimeoutError):
+                benchmark.attempt({"per_agent": "pi"}, timeout)
+        self.assertEqual(
+            [{k: v for k, v in e.items() if k != "elapsed_seconds"} for e in emitted],
+            [{"per_agent": "pi", "failure": "TimeoutError"}],
+        )
 
 
 if __name__ == "__main__":

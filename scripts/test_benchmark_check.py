@@ -81,10 +81,12 @@ class BenchmarkCheckTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     validate(changed)
 
-    def test_search_coverage_note_is_not_a_failure(self):
-        changed = records()
-        changed[3]["runs"][0]["diagnostic_counts"] = {"search_coverage": 1}
-        validate(changed)
+    def test_informational_coverage_notes_are_not_failures(self):
+        for code in ("search_coverage", "coverage_mismatch"):
+            with self.subTest(code=code):
+                changed = records()
+                changed[3]["runs"][0]["diagnostic_counts"] = {code: 1}
+                validate(changed)
 
     def test_per_agent_records(self):
         for coverage in ("compact", "full"):

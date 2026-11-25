@@ -1,13 +1,61 @@
 use super::{
     IndexSession,
-    coverage::{coverage_name, parse_searchable, searchable_name, searchable_start},
+    coverage::{parse_searchable, searchable_name, searchable_start, stored_split},
+    schema,
 };
 use crate::{
     Agent, CachedSource, Coverage, Diagnostic, DiscoveryCache, Entry, Error, Kind, RawSession,
     Result, Searchable, Session, SessionKey, SourceState, TitleOrigin,
 };
 use rusqlite::{Connection, OptionalExtension, Row, params};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SourceStatus {
+    Pending,
+    Fresh,
+    Partial,
+    Recheck,
+    Failed,
+}
+
+impl SourceStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Fresh => "fresh",
+            Self::Partial | Self::Recheck => "partial",
+            Self::Failed => "failed",
+        }
+    }
+
+    const fn recheck(self) -> bool {
+        matches!(self, Self::Recheck)
+    }
+}
+
+const STATE_VERSION: u32 = 2;
+
+#[derive(Serialize, Deserialize)]
+struct StoredState<T> {
+    version: u32,
+    state: T,
+}
+
+fn encode_state(state: &SourceState) -> Result<String> {
+    encode(&StoredState {
+        version: STATE_VERSION,
+        state,
+    })
+}
+
+fn decode_state(stored: &str) -> Option<SourceState> {
+    serde_json::from_str::<StoredState<SourceState>>(stored)
+        .ok()
+        .filter(|stored| stored.version == STATE_VERSION)
+        .map(|stored| stored.state)
+}
 
 pub struct Document {
     pub session: SessionKey,
@@ -35,7 +83,7 @@ fn document_sql(candidate: bool) -> String {
     };
     let eligible = " AND x.agent||':'||x.id IN (SELECT agent||':'||id FROM eligible)";
     format!(
-        "WITH eligible AS MATERIALIZED (SELECT json_extract(value,'$.agent') AS agent,json_extract(value,'$.id') AS id FROM json_each(?2)){candidates} SELECT x.agent,x.id,x.entry_index,x.kind,e.text,CASE WHEN x.entry_index IS NULL THEN t.metadata END,e.role,x.text_start FROM {documents} JOIN sessions t ON t.namespace=x.namespace AND t.agent=x.agent AND t.id=x.id AND t.source=x.source LEFT JOIN entries e ON e.namespace=x.namespace AND e.agent=x.agent AND e.id=x.id AND e.source=x.source AND e.entry_index=x.entry_index {VISIBLE}{eligible} AND (x.kind='title' OR ?5='[]' OR x.kind IN (SELECT value FROM json_each(?5))) ORDER BY x.agent,x.id,x.entry_index IS NOT NULL,x.document_id"
+        "WITH eligible AS MATERIALIZED (SELECT json_extract(value,'$.agent') AS agent,json_extract(value,'$.id') AS id FROM json_each(?2)){candidates} SELECT x.agent,x.id,x.entry_index,x.kind,CASE WHEN x.text_start>=e.tail_start THEN e.text_tail ELSE e.text||e.text_tail END,CASE WHEN x.entry_index IS NULL THEN t.metadata END,e.role,CASE WHEN x.text_start>=e.tail_start THEN x.text_start-e.tail_start ELSE x.text_start END FROM {documents} JOIN sessions t ON t.namespace=x.namespace AND t.agent=x.agent AND t.id=x.id AND t.source=x.source LEFT JOIN entries e ON e.namespace=x.namespace AND e.agent=x.agent AND e.id=x.id AND e.source=x.source AND e.entry_index=x.entry_index {VISIBLE}{eligible} AND (x.kind='title' OR ?5='[]' OR x.kind IN (SELECT value FROM json_each(?5))) ORDER BY x.agent,x.id,x.entry_index IS NOT NULL,x.document_id"
     )
 }
 
@@ -47,53 +95,73 @@ fn decode<T: serde::de::DeserializeOwned>(value: &str) -> Result<T> {
     Ok(serde_json::from_str(value)?)
 }
 
-pub(super) fn cache(
-    connection: &Connection,
-    namespace: &str,
-    agent: Agent,
-) -> Result<DiscoveryCache> {
-    Ok(DiscoveryCache {
-        by_source: cached(connection, namespace, agent, "fresh")?,
-        verify: false,
+pub(super) struct Cached {
+    pub discovery: DiscoveryCache,
+    pub diagnostics: BTreeMap<String, Vec<Diagnostic>>,
+}
+
+pub(super) fn cache(connection: &Connection, namespace: &str, agent: Agent) -> Result<Cached> {
+    let rows = cached(connection, namespace, agent, false)?;
+    let diagnostics = rows
+        .iter()
+        .filter(|(_, (_, diagnostics))| !diagnostics.is_empty())
+        .map(|(source, (_, diagnostics))| (source.clone(), diagnostics.clone()))
+        .collect();
+    Ok(Cached {
+        discovery: DiscoveryCache {
+            by_source: rows
+                .into_iter()
+                .map(|(source, (cached, _))| (source, cached))
+                .collect(),
+            verify: false,
+        },
+        diagnostics,
     })
 }
 
-pub(super) fn partial(
+pub(super) fn rechecked(
     connection: &Connection,
     namespace: &str,
     agent: Agent,
 ) -> Result<BTreeMap<String, CachedSource>> {
-    cached(connection, namespace, agent, "partial")
+    Ok(cached(connection, namespace, agent, true)?
+        .into_iter()
+        .map(|(source, (cached, _))| (source, cached))
+        .collect())
 }
 
 fn cached(
     connection: &Connection,
     namespace: &str,
     agent: Agent,
-    status: &str,
-) -> Result<BTreeMap<String, CachedSource>> {
-    let mut statement = connection.prepare("SELECT s.id,s.source,s.dependencies,s.fingerprint,s.state FROM sources s JOIN sessions t ON t.namespace=s.namespace AND t.agent=s.agent AND t.id=s.id AND t.source=s.source WHERE s.namespace=?1 AND s.agent=?2 AND s.status=?3")?;
-    let mut rows = statement.query((namespace, agent.to_string(), status))?;
+    recheck: bool,
+) -> Result<BTreeMap<String, (CachedSource, Vec<Diagnostic>)>> {
+    let mut statement = connection.prepare("SELECT s.id,s.source,s.dependencies,s.fingerprint,s.state,s.diagnostics FROM sources s JOIN sessions t ON t.namespace=s.namespace AND t.agent=s.agent AND t.id=s.id AND t.source=s.source WHERE s.namespace=?1 AND s.agent=?2 AND s.status IN (?3,?4) AND s.recheck=?5")?;
+    let mut rows = statement.query(params![
+        namespace,
+        agent.as_str(),
+        SourceStatus::Fresh.as_str(),
+        SourceStatus::Partial.as_str(),
+        recheck
+    ])?;
     let mut by_source = BTreeMap::new();
     while let Some(row) = rows.next()? {
         let source: String = row.get(1)?;
-        by_source.insert(
-            source.clone(),
-            CachedSource {
-                key: SessionKey {
-                    agent,
-                    id: row.get(0)?,
-                },
-                source,
-                dependencies: decode(&row.get::<_, String>(2)?)?,
-                fingerprint: decode(&row.get::<_, String>(3)?)?,
-                state: row
-                    .get::<_, Option<String>>(4)?
-                    .as_deref()
-                    .map(decode)
-                    .transpose()?,
+        let cached = CachedSource {
+            key: SessionKey {
+                agent,
+                id: row.get(0)?,
             },
-        );
+            source: source.clone(),
+            dependencies: decode(&row.get::<_, String>(2)?)?,
+            fingerprint: decode(&row.get::<_, String>(3)?)?,
+            state: row
+                .get::<_, Option<String>>(4)?
+                .as_deref()
+                .and_then(decode_state),
+        };
+        let diagnostics = decode(&row.get::<_, String>(5)?)?;
+        by_source.insert(source, (cached, diagnostics));
     }
     Ok(by_source)
 }
@@ -168,7 +236,7 @@ pub(super) fn throughput(
     Ok(connection
         .query_row(
             "SELECT bytes,micros FROM throughput WHERE agent=?1 AND coverage=?2",
-            [agent.to_string(), coverage_name(coverage).to_owned()],
+            [agent.to_string(), coverage.as_str().to_owned()],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?)
@@ -181,7 +249,7 @@ pub(super) fn observe(
     bytes: u64,
     micros: u64,
 ) -> Result<()> {
-    connection.execute("INSERT INTO throughput(agent,coverage,bytes,micros) VALUES(?1,?2,?3,?4) ON CONFLICT(agent,coverage) DO UPDATE SET bytes=bytes+excluded.bytes,micros=micros+excluded.micros", params![agent.to_string(), coverage_name(coverage), bytes, micros])?;
+    connection.execute("INSERT INTO throughput(agent,coverage,bytes,micros) VALUES(?1,?2,?3,?4) ON CONFLICT(agent,coverage) DO UPDATE SET bytes=bytes+excluded.bytes,micros=micros+excluded.micros", params![agent.to_string(), coverage.as_str(), bytes, micros])?;
     Ok(())
 }
 
@@ -192,7 +260,54 @@ pub(super) fn carry_forward(
     generation: i64,
     seen: &BTreeSet<String>,
 ) -> Result<()> {
-    connection.execute("UPDATE sources SET generation=?1 WHERE namespace=?2 AND agent=?3 AND status IN ('fresh','partial') AND generation>=COALESCE((SELECT published FROM refresh_runs WHERE namespace=?2 AND agent=?3),0) AND source NOT IN (SELECT value FROM json_each(?4))", params![generation, namespace, agent.to_string(), encode(seen)?])?;
+    connection.execute("UPDATE sources SET generation=?1 WHERE namespace=?2 AND agent=?3 AND status IN (?5,?6) AND generation>=COALESCE((SELECT published FROM refresh_runs WHERE namespace=?2 AND agent=?3),0) AND source NOT IN (SELECT value FROM json_each(?4))", params![generation, namespace, agent.as_str(), encode(seen)?, SourceStatus::Fresh.as_str(), SourceStatus::Partial.as_str()])?;
+    Ok(())
+}
+
+pub(super) fn keep_reused(
+    connection: &Connection,
+    namespace: &str,
+    agent: Agent,
+    generation: i64,
+    reused: &BTreeSet<String>,
+) -> Result<()> {
+    connection.execute(
+        "UPDATE sources SET generation=?1 WHERE namespace=?2 AND agent=?3 AND status IN (?5,?6) AND NOT recheck AND source IN (SELECT value FROM json_each(?4))",
+        params![generation, namespace, agent.as_str(), encode(reused)?, SourceStatus::Fresh.as_str(), SourceStatus::Partial.as_str()],
+    )?;
+    Ok(())
+}
+
+pub(super) fn remove_unlisted(
+    connection: &Connection,
+    namespace: &str,
+    agent: Agent,
+    generation: i64,
+) -> Result<u64> {
+    Ok(connection.execute(
+        "DELETE FROM sources WHERE namespace=?1 AND agent=?2 AND generation<>?3",
+        params![namespace, agent.as_str(), generation],
+    )? as u64)
+}
+
+pub(super) fn publish_run(
+    connection: &Connection,
+    namespace: &str,
+    agent: Agent,
+    complete: bool,
+    diagnostics: &[Diagnostic],
+    seq: i64,
+) -> Result<()> {
+    connection.execute(
+        "UPDATE refresh_runs SET status=?1,diagnostics=?2,published=generation,published_seq=?3 WHERE namespace=?4 AND agent=?5",
+        params![
+            if complete { "complete" } else { "incomplete" },
+            encode(&diagnostics)?,
+            seq,
+            namespace,
+            agent.as_str()
+        ],
+    )?;
     Ok(())
 }
 
@@ -200,13 +315,25 @@ pub(super) fn source(
     connection: &Connection,
     namespace: &str,
     raw: &RawSession,
-    status: &str,
+    status: SourceStatus,
     diagnostics: &[Diagnostic],
     generation: i64,
     state: Option<&SourceState>,
 ) -> Result<()> {
-    connection.execute("INSERT INTO sources(namespace,agent,source,id,dependencies,fingerprint,status,diagnostics,generation,state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(namespace,agent,source) DO UPDATE SET id=excluded.id,dependencies=excluded.dependencies,fingerprint=excluded.fingerprint,status=excluded.status,diagnostics=excluded.diagnostics,generation=excluded.generation,state=excluded.state",
-        params![namespace,raw.key.agent.to_string(),raw.source,raw.key.id,encode(&raw.dependencies)?,encode(&raw.fingerprint)?,status,encode(&diagnostics)?,generation,state.map(encode).transpose()?])?;
+    connection.execute("INSERT INTO sources(namespace,agent,source,id,dependencies,fingerprint,status,recheck,diagnostics,generation,state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(namespace,agent,source) DO UPDATE SET id=excluded.id,dependencies=excluded.dependencies,fingerprint=excluded.fingerprint,status=excluded.status,recheck=excluded.recheck,diagnostics=excluded.diagnostics,generation=excluded.generation,state=excluded.state",
+        params![namespace,raw.key.agent.as_str(),raw.source,raw.key.id,encode(&raw.dependencies)?,encode(&raw.fingerprint)?,status.as_str(),status.recheck(),encode(&diagnostics)?,generation,state.map(encode_state).transpose()?])?;
+    Ok(())
+}
+
+pub(super) fn delete_session(
+    connection: &Connection,
+    namespace: &str,
+    raw: &RawSession,
+) -> Result<()> {
+    connection.execute(
+        "DELETE FROM sessions WHERE namespace=?1 AND agent=?2 AND (id=?3 OR source=?4)",
+        params![namespace, raw.key.agent.as_str(), raw.key.id, raw.source],
+    )?;
     Ok(())
 }
 
@@ -218,6 +345,55 @@ struct Owner<'a> {
     source: &'a str,
 }
 
+impl<'a> Owner<'a> {
+    const fn of(namespace: &'a str, raw: &'a RawSession) -> Self {
+        Self {
+            namespace,
+            agent: raw.key.agent.as_str(),
+            id: raw.key.id.as_str(),
+            source: raw.source.as_str(),
+        }
+    }
+}
+
+struct OwnerColumns {
+    namespace: String,
+    agent: String,
+    id: String,
+    source: String,
+}
+
+impl OwnerColumns {
+    fn read(row: &Row<'_>) -> Result<Self> {
+        Ok(Self {
+            namespace: row.get(1)?,
+            agent: row.get(2)?,
+            id: row.get(3)?,
+            source: row.get(4)?,
+        })
+    }
+
+    fn owner(&self) -> Owner<'_> {
+        Owner {
+            namespace: &self.namespace,
+            agent: &self.agent,
+            id: &self.id,
+            source: &self.source,
+        }
+    }
+}
+
+fn identity_changed() -> Error {
+    Error::InvalidArgument("source changed its session identity during parsing".into())
+}
+
+fn check_identity(raw: &RawSession, session: &Session) -> Result<()> {
+    if session.key != raw.key || session.source != raw.source {
+        return Err(identity_changed());
+    }
+    Ok(())
+}
+
 pub(super) fn entry(
     connection: &Connection,
     namespace: &str,
@@ -226,21 +402,16 @@ pub(super) fn entry(
     coverage: Coverage,
 ) -> Result<()> {
     if entry.session != raw.key {
-        return Err(Error::InvalidArgument(
-            "source changed its session identity during parsing".into(),
-        ));
+        return Err(identity_changed());
     }
     let index = i64::try_from(entry.index)
         .map_err(|_| Error::InvalidArgument("entry index exceeds SQLite range".into()))?;
-    let agent = entry.session.agent.to_string();
-    connection.prepare_cached("INSERT INTO entries(namespace,agent,id,source,entry_index,source_id,timestamp,timestamp_raw,role,kind,subtype,tool_name,automated,searchable,text) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)")?
-        .execute(params![namespace,agent,entry.session.id,raw.source,index,entry.source_id,entry.timestamp,entry.timestamp_raw,entry.role,kind_name(entry.kind),entry.subtype,entry.tool_name,entry.automated,searchable_name(entry.searchable),entry.text])?;
-    let owner = Owner {
-        namespace,
-        agent: &agent,
-        id: &raw.key.id,
-        source: &raw.source,
-    };
+    let owner = Owner::of(namespace, raw);
+    let (head, tail) = entry
+        .text
+        .split_at(stored_split(entry.searchable, &entry.text));
+    connection.prepare_cached("INSERT INTO entries(namespace,agent,id,source,entry_index,source_id,timestamp,timestamp_raw,role,kind,subtype,tool_name,automated,searchable,tail_start,text_tail,text) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)")?
+        .execute(params![namespace,owner.agent,owner.id,owner.source,index,entry.source_id,entry.timestamp,entry.timestamp_raw,entry.role,entry.kind.as_str(),entry.subtype,entry.tool_name,entry.automated,searchable_name(entry.searchable),head.len(),tail,head])?;
     entry_document(
         connection,
         owner,
@@ -260,7 +431,7 @@ fn entry_document(
     text: &str,
 ) -> Result<()> {
     searchable_start(coverage, kind, subtype, searchable, text).map_or(Ok(()), |start| {
-        document(connection, owner, Some(index), kind_name(kind), text, start)
+        document(connection, owner, Some(index), kind.as_str(), text, start)
     })
 }
 
@@ -292,11 +463,7 @@ pub(super) fn session(
     raw: &RawSession,
     session: &Session,
 ) -> Result<()> {
-    if session.key != raw.key || session.source != raw.source {
-        return Err(Error::InvalidArgument(
-            "source changed its session identity during parsing".into(),
-        ));
-    }
+    check_identity(raw, session)?;
     connection.execute(
         "INSERT INTO sessions(namespace,agent,id,source,metadata) VALUES(?1,?2,?3,?4,?5)",
         params![
@@ -336,11 +503,7 @@ pub(super) fn update_session(
     raw: &RawSession,
     session: &Session,
 ) -> Result<bool> {
-    if session.key != raw.key || session.source != raw.source {
-        return Err(Error::InvalidArgument(
-            "source changed its session identity during parsing".into(),
-        ));
-    }
+    check_identity(raw, session)?;
     let updated = connection.execute(
         "UPDATE sessions SET metadata=?5 WHERE namespace=?1 AND agent=?2 AND id=?3 AND source=?4",
         params![
@@ -363,17 +526,7 @@ fn title(
     raw: &RawSession,
     session: &Session,
 ) -> Result<()> {
-    let agent = raw.key.agent.to_string();
-    title_document(
-        connection,
-        Owner {
-            namespace,
-            agent: &agent,
-            id: &raw.key.id,
-            source: &raw.source,
-        },
-        session,
-    )
+    title_document(connection, Owner::of(namespace, raw), session)
 }
 
 fn title_document(connection: &Connection, owner: Owner<'_>, session: &Session) -> Result<()> {
@@ -392,15 +545,17 @@ fn batched(
     connection: &mut Connection,
     sql: &str,
     write: &mut dyn FnMut(&Connection, &Row<'_>) -> Result<usize>,
+    done: &mut dyn FnMut(u64),
 ) -> Result<()> {
     let mut after = i64::MIN;
     loop {
         let transaction = connection.transaction()?;
         let mut more = false;
+        let mut count = 0;
         {
             let mut statement = transaction.prepare_cached(sql)?;
             let mut rows = statement.query([after])?;
-            let (mut count, mut bytes) = (0, 0);
+            let mut bytes = 0;
             while let Some(row) = rows.next()? {
                 after = row.get(0)?;
                 bytes += write(&transaction, row)?;
@@ -412,43 +567,54 @@ fn batched(
             }
         }
         transaction.commit()?;
+        done(count as u64);
         if !more {
             return Ok(());
         }
     }
 }
 
-pub(super) fn rebuild_documents(connection: &mut Connection, target: Coverage) -> Result<()> {
+fn clear_documents(connection: &mut Connection) -> Result<()> {
+    // Foreign keys and the delete trigger each disable SQLite's truncate optimization.
+    connection.execute_batch("PRAGMA foreign_keys=OFF")?;
+    let cleared = (|| -> Result<()> {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(&format!(
+            "INSERT INTO search_fts(search_fts) VALUES('delete-all'); DROP TRIGGER documents_delete; DELETE FROM search_documents; {}",
+            schema::DOCUMENTS_DELETE
+        ))?;
+        transaction.commit()?;
+        Ok(())
+    })();
+    connection.execute_batch("PRAGMA foreign_keys=ON")?;
+    cleared
+}
+
+pub(super) fn rebuild_documents(
+    connection: &mut Connection,
+    target: Coverage,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<()> {
     connection.execute(
         "UPDATE settings SET coverage_pending=?1 WHERE id=1",
-        [coverage_name(target)],
+        [target.as_str()],
     )?;
-    let transaction = connection.transaction()?;
-    transaction.execute(
-        "INSERT INTO search_fts(search_fts) VALUES('delete-all')",
-        [],
-    )?;
-    transaction.execute("DELETE FROM search_documents", [])?;
-    transaction.commit()?;
+    let total: u64 = connection.query_row("SELECT count(*) FROM entries", [], |r| r.get(0))?;
+    progress(0, total);
+    clear_documents(connection)?;
+    let mut rebuilt = 0u64;
     batched(
         connection,
-        "SELECT rowid,namespace,agent,id,source,entry_index,kind,subtype,searchable,text FROM entries WHERE rowid>?1 ORDER BY rowid",
+        "SELECT rowid,namespace,agent,id,source,entry_index,kind,subtype,searchable,text||text_tail FROM entries WHERE rowid>?1 ORDER BY rowid",
         &mut |connection, row| {
-            let (agent, id, source): (String, String, String) =
-                (row.get(2)?, row.get(3)?, row.get(4)?);
-            let namespace: String = row.get(1)?;
-            let kind = parse_kind(row.get(6)?)?;
+            let columns = OwnerColumns::read(row)?;
+            let kind = parse_kind(&row.get::<_, String>(6)?)?;
             let subtype: Option<String> = row.get(7)?;
             let searchable = parse_searchable(&row.get::<_, String>(8)?)?;
             let text: String = row.get(9)?;
             entry_document(
                 connection,
-                Owner {
-                    namespace: &namespace,
-                    agent: &agent,
-                    id: &id,
-                    source: &source,
-                },
+                columns.owner(),
                 row.get(5)?,
                 target,
                 (kind, subtype.as_deref(), searchable),
@@ -456,39 +622,43 @@ pub(super) fn rebuild_documents(connection: &mut Connection, target: Coverage) -
             )?;
             Ok(text.len())
         },
+        &mut |count| {
+            rebuilt = rebuilt.saturating_add(count).min(total);
+            progress(rebuilt, total);
+        },
     )?;
     batched(
         connection,
         "SELECT rowid,namespace,agent,id,source,metadata FROM sessions WHERE rowid>?1 ORDER BY rowid",
         &mut |connection, row| {
-            let (namespace, agent, id, source): (String, String, String, String) =
-                (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?);
+            let columns = OwnerColumns::read(row)?;
             let metadata: String = row.get(5)?;
-            title_document(
-                connection,
-                Owner {
-                    namespace: &namespace,
-                    agent: &agent,
-                    id: &id,
-                    source: &source,
-                },
-                &decode(&metadata)?,
-            )?;
+            title_document(connection, columns.owner(), &decode(&metadata)?)?;
             Ok(metadata.len())
         },
+        &mut |_| {},
     )?;
     connection.execute(
         "UPDATE settings SET coverage=?1,coverage_pending=NULL WHERE id=1",
-        [coverage_name(target)],
+        [target.as_str()],
     )?;
+    reclaim(connection)
+}
+
+pub(super) fn reclaim(connection: &Connection) -> Result<()> {
     let mut statement = connection.prepare("PRAGMA incremental_vacuum")?;
     let mut rows = statement.query([])?;
     while rows.next()?.is_some() {}
     Ok(())
 }
 
-fn parse_kind(kind: String) -> Result<Kind> {
-    Ok(serde_json::from_value(serde_json::Value::String(kind))?)
+fn parse_kind(kind: &str) -> Result<Kind> {
+    match kind {
+        "message" => Ok(Kind::Message),
+        "tool" => Ok(Kind::Tool),
+        "meta" => Ok(Kind::Meta),
+        _ => Err(Error::InvalidArgument("entry kind is invalid".into())),
+    }
 }
 
 const VISIBLE: &str = "JOIN sources s ON s.namespace=x.namespace AND s.agent=x.agent AND s.source=x.source JOIN refresh_runs r ON r.namespace=s.namespace AND r.agent=s.agent WHERE x.namespace=?1 AND s.status IN ('fresh','partial') AND s.generation>=COALESCE(r.published,0)";
@@ -542,7 +712,7 @@ impl IndexSession {
     ) -> Result<()> {
         self.ready(key.agent)?;
         let sql = format!(
-            "SELECT x.entry_index,x.source_id,x.timestamp,x.timestamp_raw,x.role,x.kind,x.subtype,x.tool_name,x.automated,x.text,x.searchable FROM entries x {VISIBLE} AND x.agent=?2 AND x.id=?3 ORDER BY x.entry_index"
+            "SELECT x.entry_index,x.source_id,x.timestamp,x.timestamp_raw,x.role,x.kind,x.subtype,x.tool_name,x.automated,x.text||x.text_tail,x.searchable FROM entries x {VISIBLE} AND x.agent=?2 AND x.id=?3 ORDER BY x.entry_index"
         );
         let mut statement = self.connection.prepare(&sql)?;
         let mut rows = statement.query((&self.namespace, key.agent.to_string(), &key.id))?;
@@ -674,68 +844,67 @@ impl IndexSession {
         }
         Ok(())
     }
+}
 
-    pub fn verify_integrity(&self) -> Result<()> {
-        let _lock = super::lock::writer(&self.context.index_dir, super::REFRESH_WAIT, false)?
-            .ok_or(Error::IndexBusy)?;
-        let connection = super::schema::open(
-            &self.context.index_dir,
-            &self.namespace,
-            &self.roots,
-            self.context.coverage,
-        )?;
-        let failed = || Error::InvalidArgument("index integrity check failed".into());
-        let integrity: String = connection.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
-        if integrity != "ok" || connection.prepare("PRAGMA foreign_key_check")?.exists([])? {
-            return Err(failed());
-        }
-        connection.execute(
-            "INSERT INTO search_fts(search_fts,rank) VALUES('integrity-check',1)",
-            [],
-        )?;
-        let counts: (i64, i64) = connection.query_row(
-            "SELECT (SELECT count(*) FROM search_documents),(SELECT count(*) FROM search_fts)",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        if counts.0 != counts.1 {
-            return Err(failed());
-        }
-        let mut sample = connection.prepare("SELECT x.document_id,x.text_start,x.has_non_ascii,x.has_nul,CASE WHEN x.entry_index IS NULL THEN t.metadata ELSE e.text END,x.entry_index IS NULL FROM search_documents x JOIN sessions t ON t.namespace=x.namespace AND t.agent=x.agent AND t.id=x.id AND t.source=x.source LEFT JOIN entries e ON e.namespace=x.namespace AND e.agent=x.agent AND e.id=x.id AND e.source=x.source AND e.entry_index=x.entry_index ORDER BY random() LIMIT 100")?;
-        let mut matched = connection
-            .prepare("SELECT count(*) FROM search_fts WHERE search_fts MATCH ?1 AND rowid=?2")?;
-        let mut rows = sample.query([])?;
-        while let Some(row) = rows.next()? {
-            let document: i64 = row.get(0)?;
-            let start: usize = row.get(1)?;
-            let stored: String = row.get(4)?;
-            let text = if row.get(5)? {
-                decode::<Session>(&stored)?.title.unwrap_or_default()
-            } else {
-                stored
-            };
-            let slice = text.get(start..).ok_or_else(failed)?;
-            if row.get::<_, bool>(2)? == slice.is_ascii()
-                || row.get::<_, bool>(3)? != slice.contains('\0')
-            {
-                return Err(failed());
-            }
-            let trigram: String = slice.to_ascii_lowercase().chars().take(3).collect();
-            if trigram.chars().count() < 3 || trigram.contains('\0') {
-                continue;
-            }
-            let phrase = format!("\"{}\"", trigram.replace('"', "\"\""));
-            let found: i64 = matched.query_row(params![phrase, document], |r| r.get(0))?;
-            if found != 1 {
-                return Err(failed());
-            }
-        }
-        Ok(())
+pub(super) fn verify_integrity(connection: &Connection) -> Result<()> {
+    let failed = || Error::InvalidArgument("index integrity check failed".into());
+    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+    if integrity != "ok" || connection.prepare("PRAGMA foreign_key_check")?.exists([])? {
+        return Err(failed());
     }
+    connection.execute(
+        "INSERT INTO search_fts(search_fts,rank) VALUES('integrity-check',1)",
+        [],
+    )?;
+    let counts: (i64, i64) = connection.query_row(
+        "SELECT (SELECT count(*) FROM search_documents),(SELECT count(*) FROM search_fts)",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if counts.0 != counts.1 {
+        return Err(failed());
+    }
+    let mut sample = connection.prepare("WITH picked AS (SELECT document_id FROM (SELECT document_id,row_number() OVER (ORDER BY document_id)-1 AS n FROM search_documents) WHERE n%?1=0 LIMIT ?2) SELECT x.document_id,x.text_start,x.has_non_ascii,x.has_nul,CASE WHEN x.entry_index IS NULL THEN t.metadata ELSE e.text||e.text_tail END,x.entry_index IS NULL,x.entry_index IS NULL OR e.tail_start=length(CAST(e.text AS BLOB)) FROM picked p JOIN search_documents x ON x.document_id=p.document_id JOIN sessions t ON t.namespace=x.namespace AND t.agent=x.agent AND t.id=x.id AND t.source=x.source LEFT JOIN entries e ON e.namespace=x.namespace AND e.agent=x.agent AND e.id=x.id AND e.source=x.source AND e.entry_index=x.entry_index ORDER BY x.document_id")?;
+    let mut matched = connection
+        .prepare("SELECT count(*) FROM search_fts WHERE search_fts MATCH ?1 AND rowid=?2")?;
+    let mut rows = sample.query(params![sample_stride(counts.0), INTEGRITY_SAMPLE])?;
+    while let Some(row) = rows.next()? {
+        let document: i64 = row.get(0)?;
+        let start: usize = row.get(1)?;
+        let stored: String = row.get(4)?;
+        let text = if row.get(5)? {
+            decode::<Session>(&stored)?.title.unwrap_or_default()
+        } else {
+            stored
+        };
+        let slice = text.get(start..).ok_or_else(failed)?;
+        if !row.get::<_, bool>(6)?
+            || row.get::<_, bool>(2)? == slice.is_ascii()
+            || row.get::<_, bool>(3)? != slice.contains('\0')
+        {
+            return Err(failed());
+        }
+        let trigram: String = slice.to_ascii_lowercase().chars().take(3).collect();
+        if trigram.chars().count() < 3 || trigram.contains('\0') {
+            continue;
+        }
+        let phrase = format!("\"{}\"", trigram.replace('"', "\"\""));
+        let found: i64 = matched.query_row(params![phrase, document], |r| r.get(0))?;
+        if found != 1 {
+            return Err(failed());
+        }
+    }
+    Ok(())
+}
+
+const INTEGRITY_SAMPLE: i64 = 100;
+
+fn sample_stride(documents: i64) -> i64 {
+    ((documents + INTEGRITY_SAMPLE - 1) / INTEGRITY_SAMPLE).max(1)
 }
 
 fn read_entry(row: &Row<'_>, key: &SessionKey) -> Result<Entry> {
-    let kind = parse_kind(row.get(5)?)?;
+    let kind = parse_kind(&row.get::<_, String>(5)?)?;
     Ok(Entry {
         session: key.clone(),
         index: row.get(0)?,
@@ -752,18 +921,9 @@ fn read_entry(row: &Row<'_>, key: &SessionKey) -> Result<Entry> {
     })
 }
 
-const fn kind_name(kind: Kind) -> &'static str {
-    match kind {
-        Kind::Message => "message",
-        Kind::Meta => "meta",
-        Kind::Tool => "tool",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Context;
     use std::{fs, time::Instant};
 
     fn fixture(count: usize) -> (tempfile::TempDir, IndexSession, Vec<SessionKey>) {
@@ -776,16 +936,7 @@ mod tests {
         text: &str,
     ) -> (tempfile::TempDir, IndexSession, Vec<SessionKey>) {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = Context {
-            roots: crate::resolve_roots(dir.path(), &BTreeMap::new()).unwrap(),
-            index_dir: dir.path().join("index"),
-            cwd: dir.path().into(),
-            now_ms: 0,
-            time_zone: "UTC".into(),
-            coverage: crate::Coverage::Compact,
-            build: crate::BuildPolicy::Inline,
-            progress: false,
-        };
+        let ctx = crate::testing::context(dir.path());
         fs::create_dir_all(&ctx.roots.claude_projects).unwrap();
         for id in ids {
             let records = (0..count)
@@ -804,7 +955,10 @@ mod tests {
         }
         let mut index = IndexSession::open(&ctx).unwrap();
         index
-            .refresh_under_lease(&BTreeSet::from([Agent::Claude]))
+            .refresh(
+                &BTreeSet::from([Agent::Claude]),
+                &crate::RefreshOptions::FULL,
+            )
             .unwrap();
         let keys = ids
             .iter()

@@ -1,5 +1,7 @@
 #[allow(dead_code)]
 mod query_support;
+#[allow(dead_code)]
+mod support;
 use query_support::*;
 use slimetrail::*;
 
@@ -31,6 +33,7 @@ fn scalar_pages_concatenate_across_timestamps_headers_and_multibyte_text() {
             offset: 0,
             max_chars: 1000,
         },
+        &RefreshOptions::QUERY,
     )
     .unwrap()
     .data
@@ -49,6 +52,7 @@ fn scalar_pages_concatenate_across_timestamps_headers_and_multibyte_text() {
                     offset,
                     max_chars: size,
                 },
+                &RefreshOptions::QUERY,
             )
             .unwrap()
             .data
@@ -82,6 +86,7 @@ fn beyond_end_is_empty_and_zero_limit_is_rejected() {
             offset: usize::MAX,
             max_chars: 3,
         },
+        &RefreshOptions::QUERY,
     )
     .unwrap()
     .data
@@ -98,7 +103,8 @@ fn beyond_end_is_empty_and_zero_limit_is_rejected() {
                 mode: ReadMode::Lite,
                 offset: 0,
                 max_chars: 0
-            }
+            },
+            &RefreshOptions::QUERY
         )
         .is_err()
     );
