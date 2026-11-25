@@ -2,8 +2,8 @@ use clap::{Args, Parser, Subcommand};
 use jiff::{Timestamp, civil, tz::TimeZone};
 use serde::Serialize;
 use slimetrail::{
-    Agent, Context, Diagnostic, Entry, Envelope, Error, Filter, Kind, ReadMode, ReadOptions,
-    Result, Scope, SearchOptions, Session, SessionKey, Sort, TimelineOptions,
+    Agent, Context, Coverage, Diagnostic, Entry, Envelope, Error, Filter, Kind, ReadMode,
+    ReadOptions, Result, Scope, SearchOptions, Session, SessionKey, Sort, TimelineOptions, config,
     dto::{EntryDto, ReadDataDto, SearchDataDto, SessionDto, SessionsDataDto, TimelineDataDto},
     entries, read, refresh, resolve_roots, search, sessions, timeline,
 };
@@ -108,7 +108,10 @@ enum Command {
         idle_minutes: u64,
     },
     #[command(about = "Refresh the local search index")]
-    Index,
+    Index {
+        #[arg(long, value_parser = ["compact", "full"], help = "Set search coverage in the config file and rebuild the search index to match")]
+        coverage: Option<String>,
+    },
     #[command(about = "List session metadata")]
     Sessions,
     #[command(about = "Stream entries from a session")]
@@ -178,12 +181,31 @@ fn execute(cli: &Cli, env: &BTreeMap<String, String>, out: &mut dyn Write) -> Re
             .map_or_else(|| home.join(".local/share"), PathBuf::from)
             .join("slimetrail")
     });
+    let config_path = config::path(&home, env);
+    let config = if let Command::Index {
+        coverage: Some(coverage),
+    } = &cli.command
+    {
+        let coverage = if coverage == "full" {
+            Coverage::Full
+        } else {
+            Coverage::Compact
+        };
+        config::write_coverage(&config_path, coverage)?;
+        config::Config {
+            coverage,
+            explicit: true,
+        }
+    } else {
+        config::load(&config_path)?
+    };
     let ctx = Context {
         roots: resolve_roots(&home, env)?,
         index_dir,
         now_ms: Timestamp::now().as_millisecond(),
         cwd: cwd.clone(),
         time_zone: zone,
+        coverage: config.coverage,
     };
     let filter = filter(&cli.common, env, &home, &cwd)?;
     let is_json = cli.common.format == "json";
@@ -289,7 +311,7 @@ fn execute(cli: &Cli, env: &BTreeMap<String, String>, out: &mut dyn Write) -> Re
                 is_json,
             )
         }
-        Command::Index => emit(out, &refresh(&ctx, &filter.agents, true)?, is_json),
+        Command::Index { .. } => emit(out, &refresh(&ctx, &filter.agents, true)?, is_json),
         Command::Sessions => emit(
             out,
             &convert(sessions(&ctx, &filter)?, |s| {
@@ -612,6 +634,7 @@ mod tests {
                 tool_name: None,
                 automated: false,
                 text: "synthetic text".into(),
+                searchable: slimetrail::Searchable::Text,
             })?;
             Err(Error::Sqlite(rusqlite::Error::InvalidQuery))
         })

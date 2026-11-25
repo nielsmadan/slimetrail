@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import argparse
+import contextlib
 import hashlib
 import json
 import os
 import platform
+import random
 import shutil
 import signal
 import sqlite3
@@ -15,7 +17,7 @@ from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-AGENTS = ("claude", "codex", "cursor", "droid", "opencode", "pi")
+AGENTS = ("claude", "codex", "cursor", "devin", "droid", "opencode", "pi")
 RESERVE = 2 * 1024**3
 DIAGNOSTICS = {
     "source_unavailable",
@@ -29,6 +31,7 @@ DIAGNOSTICS = {
     "incomplete_inventory",
     "duplicate_identity",
     "timeline_missing_timestamps",
+    "search_coverage",
     "fatal",
 }
 
@@ -74,6 +77,7 @@ def roots(env):
             )
             / "chats",
         ],
+        "devin": [value("DEVIN_SESSIONS_DIR", data / "devin") / "cli/sessions.db"],
         "droid": [value("FACTORY_HOME_OVERRIDE", home) / ".factory/sessions"],
         "pi": [
             value(
@@ -120,14 +124,267 @@ def dimensions(paths):
     return dict(counts)
 
 
+TIMESTAMP = "2026-11-16T00:00:00Z"
+
+
+def tool_output(rng):
+    """Seeded mix: 60% under 1 KB, 30% 1-16 KB, 10% 16-256 KB."""
+    roll = rng.random()
+    if roll < 0.6:
+        size = rng.randint(64, 1023)
+    elif roll < 0.9:
+        size = rng.randint(1024, 16 * 1024)
+    else:
+        size = rng.randint(16 * 1024, 256 * 1024)
+    line = "tool output line with ordinary log content\n"
+    return (line * (size // len(line) + 1))[:size]
+
+
+def events(agent, number, entries):
+    """Deterministic per-session event stream shared by every agent's writer."""
+    rng = random.Random(f"{agent}:{number}")
+    for entry in range(entries):
+        yield {"kind": "user", "text": payload(entry)}
+        phase = entry % 10
+        if phase == 2:
+            yield {
+                "kind": "reasoning",
+                "text": f"Considering ordinary approach {entry}",
+            }
+        elif phase == 3:
+            yield {
+                "kind": "call",
+                "id": f"call-{entry}",
+                "name": "Shell",
+                "input": {"command": f"ls -la entry-{entry}"},
+            }
+        elif phase == 4:
+            yield {
+                "kind": "result",
+                "id": f"call-{entry - 1}",
+                "text": tool_output(rng),
+            }
+
+
+def blocks(event):
+    kind = event["kind"]
+    if kind == "user":
+        return "user", [{"type": "text", "text": event["text"]}]
+    if kind == "reasoning":
+        return "assistant", [{"type": "thinking", "thinking": event["text"]}]
+    if kind == "call":
+        return "assistant", [
+            {
+                "type": "tool_use",
+                "id": event["id"],
+                "name": event["name"],
+                "input": event["input"],
+            }
+        ]
+    return "user", [
+        {"type": "tool_result", "tool_use_id": event["id"], "content": event["text"]}
+    ]
+
+
+def jsonl_record(agent, event):
+    kind = event["kind"]
+    if agent == "codex":
+        if kind == "user":
+            payload_ = {"type": "message", "role": "user", "content": event["text"]}
+        elif kind == "reasoning":
+            payload_ = {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": event["text"]}],
+            }
+        elif kind == "call":
+            payload_ = {
+                "type": "function_call",
+                "name": "exec",
+                "call_id": event["id"],
+                "arguments": json.dumps({"cmd": event["input"]["command"]}),
+            }
+        else:
+            payload_ = {
+                "type": "function_call_output",
+                "call_id": event["id"],
+                "output": event["text"],
+            }
+        return {"type": "response_item", "timestamp": TIMESTAMP, "payload": payload_}
+    role, content = blocks(event)
+    if agent == "claude":
+        if kind == "user":
+            message = {"role": "user", "content": event["text"]}
+        else:
+            message = {"role": role, "content": content}
+        return {"type": role, "timestamp": TIMESTAMP, "message": message}
+    if agent == "cursor":
+        return {
+            "role": role,
+            "timestamp": TIMESTAMP,
+            "message": {"content": content},
+        }
+    if agent == "pi" and kind == "result":
+        message = {
+            "role": "toolResult",
+            "toolCallId": event["id"],
+            "toolName": "read",
+            "content": [{"type": "text", "text": event["text"]}],
+        }
+    elif agent == "pi" and kind == "call":
+        message = {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "toolCall",
+                    "id": event["id"],
+                    "name": "read",
+                    "arguments": event["input"],
+                }
+            ],
+        }
+    elif kind == "user":
+        message = {"role": "user", "content": event["text"]}
+    else:
+        message = {"role": role, "content": content}
+    return {"type": "message", "timestamp": TIMESTAMP, "message": message}
+
+
+def write_opencode(database, sessions, entries):
+    database.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.closing(sqlite3.connect(database)) as connection:
+        connection.executescript(
+            "CREATE TABLE session(id TEXT PRIMARY KEY, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER); CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT); CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, time_created INTEGER, data TEXT);"
+        )
+        for number in range(sessions):
+            identity = f"bench-{number:05}"
+            connection.execute(
+                "INSERT INTO session VALUES(?,?,?,?,?)",
+                (
+                    identity,
+                    "/fixture/project",
+                    "Benchmark",
+                    1794787200000,
+                    1794787200000,
+                ),
+            )
+            count = 0
+            pending = {}
+            for event in events("opencode", number, entries):
+                kind = event["kind"]
+                if kind == "call":
+                    pending[event["id"]] = event["input"]
+                    continue
+                role = "user" if kind == "user" else "assistant"
+                if kind == "user":
+                    part = {"type": "text", "text": event["text"]}
+                elif kind == "reasoning":
+                    part = {"type": "reasoning", "text": event["text"]}
+                else:
+                    part = {
+                        "type": "tool",
+                        "tool": "shell",
+                        "state": {
+                            "input": pending.pop(event["id"], {}),
+                            "output": event["text"],
+                        },
+                    }
+                item = f"{identity}-{count}"
+                count += 1
+                connection.execute(
+                    "INSERT INTO message VALUES(?,?,?,?)",
+                    (item, identity, 1794787200000, json.dumps({"role": role})),
+                )
+                connection.execute(
+                    "INSERT INTO part VALUES(?,?,?,?)",
+                    (item, item, 1794787200000, json.dumps(part)),
+                )
+        connection.commit()
+
+
+def devin_message(role, source, content):
+    return {
+        "role": role,
+        "content": content,
+        "metadata": {
+            "created_at": "2026-08-10T10:00:00Z",
+            "is_user_input": True if source == "user" else None,
+            "telemetry": {"source": source},
+        },
+    }
+
+
+def write_devin(database, sessions, entries):
+    database.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.closing(sqlite3.connect(database)) as connection:
+        connection.executescript(
+            "PRAGMA journal_mode=WAL;"
+            "CREATE TABLE sessions(id TEXT PRIMARY KEY, working_directory TEXT, title TEXT, created_at INTEGER, last_activity_at INTEGER, main_chain_id INTEGER, hidden INTEGER);"
+            "CREATE TABLE message_nodes(row_id INTEGER PRIMARY KEY, session_id TEXT, node_id INTEGER, parent_node_id INTEGER, chat_message TEXT, created_at INTEGER, metadata TEXT);"
+            "CREATE TABLE subagent_heads(session_id TEXT, agent_id TEXT, chain_node_id INTEGER, updated_at INTEGER, PRIMARY KEY(session_id, agent_id)) WITHOUT ROWID;"
+        )
+        for number in range(sessions):
+            identity = f"bench-{number:05}"
+            chain = [
+                (
+                    devin_message("system", "sysprompt", "System prompt"),
+                    {"is_system_prefix": True},
+                )
+            ]
+            for event in events("devin", number, entries):
+                kind = event["kind"]
+                if kind == "user":
+                    chat = devin_message("user", "user", event["text"])
+                elif kind == "reasoning":
+                    chat = devin_message("assistant", "assistant", "")
+                    chat["thinking"] = {"thinking": event["text"], "signature": "sig"}
+                elif kind == "call":
+                    chat = devin_message("assistant", "assistant", "")
+                    chat["tool_calls"] = [
+                        {
+                            "id": event["id"],
+                            "name": "exec",
+                            "arguments": event["input"],
+                        }
+                    ]
+                else:
+                    chat = devin_message("tool", "tool_result", event["text"])
+                    chat["tool_call_id"] = event["id"]
+                chain.append((chat, {}))
+            connection.execute(
+                "INSERT INTO sessions VALUES(?,?,?,?,?,?,0)",
+                (
+                    identity,
+                    "/fixture/project",
+                    "Benchmark",
+                    1786356000,
+                    1786356300,
+                    len(chain) - 1,
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO message_nodes(session_id, node_id, parent_node_id, chat_message, created_at, metadata) VALUES(?,?,?,?,?,?)",
+                [
+                    (
+                        identity,
+                        node,
+                        node - 1 if node else None,
+                        json.dumps(chat),
+                        1786356000 + node,
+                        json.dumps(metadata),
+                    )
+                    for node, (chat, metadata) in enumerate(chain)
+                ],
+            )
+        connection.commit()
+
+
 def synthetic(base, sessions, entries):
     home = base / "home"
     env = {"PATH": os.environ.get("PATH", ""), "HOME": str(home), "TZ": "UTC"}
     stores = roots(env)
-    timestamp = "2026-11-16T00:00:00Z"
     changed = None
     for agent in AGENTS:
-        if agent == "opencode":
+        if agent in ("opencode", "devin"):
             continue
         for number in range(sessions):
             identity = f"bench-{number:05}"
@@ -176,64 +433,12 @@ def synthetic(base, sessions, entries):
             with path.open("w") as stream:
                 if agent in headers:
                     stream.write(json.dumps(headers[agent]) + "\n")
-                for entry in range(entries):
-                    text = payload(entry)
-                    message = {"role": "user", "content": text}
-                    record = {
-                        "type": "message",
-                        "timestamp": timestamp,
-                        "message": message,
-                    }
-                    if agent == "claude":
-                        record["type"] = "user"
-                    elif agent == "codex":
-                        record = {
-                            "type": "response_item",
-                            "timestamp": timestamp,
-                            "payload": {"type": "message", **message},
-                        }
-                    elif agent == "cursor":
-                        record = {
-                            "role": "user",
-                            "timestamp": timestamp,
-                            "message": {"content": [{"type": "text", "text": text}]},
-                        }
-                    stream.write(json.dumps(record) + "\n")
+                for event in events(agent, number, entries):
+                    stream.write(json.dumps(jsonl_record(agent, event)) + "\n")
             if agent == "claude" and number == 0:
                 changed = path
-    database = stores["opencode"][0]
-    database.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(database) as connection:
-        connection.executescript(
-            "CREATE TABLE session(id TEXT PRIMARY KEY, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER); CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT); CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, time_created INTEGER, data TEXT);"
-        )
-        for number in range(sessions):
-            identity = f"bench-{number:05}"
-            connection.execute(
-                "INSERT INTO session VALUES(?,?,?,?,?)",
-                (
-                    identity,
-                    "/fixture/project",
-                    "Benchmark",
-                    1794787200000,
-                    1794787200000,
-                ),
-            )
-            for entry in range(entries):
-                item = f"{identity}-{entry}"
-                connection.execute(
-                    "INSERT INTO message VALUES(?,?,?,?)",
-                    (item, identity, 1794787200000, '{"role":"user"}'),
-                )
-                connection.execute(
-                    "INSERT INTO part VALUES(?,?,?,?)",
-                    (
-                        item,
-                        item,
-                        1794787200000,
-                        json.dumps({"type": "text", "text": payload(entry)}),
-                    ),
-                )
+    write_opencode(stores["opencode"][0], sessions, entries)
+    write_devin(stores["devin"][0], sessions, entries)
     return env, changed
 
 
@@ -278,6 +483,45 @@ def aggregate_index(index):
             ).fetchone()[0],
             "index_bytes": path.stat().st_size,
         }
+
+
+def index_database(index):
+    databases = [
+        path
+        for path in index.glob("index-v*.sqlite3")
+        if path.name.removeprefix("index-v").removesuffix(".sqlite3").isdigit()
+    ]
+    return max(
+        databases,
+        key=lambda path: int(
+            path.name.removeprefix("index-v").removesuffix(".sqlite3")
+        ),
+        default=None,
+    )
+
+
+def agent_dimensions(index, agent):
+    """Aggregate counts and DB+WAL bytes after a TRUNCATE checkpoint (owned index only)."""
+    path = index_database(index)
+    if path is None:
+        return {}
+    with contextlib.closing(sqlite3.connect(path)) as connection:
+        sessions = connection.execute(
+            "SELECT count(*) FROM sessions WHERE agent=?", (agent,)
+        ).fetchone()[0]
+        entries = connection.execute(
+            "SELECT count(*) FROM entries WHERE agent=?", (agent,)
+        ).fetchone()[0]
+        busy = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+        if busy:
+            raise RuntimeError("checkpoint_busy")
+    wal = Path(str(path) + "-wal")
+    return {
+        "sessions": sessions,
+        "entries": entries,
+        "index_bytes": path.stat().st_size
+        + (wal.stat().st_size if wal.exists() else 0),
+    }
 
 
 def invoke(binary, index, env, args, timeout, deadline):
@@ -367,12 +611,36 @@ def main():
     )
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument(
+        "--coverage",
+        choices=("compact", "full"),
+        default="compact",
+        help="Index coverage, written to a workspace-local config",
+    )
+    parser.add_argument(
+        "--per-agent",
+        action="store_true",
+        help="Also run one cold index per agent into a fresh index",
+    )
+    parser.add_argument(
         "--timeout", type=int, default=180, help="Per subprocess deadline in seconds"
     )
     parser.add_argument("--total-timeout", type=int, default=840)
+    parser.add_argument(
+        "--capacity-factor",
+        type=int,
+        default=12,
+        help="Required free space as a multiple of source bytes",
+    )
     args = parser.parse_args()
     if (
-        min(args.sessions, args.entries, args.repeat, args.timeout, args.total_timeout)
+        min(
+            args.sessions,
+            args.entries,
+            args.repeat,
+            args.timeout,
+            args.total_timeout,
+            args.capacity_factor,
+        )
         <= 0
     ):
         parser.error("numeric options must be positive")
@@ -390,6 +658,9 @@ def main():
             if args.real
             else synthetic(workspace, args.sessions, args.entries)
         )
+        config = workspace / "config.toml"
+        config.write_text(f'coverage = "{args.coverage}"\n')
+        env["SLIMETRAIL_CONFIG"] = str(config)
         corpus = {
             agent: dimensions(paths)
             for agent, paths in roots(env).items()
@@ -405,12 +676,14 @@ def main():
                 "machine": platform.machine(),
                 "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
                 "repetitions": args.repeat,
+                "coverage": args.coverage,
+                "per_agent": args.per_agent,
                 "corpus": corpus,
                 "free_bytes_before": free,
-                "required_free_bytes": RESERVE + size * 12,
+                "required_free_bytes": RESERVE + size * args.capacity_factor,
             }
         )
-        if free < RESERVE + size * 12:
+        if free < RESERVE + size * args.capacity_factor:
             raise RuntimeError("insufficient_disk_capacity")
 
         def measure(label, command, repetitions=1):
@@ -480,6 +753,47 @@ def main():
             measure("one_changed_source", ["index"])
         else:
             emit({"one_changed_source": "synthetic_only"})
+        if args.per_agent:
+            for agent in args.agents:
+                fresh = workspace / f"index-{agent}"
+                started = time.monotonic()
+                try:
+                    run = invoke(
+                        binary,
+                        fresh,
+                        env,
+                        ["index", "--" + agent],
+                        args.timeout,
+                        deadline,
+                    )
+                    record = {
+                        "per_agent": agent,
+                        "coverage": args.coverage,
+                        "source_files": corpus[agent]["files"],
+                        "source_bytes": corpus[agent]["bytes"],
+                        "cold_ms": round(run["seconds"] * 1000),
+                        "exit": run["exit"],
+                        "incomplete": run.get("incomplete"),
+                        "diagnostic_counts": run["diagnostic_counts"],
+                        "counters": run.get("counters", {}),
+                        **agent_dimensions(fresh, agent),
+                    }
+                    if run.get("invalid_envelope"):
+                        record["invalid_envelope"] = True
+                except (Exception, KeyboardInterrupt) as error:
+                    emit(
+                        {
+                            "per_agent": agent,
+                            "failure": type(error).__name__,
+                            "elapsed_seconds": round(time.monotonic() - started, 6),
+                        }
+                    )
+                    raise
+                finally:
+                    shutil.rmtree(fresh, ignore_errors=True)
+                emit(record)
+                if run["exit"] not in (0, 1):
+                    raise RuntimeError("cli_fatal")
     finally:
         shutil.rmtree(workspace)
         emit(

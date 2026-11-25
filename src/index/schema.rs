@@ -1,5 +1,8 @@
-use super::lock::{check_file, io};
-use crate::{Error, Result};
+use super::{
+    coverage::{coverage_name, parse_coverage},
+    lock::{check_file, io},
+};
+use crate::{Coverage, Error, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::{
     fs::{self, OpenOptions},
@@ -38,14 +41,14 @@ CREATE TABLE entries(
  namespace TEXT NOT NULL, agent TEXT NOT NULL, id TEXT NOT NULL, source TEXT NOT NULL,
  entry_index INTEGER NOT NULL, source_id TEXT NOT NULL, timestamp INTEGER, timestamp_raw TEXT,
  role TEXT NOT NULL, kind TEXT NOT NULL, subtype TEXT, tool_name TEXT, automated INTEGER NOT NULL,
- text TEXT NOT NULL,
+ searchable TEXT NOT NULL, text TEXT NOT NULL,
  PRIMARY KEY(namespace,agent,id,source,entry_index),
  FOREIGN KEY(namespace,agent,id,source) REFERENCES sessions(namespace,agent,id,source) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
 );
 CREATE TABLE search_documents(
  document_id INTEGER PRIMARY KEY,
  namespace TEXT NOT NULL, agent TEXT NOT NULL, id TEXT NOT NULL, source TEXT NOT NULL,
- entry_index INTEGER, kind TEXT NOT NULL, ascii_lower TEXT NOT NULL,
+ entry_index INTEGER, kind TEXT NOT NULL, text_start INTEGER NOT NULL,
  has_non_ascii INTEGER NOT NULL, has_nul INTEGER NOT NULL,
  FOREIGN KEY(namespace,agent,id,source) REFERENCES sessions(namespace,agent,id,source) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
  FOREIGN KEY(namespace,agent,id,source,entry_index) REFERENCES entries(namespace,agent,id,source,entry_index) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
@@ -53,16 +56,9 @@ CREATE TABLE search_documents(
 CREATE INDEX documents_session ON search_documents(namespace,agent,id,source,entry_index);
 CREATE INDEX documents_non_ascii ON search_documents(namespace,document_id) WHERE has_non_ascii=1;
 CREATE INDEX documents_nul ON search_documents(namespace,document_id) WHERE has_nul=1;
-CREATE VIRTUAL TABLE search_fts USING fts5(ascii_lower,content='search_documents',content_rowid='document_id',tokenize='trigram case_sensitive 1',detail=full);
-CREATE TRIGGER documents_insert AFTER INSERT ON search_documents BEGIN
- INSERT INTO search_fts(rowid,ascii_lower) VALUES(new.document_id,new.ascii_lower);
-END;
+CREATE VIRTUAL TABLE search_fts USING fts5(ascii_lower,content='',contentless_delete=1,tokenize='trigram case_sensitive 1',detail=full);
 CREATE TRIGGER documents_delete AFTER DELETE ON search_documents BEGIN
- INSERT INTO search_fts(search_fts,rowid,ascii_lower) VALUES('delete',old.document_id,old.ascii_lower);
-END;
-CREATE TRIGGER documents_update AFTER UPDATE ON search_documents BEGIN
- INSERT INTO search_fts(search_fts,rowid,ascii_lower) VALUES('delete',old.document_id,old.ascii_lower);
- INSERT INTO search_fts(rowid,ascii_lower) VALUES(new.document_id,new.ascii_lower);
+ DELETE FROM search_fts WHERE rowid=old.document_id;
 END;
 PRAGMA user_version=3;
 ";
@@ -103,7 +99,12 @@ fn check_namespace(connection: &Connection, namespace: &str, roots: &str) -> Res
     }
 }
 
-pub(super) fn open(directory: &Path, namespace: &str, roots: &str) -> Result<Connection> {
+pub(super) fn open(
+    directory: &Path,
+    namespace: &str,
+    roots: &str,
+    coverage: Coverage,
+) -> Result<Connection> {
     let path = directory.join(DATABASE);
     preflight(directory)?;
     if !path.exists() {
@@ -140,8 +141,10 @@ pub(super) fn open(directory: &Path, namespace: &str, roots: &str) -> Result<Con
         }
     }
     transaction.execute("INSERT INTO meta(namespace,version,roots) VALUES(?1,?2,?3) ON CONFLICT(namespace) DO NOTHING", (namespace,VERSION,roots))?;
-    // Placeholder until Context gains `coverage`.
-    transaction.execute("INSERT INTO settings(id,refresh_seq,coverage) VALUES(1,0,'compact') ON CONFLICT(id) DO NOTHING", [])?;
+    transaction.execute(
+        "INSERT INTO settings(id,refresh_seq,coverage) VALUES(1,0,?1) ON CONFLICT(id) DO NOTHING",
+        [coverage_name(coverage)],
+    )?;
     check_namespace(&transaction, namespace, roots)?;
     transaction.commit()?;
     Ok(connection)
@@ -183,6 +186,24 @@ pub(super) fn refresh_seq(connection: &Connection) -> Result<i64> {
         })
         .optional()?
         .unwrap_or(0))
+}
+
+pub(super) fn coverage(connection: &Connection) -> Result<Option<(Coverage, Option<Coverage>)>> {
+    let stored: Option<(String, Option<String>)> = connection
+        .query_row(
+            "SELECT coverage,coverage_pending FROM settings WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    stored
+        .map(|(coverage, pending)| {
+            Ok((
+                parse_coverage(&coverage)?,
+                pending.as_deref().map(parse_coverage).transpose()?,
+            ))
+        })
+        .transpose()
 }
 
 pub(super) fn prune(directory: &Path) -> Result<()> {

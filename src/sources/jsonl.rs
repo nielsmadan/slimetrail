@@ -1,6 +1,7 @@
 use crate::{
     Agent, AppendState, Context, Diagnostic, Discovery, DiscoveryCache, Entry, Error, Fingerprint,
-    Kind, ParsedSession, RawSession, Result, Session, SessionKey, SourceState, TitleOrigin,
+    Kind, ParsedSession, RawSession, Result, Searchable, Session, SessionKey, SourceState,
+    TitleOrigin,
 };
 use ruzstd::decoding::{
     BlockDecodingStrategy, FrameDecoder,
@@ -1060,6 +1061,7 @@ fn entry(agent: Agent, role: &str, kind: Kind, text: String, record: &Value) -> 
         tool_name: None,
         automated: false,
         text,
+        searchable: Searchable::Text,
     }
 }
 
@@ -1090,13 +1092,25 @@ pub(crate) fn content_entries(
         let name = (kind == Kind::Tool)
             .then(|| string(value, "name").or_else(|| string(value, "tool")))
             .flatten();
+        let searchable = if matches!(
+            value["type"].as_str(),
+            Some("tool_result" | "tool-result" | "toolResult")
+        ) {
+            Searchable::ToolResult
+        } else {
+            Searchable::Text
+        };
         if let Some(last) = entries.last_mut().filter(|last| last.kind == kind) {
             last.text.push('\n');
             last.text.push_str(&text);
             last.tool_name = last.tool_name.take().or(name);
+            if last.searchable != searchable {
+                last.searchable = Searchable::Text;
+            }
         } else {
             let mut item = entry(agent, role, kind, text, record);
             item.tool_name = name;
+            item.searchable = searchable;
             item.subtype = (kind == Kind::Meta).then(|| "reasoning".into());
             entries.push(item);
         }
@@ -1151,7 +1165,16 @@ fn normalize(agent: Agent, record: &Value) -> Vec<Entry> {
                 record,
             );
             if let Some(text) = string(record, "toolUseResult").filter(|s| !s.trim().is_empty()) {
-                found.push(entry(agent, kind, Kind::Tool, text, record));
+                let duplicate = found.iter().any(|e| {
+                    e.searchable == Searchable::ToolResult && e.text.trim() == text.trim()
+                });
+                let mut item = entry(agent, kind, Kind::Tool, text, record);
+                item.searchable = if duplicate {
+                    Searchable::Duplicate
+                } else {
+                    Searchable::ToolResult
+                };
+                found.push(item);
             }
             if found.is_empty()
                 && let Some(text) = string(record, "summary").or_else(|| string(record, "text"))
@@ -1236,6 +1259,9 @@ fn normalize(agent: Agent, record: &Value) -> Vec<Entry> {
             );
             item.subtype = Some(subtype.into());
             item.tool_name = string(payload, "name");
+            if matches!(subtype, "function_call_output" | "custom_tool_call_output") {
+                item.searchable = Searchable::ToolResult;
+            }
             vec![item]
         }
         Agent::Droid | Agent::Pi if kind == "message" && record["message"].is_object() => {
@@ -1250,6 +1276,7 @@ fn normalize(agent: Agent, record: &Value) -> Vec<Entry> {
                 for item in &mut found {
                     item.kind = Kind::Tool;
                     item.tool_name = string(message, "toolName");
+                    item.searchable = Searchable::ToolResult;
                 }
             }
             found
@@ -1271,6 +1298,7 @@ mod tests {
             cwd: dir.path().into(),
             now_ms: 0,
             time_zone: "UTC".into(),
+            coverage: crate::Coverage::Compact,
         };
         fs::create_dir_all(&ctx.roots.codex_sessions).unwrap();
         for id in ["one", "two"] {

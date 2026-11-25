@@ -161,6 +161,7 @@ fn timestamp_dto_preserves_original_offset_and_falls_back_to_utc() {
         tool_name: None,
         automated: false,
         text: "synthetic 🐌".into(),
+        searchable: Searchable::Text,
     };
     assert_eq!(
         EntryDto::try_from(&entry).unwrap().timestamp.as_deref(),

@@ -308,3 +308,120 @@ fn duplicate_archive_copy_does_not_duplicate_search_or_metadata() {
     assert_eq!(result.count, 1);
     assert!(result.results[0].session.archived);
 }
+
+fn with_coverage(ctx: &Context, coverage: Coverage) -> Context {
+    Context {
+        index_dir: ctx.index_dir.with_extension(format!("{coverage:?}")),
+        coverage,
+        ..ctx.clone()
+    }
+}
+
+fn found(ctx: &Context, query: &str, regex: bool) -> (u64, Vec<String>) {
+    let mut opt = options(query);
+    opt.regex = regex;
+    let result = search(ctx, &opt).unwrap();
+    assert!(!result.incomplete, "{:?}", result.diagnostics);
+    let data = result.data.unwrap();
+    data.results
+        .first()
+        .map_or((0, Vec::new()), |hit| (hit.matches, hit.snippets.clone()))
+}
+
+#[test]
+fn compact_searches_only_tool_result_tails_on_every_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = context(dir.path());
+    let mut head = "early-literal Q# \0nul ".to_string();
+    head.push_str(&".".repeat(8000));
+    head.push_str("前日");
+    let mut tail = "本 tail \0nul ".to_string();
+    let end = " late-literal J@";
+    tail.push_str(&".".repeat(2047 - tail.len() - end.len()));
+    tail.push_str(end);
+    assert_eq!(tail.len(), 2047);
+    let text = head + &tail;
+    assert!(text.len() > 10_000);
+    claude(
+        &base,
+        "long",
+        None,
+        None,
+        &[json!({"type":"user","message":{"content":[{"type":"tool_result","content":text}]}})],
+    );
+    let compact = with_coverage(&base, Coverage::Compact);
+    let full = with_coverage(&base, Coverage::Full);
+    for (query, compact_count, full_count) in [
+        ("early-literal", 0, 1),
+        ("late-literal", 1, 1),
+        ("Q#", 0, 1),
+        ("J@", 1, 1),
+        ("日本", 0, 1),
+        ("本 t", 1, 1),
+        ("\0nul", 1, 2),
+    ] {
+        for regex in [false, true] {
+            assert_eq!(
+                found(&compact, query, regex).0,
+                compact_count,
+                "compact {query:?} regex={regex}"
+            );
+            assert_eq!(
+                found(&full, query, regex).0,
+                full_count,
+                "full {query:?} regex={regex}"
+            );
+        }
+    }
+    assert_eq!(found(&compact, "early-lit+eral", true).0, 0);
+    assert_eq!(found(&full, "early-lit+eral", true).0, 1);
+    assert_eq!(found(&compact, "^本", true).0, 1);
+    assert_eq!(found(&full, "^本", true).0, 0);
+    assert_eq!(found(&full, "^early", true).0, 1);
+    let (_, snippets) = found(&compact, "本", false);
+    assert_eq!(snippets, ["[user/tool] 本 tail \0n…"]);
+    let mut stored = Vec::new();
+    entries(&compact, &"claude:long".parse().unwrap(), &mut |entry| {
+        stored.push((entry.text, entry.searchable));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(stored, [(text, Searchable::ToolResult)]);
+}
+
+#[test]
+fn duplicate_tool_use_result_is_stored_but_scored_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = context(dir.path());
+    claude(
+        &base,
+        "dup",
+        None,
+        None,
+        &[
+            json!({"type":"user","toolUseResult":" dup needle\n","message":{"content":[{"type":"tool_result","content":"dup needle"}]}}),
+            json!({"type":"user","toolUseResult":"other needle","message":{"content":[{"type":"tool_result","content":"dup needle"}]}}),
+        ],
+    );
+    for coverage in [Coverage::Compact, Coverage::Full] {
+        let ctx = with_coverage(&base, coverage);
+        let result = search(&ctx, &options("needle")).unwrap().data.unwrap();
+        assert_eq!(result.results[0].matches, 3, "{coverage:?}");
+        assert_eq!(result.results[0].by_kind["tool"], 3);
+        let mut stored = Vec::new();
+        entries(&ctx, &"claude:dup".parse().unwrap(), &mut |entry| {
+            stored.push((entry.kind, entry.searchable, entry.text));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            stored,
+            [
+                (Kind::Tool, Searchable::ToolResult, "dup needle".into()),
+                (Kind::Tool, Searchable::Duplicate, " dup needle\n".into()),
+                (Kind::Tool, Searchable::ToolResult, "dup needle".into()),
+                (Kind::Tool, Searchable::ToolResult, "other needle".into()),
+            ]
+        );
+    }
+}

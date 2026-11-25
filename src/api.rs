@@ -52,7 +52,13 @@ pub fn search(ctx: &Context, options: &SearchOptions) -> Result<Envelope<SearchR
     let pattern = crate::search::pattern(options)?;
     let (index, status) = prepared(ctx, &options.filter.agents)?;
     let result = crate::search::run(ctx, &index, options, &pattern)?;
-    Ok(with_data(status, Some(result)))
+    let mut envelope = with_data(status, Some(result));
+    envelope.diagnostics.extend(crate::search::coverage_note(
+        index.coverage()?,
+        ctx.coverage,
+        &options.filter.kinds,
+    ));
+    Ok(envelope)
 }
 
 pub fn read(ctx: &Context, key: &SessionKey, options: &ReadOptions) -> Result<Envelope<ReadPage>> {

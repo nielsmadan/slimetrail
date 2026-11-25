@@ -6,6 +6,8 @@ use std::{
 };
 use tempfile::TempDir;
 
+const COMPACT: &[u8] = b"search_coverage: Compact coverage: reasoning is not searched, and only the last 2 KB of each tool result is searched; run `slimetrail index --coverage full` to search everything.\n";
+
 struct Fixture(TempDir);
 
 impl Fixture {
@@ -66,7 +68,7 @@ fn search_text_groups_ranked_sessions_with_unicode_labels_and_exact_references()
         &[("user", "A needle in café 🐌")],
     );
     let output = fixture.run(&[], 0);
-    assert_eq!(output.stderr, b"");
+    assert_eq!(output.stderr, COMPACT);
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         concat!(
@@ -83,7 +85,8 @@ fn search_text_groups_ranked_sessions_with_unicode_labels_and_exact_references()
         serde_json::from_slice(&fixture.run(&["--format", "json"], 0).stdout).unwrap();
     assert_eq!(json["version"], 1);
     assert_eq!(json["incomplete"], false);
-    assert_eq!(json["diagnostics"], json!([]));
+    assert_eq!(json["diagnostics"][0]["code"], "search_coverage");
+    assert_eq!(json["diagnostics"].as_array().unwrap().len(), 1);
     assert_eq!(json["data"]["count"], 2);
     assert_eq!(
         json["data"]["results"][0]["ref"],
@@ -134,7 +137,7 @@ fn search_text_distinguishes_complete_and_incomplete_empty_results() {
     let fixture = Fixture::new();
     let complete = fixture.run(&[], 0);
     assert_eq!(complete.stdout, b"No matches.\n");
-    assert_eq!(complete.stderr, b"");
+    assert_eq!(complete.stderr, COMPACT);
     let partial = fixture.run(&["--claude"], 1);
     assert_eq!(
         partial.stdout,
@@ -217,5 +220,5 @@ fn search_text_handles_a_closed_stdout_pipe_quietly() {
     drop(child.stdout.take());
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
-    assert_eq!(output.stderr, b"");
+    assert_eq!(output.stderr, COMPACT);
 }

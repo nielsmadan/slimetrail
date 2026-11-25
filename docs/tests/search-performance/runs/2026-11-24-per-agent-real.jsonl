@@ -1,0 +1,229 @@
+{"agents": ["claude"], "binary_sha256": "dfb54efe6c5178dce71333124e2b1b08100f32c4f2653d8f9f8d081b88953318", "corpus": {"claude": {"bytes": 14273487361, "files": 23140, "missing": 0, "unreadable": 0}}, "coverage": "compact", "free_bytes_before": 149293297664, "machine": "arm64", "mode": "real", "per_agent": true, "platform": "Darwin", "repetitions": 1, "required_free_bytes": 59241433092}
+{"measurement": "cold_index", "median_seconds": 446.367871, "runs": [{"counters": {"discovered": 10835, "elapsed_ms": 446334, "failed": 0, "removed": 0, "reparsed": 10835, "reused": 0}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 446.367871}]}
+{"indexed_dimensions": {"documents": 1252298, "entries": 1256834, "entry_bytes": 3443057751, "index_bytes": 9068220416, "non_ascii_documents": 259977, "nul_documents": 136, "sessions": 10835}}
+{"measurement": "warmup_index", "median_seconds": 0.854293, "runs": [{"counters": {"discovered": 10835, "elapsed_ms": 830, "failed": 0, "removed": 0, "reparsed": 1, "reused": 10834}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.854293}]}
+{"measurement": "warm_index", "median_seconds": 0.58802, "runs": [{"counters": {"discovered": 10835, "elapsed_ms": 567, "failed": 0, "removed": 0, "reparsed": 0, "reused": 10835}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.58802}]}
+{"measurement": "warm_claude_inventory", "median_seconds": 0.594468, "runs": [{"counters": {"discovered": 10835, "elapsed_ms": 573, "failed": 0, "removed": 0, "reparsed": 0, "reused": 10835}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.594468}]}
+{"measurement": "ascii_literal_warmup", "median_seconds": 5.843873, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 5.843873}]}
+{"measurement": "ascii_literal", "median_seconds": 5.339167, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 5.339167}]}
+{"measurement": "short_literal_warmup", "median_seconds": 9.587009, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 9.587009}]}
+{"measurement": "short_literal", "median_seconds": 9.662841, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 9.662841}]}
+{"measurement": "non_ascii_literal_warmup", "median_seconds": 9.203484, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 9.203484}]}
+{"measurement": "non_ascii_literal", "median_seconds": 9.227868, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 9.227868}]}
+{"measurement": "regex_warmup", "median_seconds": 9.819728, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 9.819728}]}
+{"measurement": "regex", "median_seconds": 9.655715, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 9.655715}]}
+{"one_changed_source": "synthetic_only"}
+{"cold_ms": 456975, "counters": {"discovered": 10835, "elapsed_ms": 456937, "failed": 0, "removed": 0, "reparsed": 10835, "reused": 0}, "coverage": "compact", "diagnostic_counts": {}, "entries": 1256834, "exit": 0, "incomplete": false, "index_bytes": 9068220416, "per_agent": "claude", "sessions": 10835, "source_bytes": 14273487361, "source_files": 23140}
+{"cleanup": "removed_owned_workspace", "index_exists": false, "workspace_exists": false}
+{"agents": ["claude"], "binary_sha256": "dfb54efe6c5178dce71333124e2b1b08100f32c4f2653d8f9f8d081b88953318", "corpus": {"claude": {"bytes": 14273487361, "files": 23140, "missing": 0, "unreadable": 0}}, "coverage": "full", "free_bytes_before": 150552080384, "machine": "arm64", "mode": "real", "per_agent": true, "platform": "Darwin", "repetitions": 1, "required_free_bytes": 59241433092}
+{"measurement": "cold_index", "median_seconds": 1016.363544, "runs": [{"counters": {"discovered": 10835, "elapsed_ms": 1016285, "failed": 0, "removed": 0, "reparsed": 10835, "reused": 0}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 1016.363544}]}
+{"indexed_dimensions": {"documents": 1263281, "entries": 1256834, "entry_bytes": 3443057751, "index_bytes": 14087720960, "non_ascii_documents": 280793, "nul_documents": 179, "sessions": 10835}}
+{"measurement": "warmup_index", "median_seconds": 1.076997, "runs": [{"counters": {"discovered": 10835, "elapsed_ms": 1062, "failed": 0, "removed": 0, "reparsed": 5, "reused": 10830}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 1.076997}]}
+{"measurement": "warm_index", "median_seconds": 0.615215, "runs": [{"counters": {"discovered": 10835, "elapsed_ms": 594, "failed": 0, "removed": 0, "reparsed": 0, "reused": 10835}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.615215}]}
+{"measurement": "warm_claude_inventory", "median_seconds": 0.611059, "runs": [{"counters": {"discovered": 10835, "elapsed_ms": 590, "failed": 0, "removed": 0, "reparsed": 0, "reused": 10835}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.611059}]}
+{"measurement": "ascii_literal_warmup", "median_seconds": 8.242837, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 8.242837}]}
+{"measurement": "ascii_literal", "median_seconds": 7.468192, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 7.468192}]}
+{"measurement": "short_literal_warmup", "median_seconds": 11.774248, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 11.774248}]}
+{"measurement": "short_literal", "median_seconds": 10.159737, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 10.159737}]}
+{"measurement": "non_ascii_literal_warmup", "median_seconds": 9.58858, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 9.58858}]}
+{"measurement": "non_ascii_literal", "median_seconds": 9.587834, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 9.587834}]}
+{"measurement": "regex_warmup", "median_seconds": 9.549484, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 9.549484}]}
+{"measurement": "regex", "median_seconds": 9.494088, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 9.494088}]}
+{"one_changed_source": "synthetic_only"}
+{"cold_ms": 1021724, "counters": {"discovered": 10835, "elapsed_ms": 1021703, "failed": 0, "removed": 0, "reparsed": 10835, "reused": 0}, "coverage": "full", "diagnostic_counts": {}, "entries": 1256834, "exit": 0, "incomplete": false, "index_bytes": 14087720960, "per_agent": "claude", "sessions": 10835, "source_bytes": 14273487361, "source_files": 23140}
+{"cleanup": "removed_owned_workspace", "index_exists": false, "workspace_exists": false}
+{"agents": ["codex"], "binary_sha256": "dfb54efe6c5178dce71333124e2b1b08100f32c4f2653d8f9f8d081b88953318", "corpus": {"codex": {"bytes": 3540441882, "files": 5539, "missing": 0, "unreadable": 0}}, "coverage": "compact", "free_bytes_before": 150810013696, "machine": "arm64", "mode": "real", "per_agent": true, "platform": "Darwin", "repetitions": 1, "required_free_bytes": 44632786232}
+{"measurement": "cold_index", "median_seconds": 200.678289, "runs": [{"counters": {"discovered": 5573, "elapsed_ms": 200657, "failed": 0, "removed": 0, "reparsed": 5573, "reused": 0}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 200.678289}]}
+{"indexed_dimensions": {"documents": 451199, "entries": 454195, "entry_bytes": 3089251588, "index_bytes": 5146402816, "non_ascii_documents": 83855, "nul_documents": 3, "sessions": 5573}}
+{"measurement": "warmup_index", "median_seconds": 0.684548, "runs": [{"counters": {"discovered": 5573, "elapsed_ms": 665, "failed": 0, "removed": 0, "reparsed": 0, "reused": 5573}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.684548}]}
+{"measurement": "warm_index", "median_seconds": 0.386684, "runs": [{"counters": {"discovered": 5573, "elapsed_ms": 365, "failed": 0, "removed": 0, "reparsed": 0, "reused": 5573}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.386684}]}
+{"measurement": "ascii_literal_warmup", "median_seconds": 3.887641, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 3.887641}]}
+{"measurement": "ascii_literal", "median_seconds": 3.414473, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 3.414473}]}
+{"measurement": "short_literal_warmup", "median_seconds": 7.016104, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 7.016104}]}
+{"measurement": "short_literal", "median_seconds": 7.002555, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 7.002555}]}
+{"measurement": "non_ascii_literal_warmup", "median_seconds": 6.894222, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 6.894222}]}
+{"measurement": "non_ascii_literal", "median_seconds": 6.853861, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 6.853861}]}
+{"measurement": "regex_warmup", "median_seconds": 6.943289, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 6.943289}]}
+{"measurement": "regex", "median_seconds": 6.848221, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 6.848221}]}
+{"one_changed_source": "synthetic_only"}
+{"cold_ms": 204387, "counters": {"discovered": 5573, "elapsed_ms": 204365, "failed": 0, "removed": 0, "reparsed": 5573, "reused": 0}, "coverage": "compact", "diagnostic_counts": {}, "entries": 454195, "exit": 0, "incomplete": false, "index_bytes": 5146402816, "per_agent": "codex", "sessions": 5573, "source_bytes": 3540441882, "source_files": 5539}
+{"cleanup": "removed_owned_workspace", "index_exists": false, "workspace_exists": false}
+{"agents": ["codex"], "binary_sha256": "dfb54efe6c5178dce71333124e2b1b08100f32c4f2653d8f9f8d081b88953318", "corpus": {"codex": {"bytes": 3540441882, "files": 5539, "missing": 0, "unreadable": 0}}, "coverage": "full", "free_bytes_before": 150805458944, "machine": "arm64", "mode": "real", "per_agent": true, "platform": "Darwin", "repetitions": 1, "required_free_bytes": 44632786232}
+{"measurement": "cold_index", "median_seconds": 791.177922, "runs": [{"counters": {"discovered": 5573, "elapsed_ms": 791154, "failed": 0, "removed": 0, "reparsed": 5573, "reused": 0}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 791.177922}]}
+{"indexed_dimensions": {"documents": 454652, "entries": 454195, "entry_bytes": 3089251588, "index_bytes": 11154964480, "non_ascii_documents": 112960, "nul_documents": 3, "sessions": 5573}}
+{"measurement": "warmup_index", "median_seconds": 1.058435, "runs": [{"counters": {"discovered": 5573, "elapsed_ms": 1037, "failed": 0, "removed": 0, "reparsed": 0, "reused": 5573}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 1.058435}]}
+{"measurement": "warm_index", "median_seconds": 0.359258, "runs": [{"counters": {"discovered": 5573, "elapsed_ms": 340, "failed": 0, "removed": 0, "reparsed": 0, "reused": 5573}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.359258}]}
+{"measurement": "ascii_literal_warmup", "median_seconds": 8.822359, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 8.822359}]}
+{"measurement": "ascii_literal", "median_seconds": 6.738097, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 6.738097}]}
+{"measurement": "short_literal_warmup", "median_seconds": 7.546616, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 7.546616}]}
+{"measurement": "short_literal", "median_seconds": 7.947259, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 7.947259}]}
+{"measurement": "non_ascii_literal_warmup", "median_seconds": 7.188999, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 7.188999}]}
+{"measurement": "non_ascii_literal", "median_seconds": 7.094562, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 7.094562}]}
+{"measurement": "regex_warmup", "median_seconds": 7.445601, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 7.445601}]}
+{"measurement": "regex", "median_seconds": 7.324992, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 7.324992}]}
+{"one_changed_source": "synthetic_only"}
+{"elapsed_seconds": 546.789152, "failure": "TimeoutError", "per_agent": "codex"}
+{"cleanup": "removed_owned_workspace", "index_exists": false, "workspace_exists": false}
+{"benchmark_error": "TimeoutError", "reason": "details_suppressed"}
+{"agents": ["cursor"], "binary_sha256": "dfb54efe6c5178dce71333124e2b1b08100f32c4f2653d8f9f8d081b88953318", "corpus": {"cursor": {"bytes": 125343072, "files": 1165, "missing": 0, "unreadable": 0}}, "coverage": "compact", "free_bytes_before": 150774640640, "machine": "arm64", "mode": "real", "per_agent": true, "platform": "Darwin", "repetitions": 1, "required_free_bytes": 3651600512}
+{"measurement": "cold_index", "median_seconds": 0.548719, "runs": [{"counters": {"discovered": 55, "elapsed_ms": 532, "failed": 0, "removed": 0, "reparsed": 55, "reused": 0}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.548719}]}
+{"indexed_dimensions": {"documents": 1930, "entries": 1875, "entry_bytes": 1851439, "index_bytes": 10772480, "non_ascii_documents": 149, "nul_documents": 0, "sessions": 55}}
+{"measurement": "warmup_index", "median_seconds": 0.138501, "runs": [{"counters": {"discovered": 55, "elapsed_ms": 126, "failed": 0, "removed": 0, "reparsed": 0, "reused": 55}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.138501}]}
+{"measurement": "warm_index", "median_seconds": 0.137166, "runs": [{"counters": {"discovered": 55, "elapsed_ms": 124, "failed": 0, "removed": 0, "reparsed": 0, "reused": 55}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.137166}]}
+{"measurement": "ascii_literal_warmup", "median_seconds": 0.144864, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.144864}]}
+{"measurement": "ascii_literal", "median_seconds": 0.140407, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.140407}]}
+{"measurement": "short_literal_warmup", "median_seconds": 0.150779, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.150779}]}
+{"measurement": "short_literal", "median_seconds": 0.147177, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.147177}]}
+{"measurement": "non_ascii_literal_warmup", "median_seconds": 0.151836, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.151836}]}
+{"measurement": "non_ascii_literal", "median_seconds": 0.148266, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.148266}]}
+{"measurement": "regex_warmup", "median_seconds": 0.14545, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.14545}]}
+{"measurement": "regex", "median_seconds": 0.14825, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.14825}]}
+{"one_changed_source": "synthetic_only"}
+{"cold_ms": 526, "counters": {"discovered": 55, "elapsed_ms": 510, "failed": 0, "removed": 0, "reparsed": 55, "reused": 0}, "coverage": "compact", "diagnostic_counts": {}, "entries": 1875, "exit": 0, "incomplete": false, "index_bytes": 10772480, "per_agent": "cursor", "sessions": 55, "source_bytes": 125343072, "source_files": 1165}
+{"cleanup": "removed_owned_workspace", "index_exists": false, "workspace_exists": false}
+{"agents": ["cursor"], "binary_sha256": "dfb54efe6c5178dce71333124e2b1b08100f32c4f2653d8f9f8d081b88953318", "corpus": {"cursor": {"bytes": 125343072, "files": 1165, "missing": 0, "unreadable": 0}}, "coverage": "full", "free_bytes_before": 150788505600, "machine": "arm64", "mode": "real", "per_agent": true, "platform": "Darwin", "repetitions": 1, "required_free_bytes": 3651600512}
+{"measurement": "cold_index", "median_seconds": 0.526103, "runs": [{"counters": {"discovered": 55, "elapsed_ms": 510, "failed": 0, "removed": 0, "reparsed": 55, "reused": 0}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.526103}]}
+{"indexed_dimensions": {"documents": 1930, "entries": 1875, "entry_bytes": 1851439, "index_bytes": 10772480, "non_ascii_documents": 149, "nul_documents": 0, "sessions": 55}}
+{"measurement": "warmup_index", "median_seconds": 0.139113, "runs": [{"counters": {"discovered": 55, "elapsed_ms": 127, "failed": 0, "removed": 0, "reparsed": 0, "reused": 55}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.139113}]}
+{"measurement": "warm_index", "median_seconds": 0.142652, "runs": [{"counters": {"discovered": 55, "elapsed_ms": 129, "failed": 0, "removed": 0, "reparsed": 0, "reused": 55}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.142652}]}
+{"measurement": "ascii_literal_warmup", "median_seconds": 0.144542, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.144542}]}
+{"measurement": "ascii_literal", "median_seconds": 0.146057, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.146057}]}
+{"measurement": "short_literal_warmup", "median_seconds": 0.150717, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.150717}]}
+{"measurement": "short_literal", "median_seconds": 0.148717, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.148717}]}
+{"measurement": "non_ascii_literal_warmup", "median_seconds": 0.14567, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.14567}]}
+{"measurement": "non_ascii_literal", "median_seconds": 0.151599, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.151599}]}
+{"measurement": "regex_warmup", "median_seconds": 0.147304, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.147304}]}
+{"measurement": "regex", "median_seconds": 0.147605, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.147605}]}
+{"one_changed_source": "synthetic_only"}
+{"cold_ms": 514, "counters": {"discovered": 55, "elapsed_ms": 496, "failed": 0, "removed": 0, "reparsed": 55, "reused": 0}, "coverage": "full", "diagnostic_counts": {}, "entries": 1875, "exit": 0, "incomplete": false, "index_bytes": 10772480, "per_agent": "cursor", "sessions": 55, "source_bytes": 125343072, "source_files": 1165}
+{"cleanup": "removed_owned_workspace", "index_exists": false, "workspace_exists": false}
+{"agents": ["devin"], "binary_sha256": "dfb54efe6c5178dce71333124e2b1b08100f32c4f2653d8f9f8d081b88953318", "corpus": {"devin": {"bytes": 226418304, "files": 3, "missing": 1, "unreadable": 0}}, "coverage": "compact", "free_bytes_before": 150791491584, "machine": "arm64", "mode": "real", "per_agent": true, "platform": "Darwin", "repetitions": 1, "required_free_bytes": 4864503296}
+{"measurement": "cold_index", "median_seconds": 7.078245, "runs": [{"counters": {"discovered": 76, "elapsed_ms": 7063, "failed": 0, "removed": 0, "reparsed": 76, "reused": 0}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 7.078245}]}
+{"indexed_dimensions": {"documents": 5814, "entries": 7266, "entry_bytes": 13052022, "index_bytes": 36007936, "non_ascii_documents": 854, "nul_documents": 0, "sessions": 76}}
+{"measurement": "warmup_index", "median_seconds": 0.540378, "runs": [{"counters": {"discovered": 76, "elapsed_ms": 530, "failed": 0, "removed": 0, "reparsed": 0, "reused": 76}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.540378}]}
+{"measurement": "warm_index", "median_seconds": 0.571229, "runs": [{"counters": {"discovered": 76, "elapsed_ms": 561, "failed": 0, "removed": 0, "reparsed": 0, "reused": 76}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.571229}]}
+{"measurement": "ascii_literal_warmup", "median_seconds": 0.063551, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.063551}]}
+{"measurement": "ascii_literal", "median_seconds": 0.061516, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.061516}]}
+{"measurement": "short_literal_warmup", "median_seconds": 0.075794, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.075794}]}
+{"measurement": "short_literal", "median_seconds": 0.074937, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.074937}]}
+{"measurement": "non_ascii_literal_warmup", "median_seconds": 0.075298, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.075298}]}
+{"measurement": "non_ascii_literal", "median_seconds": 0.076003, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.076003}]}
+{"measurement": "regex_warmup", "median_seconds": 0.073214, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.073214}]}
+{"measurement": "regex", "median_seconds": 0.071082, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.071082}]}
+{"one_changed_source": "synthetic_only"}
+{"cold_ms": 7139, "counters": {"discovered": 76, "elapsed_ms": 7124, "failed": 0, "removed": 0, "reparsed": 76, "reused": 0}, "coverage": "compact", "diagnostic_counts": {}, "entries": 7266, "exit": 0, "incomplete": false, "index_bytes": 36007936, "per_agent": "devin", "sessions": 76, "source_bytes": 226418304, "source_files": 3}
+{"cleanup": "removed_owned_workspace", "index_exists": false, "workspace_exists": false}
+{"agents": ["devin"], "binary_sha256": "dfb54efe6c5178dce71333124e2b1b08100f32c4f2653d8f9f8d081b88953318", "corpus": {"devin": {"bytes": 226418304, "files": 3, "missing": 1, "unreadable": 0}}, "coverage": "full", "free_bytes_before": 150806102016, "machine": "arm64", "mode": "real", "per_agent": true, "platform": "Darwin", "repetitions": 1, "required_free_bytes": 4864503296}
+{"measurement": "cold_index", "median_seconds": 8.093753, "runs": [{"counters": {"discovered": 76, "elapsed_ms": 8079, "failed": 0, "removed": 0, "reparsed": 76, "reused": 0}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 8.093753}]}
+{"indexed_dimensions": {"documents": 7282, "entries": 7266, "entry_bytes": 13052022, "index_bytes": 54562816, "non_ascii_documents": 1180, "nul_documents": 0, "sessions": 76}}
+{"measurement": "warmup_index", "median_seconds": 0.536208, "runs": [{"counters": {"discovered": 76, "elapsed_ms": 525, "failed": 0, "removed": 0, "reparsed": 0, "reused": 76}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.536208}]}
+{"measurement": "warm_index", "median_seconds": 0.537974, "runs": [{"counters": {"discovered": 76, "elapsed_ms": 527, "failed": 0, "removed": 0, "reparsed": 0, "reused": 76}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.537974}]}
+{"measurement": "ascii_literal_warmup", "median_seconds": 0.065587, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.065587}]}
+{"measurement": "ascii_literal", "median_seconds": 0.06723, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.06723}]}
+{"measurement": "short_literal_warmup", "median_seconds": 0.076589, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.076589}]}
+{"measurement": "short_literal", "median_seconds": 0.077349, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.077349}]}
+{"measurement": "non_ascii_literal_warmup", "median_seconds": 0.073226, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.073226}]}
+{"measurement": "non_ascii_literal", "median_seconds": 0.071988, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.071988}]}
+{"measurement": "regex_warmup", "median_seconds": 0.074266, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.074266}]}
+{"measurement": "regex", "median_seconds": 0.074501, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.074501}]}
+{"one_changed_source": "synthetic_only"}
+{"cold_ms": 8003, "counters": {"discovered": 76, "elapsed_ms": 7988, "failed": 0, "removed": 0, "reparsed": 76, "reused": 0}, "coverage": "full", "diagnostic_counts": {}, "entries": 7266, "exit": 0, "incomplete": false, "index_bytes": 54562816, "per_agent": "devin", "sessions": 76, "source_bytes": 226418304, "source_files": 3}
+{"cleanup": "removed_owned_workspace", "index_exists": false, "workspace_exists": false}
+{"agents": ["droid"], "binary_sha256": "dfb54efe6c5178dce71333124e2b1b08100f32c4f2653d8f9f8d081b88953318", "corpus": {"droid": {"bytes": 839886445, "files": 2306, "missing": 0, "unreadable": 0}}, "coverage": "compact", "free_bytes_before": 150804738048, "machine": "arm64", "mode": "real", "per_agent": true, "platform": "Darwin", "repetitions": 1, "required_free_bytes": 12226120988}
+{"measurement": "cold_index", "median_seconds": 24.800714, "runs": [{"counters": {"discovered": 770, "elapsed_ms": 24778, "failed": 0, "removed": 0, "reparsed": 770, "reused": 0}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 24.800714}]}
+{"indexed_dimensions": {"documents": 56773, "entries": 68791, "entry_bytes": 571245994, "index_bytes": 931041280, "non_ascii_documents": 8482, "nul_documents": 2, "sessions": 770}}
+{"measurement": "warmup_index", "median_seconds": 0.525879, "runs": [{"counters": {"discovered": 770, "elapsed_ms": 503, "failed": 0, "removed": 0, "reparsed": 0, "reused": 770}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.525879}]}
+{"measurement": "warm_index", "median_seconds": 0.190908, "runs": [{"counters": {"discovered": 770, "elapsed_ms": 168, "failed": 0, "removed": 0, "reparsed": 0, "reused": 770}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.190908}]}
+{"measurement": "ascii_literal_warmup", "median_seconds": 0.736643, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.736643}]}
+{"measurement": "ascii_literal", "median_seconds": 0.71699, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.71699}]}
+{"measurement": "short_literal_warmup", "median_seconds": 1.356604, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 1.356604}]}
+{"measurement": "short_literal", "median_seconds": 1.276868, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 1.276868}]}
+{"measurement": "non_ascii_literal_warmup", "median_seconds": 1.310035, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 1.310035}]}
+{"measurement": "non_ascii_literal", "median_seconds": 1.355225, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 1.355225}]}
+{"measurement": "regex_warmup", "median_seconds": 1.278643, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 1.278643}]}
+{"measurement": "regex", "median_seconds": 1.370916, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 1.370916}]}
+{"one_changed_source": "synthetic_only"}
+{"cold_ms": 24384, "counters": {"discovered": 770, "elapsed_ms": 24364, "failed": 0, "removed": 0, "reparsed": 770, "reused": 0}, "coverage": "compact", "diagnostic_counts": {}, "entries": 68791, "exit": 0, "incomplete": false, "index_bytes": 931041280, "per_agent": "droid", "sessions": 770, "source_bytes": 839886445, "source_files": 2306}
+{"cleanup": "removed_owned_workspace", "index_exists": false, "workspace_exists": false}
+{"agents": ["droid"], "binary_sha256": "dfb54efe6c5178dce71333124e2b1b08100f32c4f2653d8f9f8d081b88953318", "corpus": {"droid": {"bytes": 839886445, "files": 2306, "missing": 0, "unreadable": 0}}, "coverage": "full", "free_bytes_before": 150805450752, "machine": "arm64", "mode": "real", "per_agent": true, "platform": "Darwin", "repetitions": 1, "required_free_bytes": 12226120988}
+{"measurement": "cold_index", "median_seconds": 115.159072, "runs": [{"counters": {"discovered": 770, "elapsed_ms": 115102, "failed": 0, "removed": 0, "reparsed": 770, "reused": 0}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 115.159072}]}
+{"indexed_dimensions": {"documents": 69561, "entries": 68791, "entry_bytes": 571245994, "index_bytes": 2015457280, "non_ascii_documents": 18668, "nul_documents": 3, "sessions": 770}}
+{"measurement": "warmup_index", "median_seconds": 0.508086, "runs": [{"counters": {"discovered": 770, "elapsed_ms": 485, "failed": 0, "removed": 0, "reparsed": 0, "reused": 770}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.508086}]}
+{"measurement": "warm_index", "median_seconds": 0.175585, "runs": [{"counters": {"discovered": 770, "elapsed_ms": 152, "failed": 0, "removed": 0, "reparsed": 0, "reused": 770}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.175585}]}
+{"measurement": "ascii_literal_warmup", "median_seconds": 0.942192, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.942192}]}
+{"measurement": "ascii_literal", "median_seconds": 0.971653, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.971653}]}
+{"measurement": "short_literal_warmup", "median_seconds": 1.462281, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 1.462281}]}
+{"measurement": "short_literal", "median_seconds": 1.413844, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 1.413844}]}
+{"measurement": "non_ascii_literal_warmup", "median_seconds": 1.365822, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 1.365822}]}
+{"measurement": "non_ascii_literal", "median_seconds": 1.329989, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 1.329989}]}
+{"measurement": "regex_warmup", "median_seconds": 1.346608, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 1.346608}]}
+{"measurement": "regex", "median_seconds": 1.335341, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 1.335341}]}
+{"one_changed_source": "synthetic_only"}
+{"cold_ms": 116086, "counters": {"discovered": 770, "elapsed_ms": 116070, "failed": 0, "removed": 0, "reparsed": 770, "reused": 0}, "coverage": "full", "diagnostic_counts": {}, "entries": 68791, "exit": 0, "incomplete": false, "index_bytes": 2015457280, "per_agent": "droid", "sessions": 770, "source_bytes": 839886445, "source_files": 2306}
+{"cleanup": "removed_owned_workspace", "index_exists": false, "workspace_exists": false}
+{"agents": ["opencode"], "binary_sha256": "dfb54efe6c5178dce71333124e2b1b08100f32c4f2653d8f9f8d081b88953318", "corpus": {"opencode": {"bytes": 167997440, "files": 3, "missing": 1, "unreadable": 0}}, "coverage": "compact", "free_bytes_before": 150788227072, "machine": "arm64", "mode": "real", "per_agent": true, "platform": "Darwin", "repetitions": 1, "required_free_bytes": 4163452928}
+{"measurement": "cold_index", "median_seconds": 2.618975, "runs": [{"counters": {"discovered": 251, "elapsed_ms": 2599, "failed": 0, "removed": 0, "reparsed": 251, "reused": 0}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 2.618975}]}
+{"indexed_dimensions": {"documents": 4778, "entries": 5421, "entry_bytes": 17145057, "index_bytes": 60723200, "non_ascii_documents": 1013, "nul_documents": 0, "sessions": 251}}
+{"measurement": "warmup_index", "median_seconds": 0.023817, "runs": [{"counters": {"discovered": 251, "elapsed_ms": 11, "failed": 0, "removed": 0, "reparsed": 0, "reused": 251}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.023817}]}
+{"measurement": "warm_index", "median_seconds": 0.02132, "runs": [{"counters": {"discovered": 251, "elapsed_ms": 9, "failed": 0, "removed": 0, "reparsed": 0, "reused": 251}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.02132}]}
+{"measurement": "warm_opencode_inventory", "median_seconds": 0.020887, "runs": [{"counters": {"discovered": 251, "elapsed_ms": 9, "failed": 0, "removed": 0, "reparsed": 0, "reused": 251}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.020887}]}
+{"measurement": "ascii_literal_warmup", "median_seconds": 0.048311, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.048311}]}
+{"measurement": "ascii_literal", "median_seconds": 0.054365, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.054365}]}
+{"measurement": "short_literal_warmup", "median_seconds": 0.050295, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.050295}]}
+{"measurement": "short_literal", "median_seconds": 0.05019, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.05019}]}
+{"measurement": "non_ascii_literal_warmup", "median_seconds": 0.044778, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.044778}]}
+{"measurement": "non_ascii_literal", "median_seconds": 0.049973, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.049973}]}
+{"measurement": "regex_warmup", "median_seconds": 0.044812, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.044812}]}
+{"measurement": "regex", "median_seconds": 0.046877, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.046877}]}
+{"one_changed_source": "synthetic_only"}
+{"cold_ms": 2628, "counters": {"discovered": 251, "elapsed_ms": 2608, "failed": 0, "removed": 0, "reparsed": 251, "reused": 0}, "coverage": "compact", "diagnostic_counts": {}, "entries": 5421, "exit": 0, "incomplete": false, "index_bytes": 60723200, "per_agent": "opencode", "sessions": 251, "source_bytes": 167997440, "source_files": 3}
+{"cleanup": "removed_owned_workspace", "index_exists": false, "workspace_exists": false}
+{"agents": ["opencode"], "binary_sha256": "dfb54efe6c5178dce71333124e2b1b08100f32c4f2653d8f9f8d081b88953318", "corpus": {"opencode": {"bytes": 167997440, "files": 3, "missing": 1, "unreadable": 0}}, "coverage": "full", "free_bytes_before": 150792245248, "machine": "arm64", "mode": "real", "per_agent": true, "platform": "Darwin", "repetitions": 1, "required_free_bytes": 4163452928}
+{"measurement": "cold_index", "median_seconds": 2.8984, "runs": [{"counters": {"discovered": 251, "elapsed_ms": 2881, "failed": 0, "removed": 0, "reparsed": 251, "reused": 0}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 2.8984}]}
+{"indexed_dimensions": {"documents": 5672, "entries": 5421, "entry_bytes": 17145057, "index_bytes": 66506752, "non_ascii_documents": 1360, "nul_documents": 0, "sessions": 251}}
+{"measurement": "warmup_index", "median_seconds": 0.02354, "runs": [{"counters": {"discovered": 251, "elapsed_ms": 11, "failed": 0, "removed": 0, "reparsed": 0, "reused": 251}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.02354}]}
+{"measurement": "warm_index", "median_seconds": 0.021199, "runs": [{"counters": {"discovered": 251, "elapsed_ms": 9, "failed": 0, "removed": 0, "reparsed": 0, "reused": 251}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.021199}]}
+{"measurement": "warm_opencode_inventory", "median_seconds": 0.021182, "runs": [{"counters": {"discovered": 251, "elapsed_ms": 9, "failed": 0, "removed": 0, "reparsed": 0, "reused": 251}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.021182}]}
+{"measurement": "ascii_literal_warmup", "median_seconds": 0.057123, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.057123}]}
+{"measurement": "ascii_literal", "median_seconds": 0.059011, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.059011}]}
+{"measurement": "short_literal_warmup", "median_seconds": 0.054811, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.054811}]}
+{"measurement": "short_literal", "median_seconds": 0.053341, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.053341}]}
+{"measurement": "non_ascii_literal_warmup", "median_seconds": 0.050043, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.050043}]}
+{"measurement": "non_ascii_literal", "median_seconds": 0.050567, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.050567}]}
+{"measurement": "regex_warmup", "median_seconds": 0.049662, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.049662}]}
+{"measurement": "regex", "median_seconds": 0.049875, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.049875}]}
+{"one_changed_source": "synthetic_only"}
+{"cold_ms": 2931, "counters": {"discovered": 251, "elapsed_ms": 2915, "failed": 0, "removed": 0, "reparsed": 251, "reused": 0}, "coverage": "full", "diagnostic_counts": {}, "entries": 5421, "exit": 0, "incomplete": false, "index_bytes": 66506752, "per_agent": "opencode", "sessions": 251, "source_bytes": 167997440, "source_files": 3}
+{"cleanup": "removed_owned_workspace", "index_exists": false, "workspace_exists": false}
+{"agents": ["pi"], "binary_sha256": "dfb54efe6c5178dce71333124e2b1b08100f32c4f2653d8f9f8d081b88953318", "corpus": {"pi": {"bytes": 26362933, "files": 155, "missing": 0, "unreadable": 0}}, "coverage": "compact", "free_bytes_before": 150791368704, "machine": "arm64", "mode": "real", "per_agent": true, "platform": "Darwin", "repetitions": 1, "required_free_bytes": 2463838844}
+{"measurement": "cold_index", "median_seconds": 1.371006, "runs": [{"counters": {"discovered": 121, "elapsed_ms": 1186, "failed": 0, "removed": 0, "reparsed": 121, "reused": 0}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 1.371006}]}
+{"indexed_dimensions": {"documents": 4128, "entries": 5150, "entry_bytes": 14187915, "index_bytes": 33280000, "non_ascii_documents": 880, "nul_documents": 0, "sessions": 121}}
+{"measurement": "warmup_index", "median_seconds": 0.142974, "runs": [{"counters": {"discovered": 121, "elapsed_ms": 130, "failed": 0, "removed": 0, "reparsed": 0, "reused": 121}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.142974}]}
+{"measurement": "warm_index", "median_seconds": 0.147053, "runs": [{"counters": {"discovered": 121, "elapsed_ms": 134, "failed": 0, "removed": 0, "reparsed": 0, "reused": 121}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.147053}]}
+{"measurement": "ascii_literal_warmup", "median_seconds": 0.160758, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.160758}]}
+{"measurement": "ascii_literal", "median_seconds": 0.158867, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.158867}]}
+{"measurement": "short_literal_warmup", "median_seconds": 0.169174, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.169174}]}
+{"measurement": "short_literal", "median_seconds": 0.185633, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.185633}]}
+{"measurement": "non_ascii_literal_warmup", "median_seconds": 0.16647, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.16647}]}
+{"measurement": "non_ascii_literal", "median_seconds": 0.168506, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.168506}]}
+{"measurement": "regex_warmup", "median_seconds": 0.165591, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.165591}]}
+{"measurement": "regex", "median_seconds": 0.16488, "runs": [{"diagnostic_counts": {"search_coverage": 1}, "exit": 0, "seconds": 0.16488}]}
+{"one_changed_source": "synthetic_only"}
+{"cold_ms": 863, "counters": {"discovered": 121, "elapsed_ms": 846, "failed": 0, "removed": 0, "reparsed": 121, "reused": 0}, "coverage": "compact", "diagnostic_counts": {}, "entries": 5150, "exit": 0, "incomplete": false, "index_bytes": 33280000, "per_agent": "pi", "sessions": 121, "source_bytes": 26362933, "source_files": 155}
+{"cleanup": "removed_owned_workspace", "index_exists": false, "workspace_exists": false}
+{"agents": ["pi"], "binary_sha256": "dfb54efe6c5178dce71333124e2b1b08100f32c4f2653d8f9f8d081b88953318", "corpus": {"pi": {"bytes": 26362933, "files": 155, "missing": 0, "unreadable": 0}}, "coverage": "full", "free_bytes_before": 150774411264, "machine": "arm64", "mode": "real", "per_agent": true, "platform": "Darwin", "repetitions": 1, "required_free_bytes": 2463838844}
+{"measurement": "cold_index", "median_seconds": 1.993258, "runs": [{"counters": {"discovered": 121, "elapsed_ms": 1976, "failed": 0, "removed": 0, "reparsed": 121, "reused": 0}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 1.993258}]}
+{"indexed_dimensions": {"documents": 5205, "entries": 5150, "entry_bytes": 14187915, "index_bytes": 54329344, "non_ascii_documents": 1274, "nul_documents": 0, "sessions": 121}}
+{"measurement": "warmup_index", "median_seconds": 0.14364, "runs": [{"counters": {"discovered": 121, "elapsed_ms": 130, "failed": 0, "removed": 0, "reparsed": 0, "reused": 121}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.14364}]}
+{"measurement": "warm_index", "median_seconds": 0.140581, "runs": [{"counters": {"discovered": 121, "elapsed_ms": 127, "failed": 0, "removed": 0, "reparsed": 0, "reused": 121}, "diagnostic_counts": {}, "exit": 0, "incomplete": false, "seconds": 0.140581}]}
+{"measurement": "ascii_literal_warmup", "median_seconds": 0.169337, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.169337}]}
+{"measurement": "ascii_literal", "median_seconds": 0.169421, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.169421}]}
+{"measurement": "short_literal_warmup", "median_seconds": 0.175316, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.175316}]}
+{"measurement": "short_literal", "median_seconds": 0.17429, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.17429}]}
+{"measurement": "non_ascii_literal_warmup", "median_seconds": 0.170262, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.170262}]}
+{"measurement": "non_ascii_literal", "median_seconds": 0.169531, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.169531}]}
+{"measurement": "regex_warmup", "median_seconds": 0.171695, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.171695}]}
+{"measurement": "regex", "median_seconds": 0.169136, "runs": [{"diagnostic_counts": {}, "exit": 0, "seconds": 0.169136}]}
+{"one_changed_source": "synthetic_only"}
+{"cold_ms": 1965, "counters": {"discovered": 121, "elapsed_ms": 1948, "failed": 0, "removed": 0, "reparsed": 121, "reused": 0}, "coverage": "full", "diagnostic_counts": {}, "entries": 5150, "exit": 0, "incomplete": false, "index_bytes": 54329344, "per_agent": "pi", "sessions": 121, "source_bytes": 26362933, "source_files": 155}
+{"cleanup": "removed_owned_workspace", "index_exists": false, "workspace_exists": false}

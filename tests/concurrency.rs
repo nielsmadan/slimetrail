@@ -20,6 +20,7 @@ fn context(base: &Path) -> Context {
         now_ms: 0,
         cwd: base.into(),
         time_zone: "UTC".into(),
+        coverage: slimetrail::Coverage::Compact,
     }
 }
 
@@ -221,7 +222,10 @@ fn query_during_another_write_answers_from_the_published_index() {
             .iter()
             .map(|d| (d.code.as_str(), d.agent, d.source.as_deref()))
             .collect::<Vec<_>>(),
-        [("refresh_in_progress", None, None)]
+        [
+            ("refresh_in_progress", None, None),
+            ("search_coverage", None, None)
+        ]
     );
     assert_eq!(hits(&result), ["one"]);
     release(&mut child);

@@ -75,7 +75,8 @@ fn search_complete_empty_partial_and_fatal_envelopes() {
     fixture.write("Unicode café 🐌 and a.b");
     let complete = fixture.json(&["search", "A.B", "--codex", "--scope", "all"], 0);
     assert_eq!(complete["incomplete"], false);
-    assert_eq!(complete["diagnostics"], json!([]));
+    assert_eq!(complete["diagnostics"].as_array().unwrap().len(), 1);
+    assert_eq!(complete["diagnostics"][0]["code"], "search_coverage");
     assert_eq!(complete["data"]["count"], 1);
     assert_eq!(complete["data"]["results"][0]["ref"], "codex:sample");
     assert_eq!(
@@ -668,8 +669,9 @@ fn unavailable_unselected_root_allows_healthy_selection_and_identifies_partial_s
     assert_eq!(
         String::from_utf8(mixed.stderr).unwrap(),
         format!(
-            "source_unavailable: [claude {}] Required session store could not be enumerated\n",
-            blocked.join("projects").display()
+            "source_unavailable: [claude {}] Required session store could not be enumerated\n{}",
+            blocked.join("projects").display(),
+            String::from_utf8(single.stderr).unwrap()
         )
     );
 }
@@ -691,5 +693,266 @@ fn malformed_source_stderr_has_identity_and_preserves_text_read_stdout() {
             "malformed_records: [codex {}] 1 nonempty records were not valid JSON objects\n",
             path.display()
         )
+    );
+}
+
+fn tool_session(fixture: &Fixture) {
+    let output = format!("early-literal {} late-literal", "x".repeat(10_000));
+    let records = [
+        json!({"type":"session_meta","payload":{"id":"tool","cwd":fixture.root().join("work/app")}}),
+        json!({"type":"response_item","timestamp":"2026-10-25T00:30:00Z","payload":{"type":"function_call_output","call_id":"c1","output":output}}),
+        json!({"type":"response_item","timestamp":"2026-10-25T00:31:00Z","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"pondered riddle"}]}}),
+    ];
+    fs::write(
+        fixture.root().join("codex/sessions/tool.jsonl"),
+        records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+    .unwrap();
+}
+
+fn index_settings(fixture: &Fixture) -> (String, Option<String>) {
+    let db = rusqlite::Connection::open(fixture.root().join("index/index-v3.sqlite3")).unwrap();
+    db.query_row("SELECT coverage,coverage_pending FROM settings", [], |r| {
+        Ok((r.get(0)?, r.get(1)?))
+    })
+    .unwrap()
+}
+
+fn codes(value: &Value) -> Vec<&str> {
+    value["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["code"].as_str().unwrap())
+        .collect()
+}
+
+fn search_args(query: &str) -> Vec<&str> {
+    vec!["search", query, "--codex", "--scope", "all"]
+}
+
+#[test]
+fn coverage_flag_rebuilds_search_documents_without_reparsing() {
+    let fixture = Fixture::new();
+    tool_session(&fixture);
+    let built = fixture.json(&["index", "--codex"], 0);
+    assert_eq!(built["data"]["reparsed"], 1);
+    let compact = fixture.json(&search_args("early-literal"), 0);
+    assert_eq!(compact["data"]["count"], 0);
+    assert_eq!(codes(&compact), ["search_coverage"]);
+    assert_eq!(compact["incomplete"], false);
+    assert_eq!(
+        fixture.json(&search_args("late-literal"), 0)["data"]["count"],
+        1
+    );
+    assert_eq!(
+        fixture.json(&search_args("pondered"), 0)["data"]["count"],
+        0
+    );
+    let rebuilt = fixture.json(&["index", "--codex", "--coverage", "full"], 0);
+    assert_eq!(rebuilt["data"]["reparsed"], 0);
+    assert_eq!(rebuilt["data"]["reused"], 1);
+    assert_eq!(
+        fs::read_to_string(fixture.root().join(".config/slimetrail/config.toml")).unwrap(),
+        "coverage = \"full\"\n"
+    );
+    assert_eq!(index_settings(&fixture), ("full".into(), None));
+    for query in ["early-literal", "late-literal", "pondered"] {
+        let full = fixture.json(&search_args(query), 0);
+        assert_eq!(full["data"]["count"], 1, "{query}");
+        assert_eq!(full["diagnostics"], json!([]));
+    }
+    let back = fixture.json(&["index", "--codex", "--coverage", "compact"], 0);
+    assert_eq!(back["data"]["reparsed"], 0);
+    assert_eq!(index_settings(&fixture), ("compact".into(), None));
+    assert_eq!(
+        fixture.json(&search_args("early-literal"), 0)["data"]["count"],
+        0
+    );
+}
+
+#[test]
+fn coverage_flag_repairs_an_invalid_config_and_writes_through_a_symlink() {
+    let fixture = Fixture::new();
+    tool_session(&fixture);
+    let config = fixture.root().join(".config/slimetrail/config.toml");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, "coverage = \"everything\"\n").unwrap();
+    fixture.json(&search_args("early-literal"), 2);
+    fixture.json(&["index", "--codex", "--coverage", "full"], 0);
+    assert_eq!(
+        fs::read_to_string(&config).unwrap(),
+        "coverage = \"full\"\n"
+    );
+    let target = fixture.root().join("dotfiles/real.toml");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::rename(&config, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &config).unwrap();
+    fixture.json(&["index", "--codex", "--coverage", "compact"], 0);
+    assert!(
+        fs::symlink_metadata(&config)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "coverage = \"compact\"\n"
+    );
+}
+
+#[test]
+fn config_mismatch_is_noted_by_queries_and_reconciled_only_by_index() {
+    let fixture = Fixture::new();
+    tool_session(&fixture);
+    fixture.json(&["index", "--codex"], 0);
+    let config = fixture.root().join("elsewhere/custom.toml");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, "coverage = \"full\"\n").unwrap();
+    let run = |args: &[&str], code: i32| {
+        let output = fixture
+            .command()
+            .env("SLIMETRAIL_CONFIG", &config)
+            .args(["--format", "json"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(code), "{output:?}");
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let noted = run(&search_args("early-literal"), 0);
+    assert_eq!(noted["data"]["count"], 0);
+    assert_eq!(noted["incomplete"], false);
+    assert_eq!(codes(&noted), ["search_coverage"]);
+    let message = noted["diagnostics"][0]["message"].as_str().unwrap();
+    assert!(message.contains("config asks for full"), "{message}");
+    assert!(message.contains("run `slimetrail index`"), "{message}");
+    assert_eq!(index_settings(&fixture), ("compact".into(), None));
+    assert_eq!(run(&["index", "--codex"], 0)["data"]["reparsed"], 0);
+    assert_eq!(index_settings(&fixture), ("full".into(), None));
+    let full = run(&search_args("early-literal"), 0);
+    assert_eq!(full["data"]["count"], 1);
+    assert_eq!(full["diagnostics"], json!([]));
+    let mismatch = fixture.json(&search_args("early-literal"), 0);
+    assert_eq!(mismatch["data"]["count"], 1);
+    assert_eq!(codes(&mismatch), ["search_coverage"]);
+    assert!(
+        mismatch["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("config asks for compact")
+    );
+    assert_eq!(index_settings(&fixture), ("full".into(), None));
+}
+
+#[test]
+fn interrupted_coverage_rebuild_keeps_queries_stale_until_index_completes_it() {
+    let fixture = Fixture::new();
+    tool_session(&fixture);
+    fixture.json(&["index", "--codex"], 0);
+    let db = rusqlite::Connection::open(fixture.root().join("index/index-v3.sqlite3")).unwrap();
+    db.execute("UPDATE settings SET coverage_pending='full'", [])
+        .unwrap();
+    drop(db);
+    let stale = fixture.json(&search_args("late-literal"), 1);
+    assert_eq!(stale["incomplete"], true);
+    assert_eq!(codes(&stale), ["refresh_in_progress", "search_coverage"]);
+    let listed = fixture.json(&["sessions", "--codex", "--scope", "all"], 1);
+    assert_eq!(codes(&listed), ["refresh_in_progress"]);
+    assert_eq!(
+        index_settings(&fixture),
+        ("compact".into(), Some("full".into()))
+    );
+    assert_eq!(
+        fixture.json(&["index", "--codex"], 0)["data"]["reparsed"],
+        0
+    );
+    assert_eq!(index_settings(&fixture), ("compact".into(), None));
+    let complete = fixture.json(&search_args("late-literal"), 0);
+    assert_eq!(complete["data"]["count"], 1);
+    assert_eq!(codes(&complete), ["search_coverage"]);
+}
+
+#[test]
+fn compact_kind_filters_name_the_limited_kind() {
+    let fixture = Fixture::new();
+    tool_session(&fixture);
+    for (kind, limited) in [("meta", "--kind meta"), ("tool", "--kind tool")] {
+        let mut args = search_args("literal");
+        args.extend(["--kind", kind]);
+        let value = fixture.json(&args, 0);
+        assert_eq!(value["incomplete"], false);
+        assert_eq!(codes(&value), ["coverage_excluded"]);
+        assert!(
+            value["diagnostics"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains(limited)
+        );
+    }
+    let mut args = search_args("literal");
+    args.extend(["--kind", "message"]);
+    assert_eq!(codes(&fixture.json(&args, 0)), ["search_coverage"]);
+}
+
+#[test]
+fn config_file_location_and_validation() {
+    let fixture = Fixture::new();
+    tool_session(&fixture);
+    let xdg = fixture.root().join("xdg");
+    let xdg_file = xdg.join("slimetrail/config.toml");
+    fs::create_dir_all(xdg_file.parent().unwrap()).unwrap();
+    let explicit = fixture.root().join("explicit.toml");
+    let run = |env: &[(&str, &Path)]| {
+        let mut command = fixture.command();
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        command
+            .args(["--format", "json"])
+            .args(search_args("early-literal"))
+            .output()
+            .unwrap()
+    };
+    for (file, env) in [
+        (&xdg_file, vec![("XDG_CONFIG_HOME", xdg.as_path())]),
+        (
+            &explicit,
+            vec![
+                ("XDG_CONFIG_HOME", xdg.as_path()),
+                ("SLIMETRAIL_CONFIG", explicit.as_path()),
+            ],
+        ),
+    ] {
+        fs::write(file, "coverage = \"sometimes\"\n").unwrap();
+        let output = run(&env);
+        assert_eq!(output.status.code(), Some(2));
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(&file.display().to_string()), "{stderr}");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(codes(&value), ["fatal"]);
+        fs::write(file, "coverage = \"full\"\n").unwrap();
+        let output = run(&env);
+        assert_eq!(output.status.code(), Some(0));
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["data"]["count"], 1);
+        assert_eq!(value["diagnostics"], json!([]));
+        fs::remove_file(file).unwrap();
+    }
+    fs::write(&explicit, "coverage = \"full\"\nextra = 1\n").unwrap();
+    let output = run(&[("SLIMETRAIL_CONFIG", explicit.as_path())]);
+    assert_eq!(output.status.code(), Some(2));
+    let value: Value = serde_json::from_slice(&run(&[]).stdout).unwrap();
+    assert_eq!(codes(&value), ["search_coverage"]);
+    assert!(
+        value["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("config asks for compact")
     );
 }

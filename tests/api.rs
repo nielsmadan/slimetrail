@@ -6,16 +6,27 @@ use slimetrail::*;
 use std::{collections::BTreeSet, fs};
 
 #[test]
+fn six_agent_reference_search_read_and_timeline_goldens() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = context(dir.path());
+    six(&base);
+    let golden: Value =
+        serde_json::from_str(include_str!("fixtures/query/six.golden.json")).unwrap();
+    for coverage in [Coverage::Full, Coverage::Compact] {
+        let ctx = Context {
+            index_dir: dir.path().join(format!("index-{coverage:?}")),
+            coverage,
+            ..base.clone()
+        };
+        goldens(&ctx, &golden);
+    }
+}
+
 #[expect(
     clippy::cast_precision_loss,
     reason = "The Python goldens store fixture scores as floats"
 )]
-fn six_agent_reference_search_read_and_timeline_goldens() {
-    let dir = tempfile::tempdir().unwrap();
-    let ctx = context(dir.path());
-    six(&ctx);
-    let golden: Value =
-        serde_json::from_str(include_str!("fixtures/query/six.golden.json")).unwrap();
+fn goldens(ctx: &Context, golden: &Value) {
     for agent in [
         Agent::Claude,
         Agent::Codex,
@@ -25,13 +36,13 @@ fn six_agent_reference_search_read_and_timeline_goldens() {
         Agent::Pi,
     ] {
         let selected = filter(agent);
-        let list = sessions(&ctx, &selected).unwrap();
+        let list = sessions(ctx, &selected).unwrap();
         assert!(!list.incomplete, "{:?}", list.diagnostics);
         let session = &list.data.unwrap()[0];
         for query in ["needle", "café", "Native", "title"] {
             let mut opt = options(query);
             opt.filter = selected.clone();
-            let result = search(&ctx, &opt).unwrap().data.unwrap();
+            let result = search(ctx, &opt).unwrap().data.unwrap();
             let actual = result.results.first().map_or(Value::Null, |hit|json!({"score":hit.score as f64,"matches":hit.matches,"by_kind":hit.by_kind,"snippets":hit.snippets}));
             assert_eq!(
                 actual,
@@ -45,7 +56,7 @@ fn six_agent_reference_search_read_and_timeline_goldens() {
             ("log", ReadMode::Log),
         ] {
             let page = read(
-                &ctx,
+                ctx,
                 &session.key,
                 &ReadOptions {
                     mode,
@@ -63,7 +74,7 @@ fn six_agent_reference_search_read_and_timeline_goldens() {
             );
         }
         let result = timeline(
-            &ctx,
+            ctx,
             &TimelineOptions {
                 filter: selected,
                 since: ts("2026-08-10T00:00:00Z"),
@@ -105,7 +116,8 @@ fn partial_sources_preserve_results_and_status_across_all_apis() {
     let found = search(&ctx, &opt).unwrap();
     assert!(found.incomplete);
     assert_eq!(found.data.unwrap().count, 1);
-    assert_eq!(found.diagnostics.len(), 2);
+    assert_eq!(found.diagnostics.len(), 3);
+    assert_eq!(found.diagnostics[2].code, "search_coverage");
     let list = sessions(&ctx, &opt.filter).unwrap();
     assert!(list.incomplete);
     assert_eq!(list.data.unwrap().len(), 1);
@@ -307,9 +319,22 @@ fn thinking_blocks_keep_order_ids_kind_weights_and_read_visibility() {
         let mut opt = options("needle");
         opt.filter = filter(agent);
         let found = search(&ctx, &opt).unwrap().data.unwrap();
+        assert_eq!((found.results[0].score, found.results[0].matches), (4, 2));
+        opt.filter.kinds = BTreeSet::from([Kind::Meta]);
+        let meta = search(&ctx, &opt).unwrap();
+        assert!(!meta.incomplete);
+        assert_eq!(meta.diagnostics[0].code, "coverage_excluded");
+        assert_eq!(meta.data.unwrap().count, 0);
+        let full = Context {
+            index_dir: dir.path().join(format!("full-{agent}")),
+            coverage: Coverage::Full,
+            ..ctx.clone()
+        };
+        opt.filter.kinds = BTreeSet::new();
+        let found = search(&full, &opt).unwrap().data.unwrap();
         assert_eq!((found.results[0].score, found.results[0].matches), (8, 4));
         opt.filter.kinds = BTreeSet::from([Kind::Meta]);
-        let meta = search(&ctx, &opt).unwrap().data.unwrap();
+        let meta = search(&full, &opt).unwrap().data.unwrap();
         assert_eq!((meta.results[0].score, meta.results[0].matches), (4, 2));
         let page = |mode| {
             read(

@@ -1,3 +1,4 @@
+pub mod coverage;
 mod lock;
 mod refresh;
 mod schema;
@@ -6,7 +7,7 @@ mod store;
 pub use schema::{DATABASE, VERSION};
 pub use store::Document;
 
-use crate::{Agent, Context, Diagnostic, Envelope, IndexStats, Result};
+use crate::{Agent, Context, Coverage, Diagnostic, Envelope, IndexStats, Result};
 use rusqlite::Connection;
 use std::{
     collections::BTreeSet,
@@ -19,6 +20,8 @@ const REFRESH_WAIT: Duration = Duration::from_secs(3600);
 
 struct Writer {
     connection: Connection,
+    coverage: Coverage,
+    pending: Option<Coverage>,
     _lock: File,
 }
 
@@ -90,6 +93,11 @@ impl IndexSession {
         &self.namespace
     }
 
+    pub fn coverage(&self) -> Result<Coverage> {
+        Ok(schema::coverage(&self.connection)?
+            .map_or(self.context.coverage, |(coverage, _)| coverage))
+    }
+
     pub fn refresh_under_lease(
         &mut self,
         agents: &BTreeSet<Agent>,
@@ -108,17 +116,14 @@ impl IndexSession {
     ) -> Result<Envelope<IndexStats>> {
         let started = Instant::now();
         let s0 = self.seen_seq;
-        let Some(mut writer) = self.writer(wait, false)? else {
+        let writer = self.writer(wait, false)?;
+        let rebuilding = writer.as_ref().is_some_and(|w| w.pending.is_some());
+        let Some(mut writer) = writer.filter(|_| !rebuilding) else {
             self.reopen()?;
             self.pin()?;
             self.seen_seq = schema::refresh_seq(&self.connection)?;
             self.stale.extend(agents.iter().copied());
-            let busy = Diagnostic {
-                agent: None,
-                source: None,
-                code: "refresh_in_progress".into(),
-                message: "Another slimetrail process is refreshing the index; results come from the last published index".into(),
-            };
+            let busy = refresh_in_progress(rebuilding);
             return Ok(skipped(vec![busy], started));
         };
         let published = store::published(&writer.connection, &self.namespace, agents, s0)?;
@@ -141,9 +146,18 @@ impl IndexSession {
         let Some(lock) = lock::writer(&self.context.index_dir, wait, notice)? else {
             return Ok(None);
         };
-        let connection = schema::open(&self.context.index_dir, &self.namespace, &self.roots)?;
+        let connection = schema::open(
+            &self.context.index_dir,
+            &self.namespace,
+            &self.roots,
+            self.context.coverage,
+        )?;
+        let (coverage, pending) =
+            schema::coverage(&connection)?.unwrap_or((self.context.coverage, None));
         Ok(Some(Writer {
             connection,
+            coverage,
+            pending,
             _lock: lock,
         }))
     }
@@ -171,6 +185,20 @@ impl IndexSession {
         self.connection
             .query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))?;
         Ok(())
+    }
+}
+
+fn refresh_in_progress(rebuilding: bool) -> Diagnostic {
+    let message = if rebuilding {
+        "A search coverage rebuild is unfinished; search results may be missing matches until `slimetrail index` completes it"
+    } else {
+        "Another slimetrail process is refreshing the index; results come from the last published index"
+    };
+    Diagnostic {
+        agent: None,
+        source: None,
+        code: "refresh_in_progress".into(),
+        message: message.into(),
     }
 }
 
@@ -222,6 +250,7 @@ mod tests {
             cwd: dir.path().into(),
             now_ms: 0,
             time_zone: "UTC".into(),
+            coverage: Coverage::Compact,
         };
         fs::create_dir_all(ctx.roots.opencode_db.parent().unwrap()).unwrap();
         let db = Connection::open(&ctx.roots.opencode_db).unwrap();
@@ -276,6 +305,7 @@ mod tests {
             cwd: dir.path().into(),
             now_ms: 0,
             time_zone: "UTC".into(),
+            coverage: Coverage::Compact,
         };
         fs::create_dir_all(ctx.roots.opencode_db.parent().unwrap()).unwrap();
         let db = Connection::open(&ctx.roots.opencode_db).unwrap();

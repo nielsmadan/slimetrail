@@ -33,6 +33,7 @@ fn context(base: &Path) -> Context {
         cwd: base.into(),
         now_ms: 0,
         time_zone: "UTC".into(),
+        coverage: slimetrail::Coverage::Compact,
     }
 }
 
@@ -608,6 +609,7 @@ fn foreign_keys_reject_cross_namespace_and_cross_source_links() {
             "subtype",
             "tool_name",
             "automated",
+            "searchable",
             "text",
         ];
         let select = columns
@@ -1440,4 +1442,118 @@ fn partial_source_resumes_and_keeps_its_diagnostic() {
     assert_eq!(codes(&result), ["malformed_records"]);
     assert_eq!(counts(&result), (1, 1));
     assert_eq!(rowids(&ctx, &key), resumed);
+}
+
+fn fts_counts(ctx: &Context) -> (String, i64, i64) {
+    let db = Connection::open(ctx.index_dir.join(DATABASE)).unwrap();
+    db.query_row(
+        "SELECT (SELECT sql FROM sqlite_schema WHERE name='search_fts'),(SELECT count(*) FROM search_documents),(SELECT count(*) FROM search_fts)",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .unwrap()
+}
+
+fn tool_result_line(id: &str, text: &str) -> String {
+    json!({"type":"user","sessionId":id,"message":{"content":[{"type":"tool_result","content":text}]}}).to_string() + "\n"
+}
+
+#[test]
+fn contentless_fts_survives_cascaded_deletes_appends_and_coverage_flips() {
+    let dir = tempfile::tempdir().unwrap();
+    let compact = context(dir.path());
+    let full = Context {
+        coverage: Coverage::Full,
+        ..compact.clone()
+    };
+    let agents = selected(Agent::Claude);
+    let many = compact.roots.claude_projects.join("project/many.jsonl");
+    let lines: String = (0..10_050)
+        .map(|i| {
+            json!({"type":"assistant","sessionId":"many","message":{"content":[
+                {"type":"thinking","thinking":format!("thought {i}")},
+                {"type":"text","text":format!("said {i}")}
+            ]}})
+            .to_string()
+                + "\n"
+        })
+        .collect();
+    write(&many, &lines);
+    let tool = compact.roots.claude_projects.join("project/tool.jsonl");
+    let long = format!("early {} late", "y".repeat(4096));
+    write(&tool, &tool_result_line("tool", &long));
+    let doomed = claude(&compact, "doomed", "short lived");
+    index::refresh(&compact, &agents, false).unwrap();
+    let (sql, documents, rows) = fts_counts(&compact);
+    assert!(sql.contains("contentless_delete=1"), "{sql}");
+    assert_eq!((documents, rows), (10_052, 10_052));
+    IndexSession::open(&compact)
+        .unwrap()
+        .verify_integrity()
+        .unwrap();
+    fs::remove_file(&doomed).unwrap();
+    assert_eq!(
+        index::refresh(&compact, &agents, false)
+            .unwrap()
+            .data
+            .unwrap()
+            .removed,
+        1
+    );
+    let (_, documents, rows) = fts_counts(&compact);
+    assert_eq!((documents, rows), (10_051, 10_051));
+    IndexSession::open(&compact)
+        .unwrap()
+        .verify_integrity()
+        .unwrap();
+    let stats = index::refresh(&full, &agents, true).unwrap().data.unwrap();
+    assert_eq!(stats.reparsed, 0);
+    let (_, documents, rows) = fts_counts(&full);
+    assert_eq!((documents, rows), (20_101, 20_101));
+    let lease = IndexSession::open(&full).unwrap();
+    lease.verify_integrity().unwrap();
+    assert_eq!(lease.coverage().unwrap(), Coverage::Full);
+    drop(lease);
+    append(&tool, &tool_result_line("tool", &format!("again {long}")));
+    age(&tool);
+    let appended = index::refresh(&full, &agents, false).unwrap().data.unwrap();
+    assert_eq!(appended.reparsed, 1);
+    let mut lease = IndexSession::open(&full).unwrap();
+    lease.refresh_under_lease(&agents).unwrap();
+    let mut hits = Vec::new();
+    lease
+        .visit_documents(&key("tool"), Some(("early", false)), &mut |doc| {
+            hits.push((doc.entry_index, doc.text.len()));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(hits, [(Some(0), long.len()), (Some(1), long.len() + 6)]);
+    lease.verify_integrity().unwrap();
+    drop(lease);
+    index::refresh(&compact, &agents, true).unwrap();
+    let mut lease = IndexSession::open(&compact).unwrap();
+    lease.refresh_under_lease(&agents).unwrap();
+    let mut tails = Vec::new();
+    lease
+        .visit_documents(&key("tool"), None, &mut |doc| {
+            tails.push(doc.text.len());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(tails, [2048, 2048]);
+    lease.verify_integrity().unwrap();
+    drop(lease);
+    let db = Connection::open(compact.index_dir.join(DATABASE)).unwrap();
+    db.execute(
+        "DELETE FROM search_fts WHERE rowid=(SELECT max(document_id) FROM search_documents)",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    assert!(
+        IndexSession::open(&compact)
+            .unwrap()
+            .verify_integrity()
+            .is_err()
+    );
 }

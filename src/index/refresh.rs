@@ -96,6 +96,7 @@ fn ingest_once(
         },
         None => None,
     };
+    let coverage = writer.coverage;
     let transaction = writer.connection.savepoint()?;
     store::source(
         &transaction,
@@ -129,7 +130,7 @@ fn ingest_once(
             ));
         }
         expected_index += 1;
-        let result = store::entry(&transaction, &index.namespace, raw, &entry);
+        let result = store::entry(&transaction, &index.namespace, raw, &entry, coverage);
         write_failed |= result.is_err();
         result
     });
@@ -220,6 +221,21 @@ fn run_noting(
     let mut writer = index
         .writer(REFRESH_WAIT, notice)?
         .ok_or(Error::IndexBusy)?;
+    let target = index.context.coverage;
+    if !verify && writer.pending.is_some() {
+        let started = Instant::now();
+        drop(writer);
+        index.reopen()?;
+        return Ok(super::skipped(
+            vec![super::refresh_in_progress(true)],
+            started,
+        ));
+    }
+    if verify && (writer.coverage != target || writer.pending.is_some()) {
+        store::rebuild_documents(&mut writer.connection, target)?;
+        writer.coverage = target;
+        writer.pending = None;
+    }
     let result = write(index, &mut writer, agents, readers, verify)?;
     index.publish(writer, false)?;
     Ok(result)
@@ -564,6 +580,7 @@ mod tests {
             now_ms: 0,
             cwd: base.into(),
             time_zone: "UTC".into(),
+            coverage: crate::Coverage::Compact,
         }
     }
 
@@ -1090,6 +1107,23 @@ mod tests {
         assert_eq!(keys(&index), visible);
         assert_eq!(visible, ["claude:one", "claude:two"]);
         assert_eq!(run_row(&index), (generation, "incomplete".into()));
+    }
+
+    #[test]
+    fn unverified_refresh_during_a_pending_rebuild_writes_nothing_and_is_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let mut index = two_sessions(&ctx);
+        let (generation, _) = run_row(&index);
+        let db = rusqlite::Connection::open(ctx.index_dir.join(crate::index::DATABASE)).unwrap();
+        db.execute("UPDATE settings SET coverage_pending='full'", [])
+            .unwrap();
+        drop(db);
+        let agents = BTreeSet::from([Agent::Claude]);
+        let result = index.refresh_under_lease(&agents).unwrap();
+        assert!(result.incomplete);
+        assert_eq!(codes(&result), ["refresh_in_progress"]);
+        assert_eq!(run_row(&index).0, generation);
     }
 
     #[test]

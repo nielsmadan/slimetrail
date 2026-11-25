@@ -31,6 +31,7 @@ fn context(base: &Path) -> Context {
         now_ms: 0,
         cwd: "/fixture/project".into(),
         time_zone: "UTC".into(),
+        coverage: slimetrail::Coverage::Compact,
     }
 }
 fn root(ctx: &Context, agent: Agent) -> &Path {
@@ -744,4 +745,100 @@ fn torn_final_line_is_excluded_from_state_and_malformed_only_when_old() {
     );
     assert!(!parsed.recheck);
     assert_eq!(append_state(&parsed).malformed, 0);
+}
+
+#[test]
+fn readers_classify_tool_results_duplicates_and_mixed_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let message = |role: &str, content: Value| json!({"type":"message","message":{"role":role,"content":content}});
+    let cases = [
+        (
+            Agent::Claude,
+            vec![
+                json!({"type":"user","sessionId":"s","message":{"content":[{"type":"tool_result","content":"out"}]},"toolUseResult":" out\n"}),
+                json!({"type":"user","message":{"content":[{"type":"tool_result","content":"out"}]},"toolUseResult":"different"}),
+                json!({"type":"assistant","message":{"content":[{"type":"tool_use","name":"Shell","input":"ls"},{"type":"tool_result","content":"mixed"}]}}),
+                json!({"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hm"},{"type":"text","text":"hello"}]}}),
+            ],
+            vec![
+                (Kind::Tool, Searchable::ToolResult),
+                (Kind::Tool, Searchable::Duplicate),
+                (Kind::Tool, Searchable::ToolResult),
+                (Kind::Tool, Searchable::ToolResult),
+                (Kind::Tool, Searchable::Text),
+                (Kind::Meta, Searchable::Text),
+                (Kind::Message, Searchable::Text),
+            ],
+        ),
+        (
+            Agent::Codex,
+            vec![
+                json!({"type":"session_meta","payload":{"id":"s"}}),
+                json!({"type":"response_item","payload":{"type":"function_call","name":"exec","arguments":"ls"}}),
+                json!({"type":"response_item","payload":{"type":"function_call_output","output":"out"}}),
+                json!({"type":"response_item","payload":{"type":"custom_tool_call","name":"patch","input":"diff"}}),
+                json!({"type":"response_item","payload":{"type":"custom_tool_call_output","output":"done"}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":"hello"}}),
+            ],
+            vec![
+                (Kind::Tool, Searchable::Text),
+                (Kind::Tool, Searchable::ToolResult),
+                (Kind::Tool, Searchable::Text),
+                (Kind::Tool, Searchable::ToolResult),
+                (Kind::Message, Searchable::Text),
+            ],
+        ),
+        (
+            Agent::Pi,
+            vec![
+                json!({"type":"session","id":"s"}),
+                message("toolResult", json!([{"type":"text","text":"out"}])),
+                message(
+                    "assistant",
+                    json!([{"type":"toolCall","name":"read"},{"type":"text","text":"hello"}]),
+                ),
+            ],
+            vec![
+                (Kind::Tool, Searchable::ToolResult),
+                (Kind::Tool, Searchable::Text),
+                (Kind::Message, Searchable::Text),
+            ],
+        ),
+        (
+            Agent::Droid,
+            vec![
+                json!({"type":"session_start","id":"s"}),
+                message("tool", json!("out")),
+                message(
+                    "user",
+                    json!([{"type":"tool_use","name":"Shell","input":"ls"},{"type":"tool_result","content":"mixed"}]),
+                ),
+            ],
+            vec![
+                (Kind::Tool, Searchable::ToolResult),
+                (Kind::Tool, Searchable::Text),
+            ],
+        ),
+    ];
+    for (agent, records, expected) in cases {
+        write(
+            &root(&ctx, agent).join("project/s.jsonl"),
+            &records
+                .iter()
+                .map(|record| record.to_string() + "\n")
+                .collect::<String>(),
+        );
+        let source = source_for(&ctx, agent).unwrap();
+        let discovery = discover(source.as_ref(), &ctx);
+        let (_, entries) = parse(source.as_ref(), &discovery.sessions[0]);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.kind, e.searchable))
+                .collect::<Vec<_>>(),
+            expected,
+            "{agent}"
+        );
+    }
 }

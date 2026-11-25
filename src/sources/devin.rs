@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     Agent, Context, Discovery, DiscoveryCache, Entry, Fingerprint, Kind, ParsedSession, RawSession,
-    Result, Session, SessionKey, SourceState, Timestamp, TitleOrigin,
+    Result, Searchable, Session, SessionKey, SourceState, Timestamp, TitleOrigin,
 };
 use rusqlite::{Connection, Row, types::ValueRef};
 use serde_json::{Value, json};
@@ -699,6 +699,11 @@ impl Source for Devin {
                     subtype: item.subtype.map(Into::into),
                     tool_name: item.tool_name,
                     automated: item.automated || session.parent.is_some(),
+                    searchable: if item.subtype == Some("tool_result") {
+                        Searchable::ToolResult
+                    } else {
+                        Searchable::Text
+                    },
                     text: item.text,
                 })?;
                 index += 1;

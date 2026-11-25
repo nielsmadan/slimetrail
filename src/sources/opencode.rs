@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     Agent, Context, Discovery, DiscoveryCache, Entry, Kind, ParsedSession, RawSession, Result,
-    Session, SessionKey, TitleOrigin,
+    Searchable, Session, SessionKey, TitleOrigin,
 };
 use rusqlite::Connection;
 use serde_json::Value;
@@ -263,6 +263,7 @@ impl Source for Opencode {
                 automated: session.parent.is_some()
                     || message["automated"].as_bool().unwrap_or(false),
                 text,
+                searchable: Searchable::Text,
             };
             index += 1;
             emit(entry)?;

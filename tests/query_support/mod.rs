@@ -26,6 +26,7 @@ pub(crate) fn context(base: &Path) -> Context {
         cwd: "/fixture/project".into(),
         now_ms: ts("2026-11-16T12:00:00Z"),
         time_zone: "UTC".into(),
+        coverage: slimetrail::Coverage::Compact,
     }
 }
 pub(crate) fn ts(text: &str) -> i64 {

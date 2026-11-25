@@ -1,7 +1,10 @@
-use super::IndexSession;
+use super::{
+    IndexSession,
+    coverage::{coverage_name, parse_searchable, searchable_name, searchable_start},
+};
 use crate::{
-    Agent, CachedSource, Diagnostic, DiscoveryCache, Entry, Error, Kind, RawSession, Result,
-    Session, SessionKey, SourceState, TitleOrigin,
+    Agent, CachedSource, Coverage, Diagnostic, DiscoveryCache, Entry, Error, Kind, RawSession,
+    Result, Searchable, Session, SessionKey, SourceState, TitleOrigin,
 };
 use rusqlite::{Connection, Row, params};
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,7 +35,7 @@ fn document_sql(candidate: bool) -> String {
     };
     let eligible = " AND x.agent||':'||x.id IN (SELECT agent||':'||id FROM eligible)";
     format!(
-        "WITH eligible AS MATERIALIZED (SELECT json_extract(value,'$.agent') AS agent,json_extract(value,'$.id') AS id FROM json_each(?2)){candidates} SELECT x.agent,x.id,x.entry_index,x.kind,e.text,CASE WHEN x.entry_index IS NULL THEN t.metadata END,e.role FROM {documents} JOIN sessions t ON t.namespace=x.namespace AND t.agent=x.agent AND t.id=x.id AND t.source=x.source LEFT JOIN entries e ON e.namespace=x.namespace AND e.agent=x.agent AND e.id=x.id AND e.source=x.source AND e.entry_index=x.entry_index {VISIBLE}{eligible} AND (x.kind='title' OR ?5='[]' OR x.kind IN (SELECT value FROM json_each(?5))) ORDER BY x.agent,x.id,x.entry_index IS NOT NULL,x.document_id"
+        "WITH eligible AS MATERIALIZED (SELECT json_extract(value,'$.agent') AS agent,json_extract(value,'$.id') AS id FROM json_each(?2)){candidates} SELECT x.agent,x.id,x.entry_index,x.kind,e.text,CASE WHEN x.entry_index IS NULL THEN t.metadata END,e.role,x.text_start FROM {documents} JOIN sessions t ON t.namespace=x.namespace AND t.agent=x.agent AND t.id=x.id AND t.source=x.source LEFT JOIN entries e ON e.namespace=x.namespace AND e.agent=x.agent AND e.id=x.id AND e.source=x.source AND e.entry_index=x.entry_index {VISIBLE}{eligible} AND (x.kind='title' OR ?5='[]' OR x.kind IN (SELECT value FROM json_each(?5))) ORDER BY x.agent,x.id,x.entry_index IS NOT NULL,x.document_id"
     )
 }
 
@@ -170,11 +173,20 @@ pub(super) fn source(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct Owner<'a> {
+    namespace: &'a str,
+    agent: &'a str,
+    id: &'a str,
+    source: &'a str,
+}
+
 pub(super) fn entry(
     connection: &Connection,
     namespace: &str,
     raw: &RawSession,
     entry: &Entry,
+    coverage: Coverage,
 ) -> Result<()> {
     if entry.session != raw.key {
         return Err(Error::InvalidArgument(
@@ -183,28 +195,57 @@ pub(super) fn entry(
     }
     let index = i64::try_from(entry.index)
         .map_err(|_| Error::InvalidArgument("entry index exceeds SQLite range".into()))?;
-    connection.execute("INSERT INTO entries(namespace,agent,id,source,entry_index,source_id,timestamp,timestamp_raw,role,kind,subtype,tool_name,automated,text) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-        params![namespace,entry.session.agent.to_string(),entry.session.id,raw.source,index,entry.source_id,entry.timestamp,entry.timestamp_raw,entry.role,kind_name(entry.kind),entry.subtype,entry.tool_name,entry.automated,entry.text])?;
-    document(
-        connection,
+    let agent = entry.session.agent.to_string();
+    connection.prepare_cached("INSERT INTO entries(namespace,agent,id,source,entry_index,source_id,timestamp,timestamp_raw,role,kind,subtype,tool_name,automated,searchable,text) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)")?
+        .execute(params![namespace,agent,entry.session.id,raw.source,index,entry.source_id,entry.timestamp,entry.timestamp_raw,entry.role,kind_name(entry.kind),entry.subtype,entry.tool_name,entry.automated,searchable_name(entry.searchable),entry.text])?;
+    let owner = Owner {
         namespace,
-        raw,
-        Some(index),
-        kind_name(entry.kind),
+        agent: &agent,
+        id: &raw.key.id,
+        source: &raw.source,
+    };
+    entry_document(
+        connection,
+        owner,
+        index,
+        coverage,
+        (entry.kind, entry.subtype.as_deref(), entry.searchable),
         &entry.text,
     )
 }
 
+fn entry_document(
+    connection: &Connection,
+    owner: Owner<'_>,
+    index: i64,
+    coverage: Coverage,
+    (kind, subtype, searchable): (Kind, Option<&str>, Searchable),
+    text: &str,
+) -> Result<()> {
+    searchable_start(coverage, kind, subtype, searchable, text).map_or(Ok(()), |start| {
+        document(connection, owner, Some(index), kind_name(kind), text, start)
+    })
+}
+
 fn document(
     connection: &Connection,
-    namespace: &str,
-    raw: &RawSession,
+    owner: Owner<'_>,
     index: Option<i64>,
     kind: &str,
     text: &str,
+    start: usize,
 ) -> Result<()> {
-    connection.execute("INSERT INTO search_documents(namespace,agent,id,source,entry_index,kind,ascii_lower,has_non_ascii,has_nul) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-        params![namespace,raw.key.agent.to_string(),raw.key.id,raw.source,index,kind,text.to_ascii_lowercase(),!text.is_ascii(),text.contains('\0')])?;
+    let slice = &text[start..];
+    let text_start = i64::try_from(start)
+        .map_err(|_| Error::InvalidArgument("document offset exceeds SQLite range".into()))?;
+    connection.prepare_cached("INSERT INTO search_documents(namespace,agent,id,source,entry_index,kind,text_start,has_non_ascii,has_nul) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)")?
+        .execute(params![owner.namespace,owner.agent,owner.id,owner.source,index,kind,text_start,!slice.is_ascii(),slice.contains('\0')])?;
+    connection
+        .prepare_cached("INSERT INTO search_fts(rowid,ascii_lower) VALUES(?1,?2)")?
+        .execute(params![
+            connection.last_insert_rowid(),
+            slice.to_ascii_lowercase()
+        ])?;
     Ok(())
 }
 
@@ -285,12 +326,132 @@ fn title(
     raw: &RawSession,
     session: &Session,
 ) -> Result<()> {
+    let agent = raw.key.agent.to_string();
+    title_document(
+        connection,
+        Owner {
+            namespace,
+            agent: &agent,
+            id: &raw.key.id,
+            source: &raw.source,
+        },
+        session,
+    )
+}
+
+fn title_document(connection: &Connection, owner: Owner<'_>, session: &Session) -> Result<()> {
     if session.title_origin == Some(TitleOrigin::Native)
         && let Some(title) = &session.title
     {
-        document(connection, namespace, raw, None, "title", title)?;
+        document(connection, owner, None, "title", title, 0)?;
     }
     Ok(())
+}
+
+const REBUILD_ROWS: usize = 10_000;
+const REBUILD_BYTES: usize = 64 << 20;
+
+fn batched(
+    connection: &mut Connection,
+    sql: &str,
+    write: &mut dyn FnMut(&Connection, &Row<'_>) -> Result<usize>,
+) -> Result<()> {
+    let mut after = i64::MIN;
+    loop {
+        let transaction = connection.transaction()?;
+        let mut more = false;
+        {
+            let mut statement = transaction.prepare_cached(sql)?;
+            let mut rows = statement.query([after])?;
+            let (mut count, mut bytes) = (0, 0);
+            while let Some(row) = rows.next()? {
+                after = row.get(0)?;
+                bytes += write(&transaction, row)?;
+                count += 1;
+                if count >= REBUILD_ROWS || bytes >= REBUILD_BYTES {
+                    more = true;
+                    break;
+                }
+            }
+        }
+        transaction.commit()?;
+        if !more {
+            return Ok(());
+        }
+    }
+}
+
+pub(super) fn rebuild_documents(connection: &mut Connection, target: Coverage) -> Result<()> {
+    connection.execute(
+        "UPDATE settings SET coverage_pending=?1 WHERE id=1",
+        [coverage_name(target)],
+    )?;
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "INSERT INTO search_fts(search_fts) VALUES('delete-all')",
+        [],
+    )?;
+    transaction.execute("DELETE FROM search_documents", [])?;
+    transaction.commit()?;
+    batched(
+        connection,
+        "SELECT rowid,namespace,agent,id,source,entry_index,kind,subtype,searchable,text FROM entries WHERE rowid>?1 ORDER BY rowid",
+        &mut |connection, row| {
+            let (agent, id, source): (String, String, String) =
+                (row.get(2)?, row.get(3)?, row.get(4)?);
+            let namespace: String = row.get(1)?;
+            let kind = parse_kind(row.get(6)?)?;
+            let subtype: Option<String> = row.get(7)?;
+            let searchable = parse_searchable(&row.get::<_, String>(8)?)?;
+            let text: String = row.get(9)?;
+            entry_document(
+                connection,
+                Owner {
+                    namespace: &namespace,
+                    agent: &agent,
+                    id: &id,
+                    source: &source,
+                },
+                row.get(5)?,
+                target,
+                (kind, subtype.as_deref(), searchable),
+                &text,
+            )?;
+            Ok(text.len())
+        },
+    )?;
+    batched(
+        connection,
+        "SELECT rowid,namespace,agent,id,source,metadata FROM sessions WHERE rowid>?1 ORDER BY rowid",
+        &mut |connection, row| {
+            let (namespace, agent, id, source): (String, String, String, String) =
+                (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?);
+            let metadata: String = row.get(5)?;
+            title_document(
+                connection,
+                Owner {
+                    namespace: &namespace,
+                    agent: &agent,
+                    id: &id,
+                    source: &source,
+                },
+                &decode(&metadata)?,
+            )?;
+            Ok(metadata.len())
+        },
+    )?;
+    connection.execute(
+        "UPDATE settings SET coverage=?1,coverage_pending=NULL WHERE id=1",
+        [coverage_name(target)],
+    )?;
+    let mut statement = connection.prepare("PRAGMA incremental_vacuum")?;
+    let mut rows = statement.query([])?;
+    while rows.next()?.is_some() {}
+    Ok(())
+}
+
+fn parse_kind(kind: String) -> Result<Kind> {
+    Ok(serde_json::from_value(serde_json::Value::String(kind))?)
 }
 
 const VISIBLE: &str = "JOIN sources s ON s.namespace=x.namespace AND s.agent=x.agent AND s.source=x.source JOIN refresh_runs r ON r.namespace=s.namespace AND r.agent=s.agent WHERE x.namespace=?1 AND s.status IN ('fresh','partial') AND s.generation>=COALESCE(r.published,0)";
@@ -344,7 +505,7 @@ impl IndexSession {
     ) -> Result<()> {
         self.ready(key.agent)?;
         let sql = format!(
-            "SELECT x.entry_index,x.source_id,x.timestamp,x.timestamp_raw,x.role,x.kind,x.subtype,x.tool_name,x.automated,x.text FROM entries x {VISIBLE} AND x.agent=?2 AND x.id=?3 ORDER BY x.entry_index"
+            "SELECT x.entry_index,x.source_id,x.timestamp,x.timestamp_raw,x.role,x.kind,x.subtype,x.tool_name,x.automated,x.text,x.searchable FROM entries x {VISIBLE} AND x.agent=?2 AND x.id=?3 ORDER BY x.entry_index"
         );
         let mut statement = self.connection.prepare(&sql)?;
         let mut rows = statement.query((&self.namespace, key.agent.to_string(), &key.id))?;
@@ -449,13 +610,20 @@ impl IndexSession {
                 continue;
             }
             let entry_index: Option<u64> = row.get(2)?;
-            let text = if entry_index.is_some() {
+            let mut text: String = if entry_index.is_some() {
                 row.get(4)?
             } else {
                 decode::<Session>(&row.get::<_, String>(5)?)?
                     .title
                     .unwrap_or_default()
             };
+            let start: usize = row.get(7)?;
+            if !text.is_char_boundary(start) {
+                return Err(Error::InvalidArgument(
+                    "search document offset is not a character boundary".into(),
+                ));
+            }
+            text.drain(..start);
             emit(Document {
                 role: row.get(6)?,
                 session: SessionKey {
@@ -473,25 +641,64 @@ impl IndexSession {
     pub fn verify_integrity(&self) -> Result<()> {
         let _lock = super::lock::writer(&self.context.index_dir, super::REFRESH_WAIT, false)?
             .ok_or(Error::IndexBusy)?;
-        let connection =
-            super::schema::open(&self.context.index_dir, &self.namespace, &self.roots)?;
+        let connection = super::schema::open(
+            &self.context.index_dir,
+            &self.namespace,
+            &self.roots,
+            self.context.coverage,
+        )?;
+        let failed = || Error::InvalidArgument("index integrity check failed".into());
         let integrity: String = connection.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
         if integrity != "ok" || connection.prepare("PRAGMA foreign_key_check")?.exists([])? {
-            return Err(Error::InvalidArgument(
-                "index integrity check failed".into(),
-            ));
+            return Err(failed());
         }
         connection.execute(
             "INSERT INTO search_fts(search_fts,rank) VALUES('integrity-check',1)",
             [],
         )?;
+        let counts: (i64, i64) = connection.query_row(
+            "SELECT (SELECT count(*) FROM search_documents),(SELECT count(*) FROM search_fts)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if counts.0 != counts.1 {
+            return Err(failed());
+        }
+        let mut sample = connection.prepare("SELECT x.document_id,x.text_start,x.has_non_ascii,x.has_nul,CASE WHEN x.entry_index IS NULL THEN t.metadata ELSE e.text END,x.entry_index IS NULL FROM search_documents x JOIN sessions t ON t.namespace=x.namespace AND t.agent=x.agent AND t.id=x.id AND t.source=x.source LEFT JOIN entries e ON e.namespace=x.namespace AND e.agent=x.agent AND e.id=x.id AND e.source=x.source AND e.entry_index=x.entry_index ORDER BY random() LIMIT 100")?;
+        let mut matched = connection
+            .prepare("SELECT count(*) FROM search_fts WHERE search_fts MATCH ?1 AND rowid=?2")?;
+        let mut rows = sample.query([])?;
+        while let Some(row) = rows.next()? {
+            let document: i64 = row.get(0)?;
+            let start: usize = row.get(1)?;
+            let stored: String = row.get(4)?;
+            let text = if row.get(5)? {
+                decode::<Session>(&stored)?.title.unwrap_or_default()
+            } else {
+                stored
+            };
+            let slice = text.get(start..).ok_or_else(failed)?;
+            if row.get::<_, bool>(2)? == slice.is_ascii()
+                || row.get::<_, bool>(3)? != slice.contains('\0')
+            {
+                return Err(failed());
+            }
+            let trigram: String = slice.to_ascii_lowercase().chars().take(3).collect();
+            if trigram.chars().count() < 3 || trigram.contains('\0') {
+                continue;
+            }
+            let phrase = format!("\"{}\"", trigram.replace('"', "\"\""));
+            let found: i64 = matched.query_row(params![phrase, document], |r| r.get(0))?;
+            if found != 1 {
+                return Err(failed());
+            }
+        }
         Ok(())
     }
 }
 
 fn read_entry(row: &Row<'_>, key: &SessionKey) -> Result<Entry> {
-    let kind: String = row.get(5)?;
-    let kind: Kind = serde_json::from_value(serde_json::Value::String(kind))?;
+    let kind = parse_kind(row.get(5)?)?;
     Ok(Entry {
         session: key.clone(),
         index: row.get(0)?,
@@ -504,6 +711,7 @@ fn read_entry(row: &Row<'_>, key: &SessionKey) -> Result<Entry> {
         tool_name: row.get(7)?,
         automated: row.get(8)?,
         text: row.get(9)?,
+        searchable: parse_searchable(&row.get::<_, String>(10)?)?,
     })
 }
 
@@ -537,6 +745,7 @@ mod tests {
             cwd: dir.path().into(),
             now_ms: 0,
             time_zone: "UTC".into(),
+            coverage: crate::Coverage::Compact,
         };
         fs::create_dir_all(&ctx.roots.claude_projects).unwrap();
         for id in ids {

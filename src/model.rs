@@ -29,6 +29,21 @@ pub enum Kind {
     Tool,
     Meta,
 }
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Coverage {
+    #[default]
+    Compact,
+    Full,
+}
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Searchable {
+    #[default]
+    Text,
+    ToolResult,
+    Duplicate,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Roots {
     pub claude_projects: PathBuf,
@@ -51,6 +66,8 @@ pub struct Context {
     pub now_ms: Timestamp,
     pub cwd: PathBuf,
     pub time_zone: String,
+    #[serde(default)]
+    pub coverage: Coverage,
 }
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -85,6 +102,7 @@ pub struct Entry {
     pub tool_name: Option<String>,
     pub automated: bool,
     pub text: String,
+    pub searchable: Searchable,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diagnostic {

@@ -34,6 +34,7 @@ fn context(base: &Path) -> Context {
         now_ms: 0,
         cwd: "/fixture/project".into(),
         time_zone: "UTC".into(),
+        coverage: slimetrail::Coverage::Compact,
     }
 }
 
@@ -198,6 +199,7 @@ fn checked_in_reference_goldens_cover_cursor_and_opencode() {
         assert_eq!(parsed.session.cwd, Some("/fixture/project".into()));
         assert_eq!(parsed.session.title_origin, Some(TitleOrigin::Native));
         assert!(entries.iter().all(|e| e.session == parsed.session.key));
+        assert!(entries.iter().all(|e| e.searchable == Searchable::Text));
         let actual: Vec<_> = entries
             .iter()
             .map(|e| json!({"role":e.role,"kind":e.kind,"text":e.text,"timestamp":e.timestamp}))
@@ -657,4 +659,37 @@ fn opencode_enumerates_sessions_missing_from_partial_cache() {
         std::collections::BTreeSet::from(["main", "other"])
     );
     assert!(found.complete_agents.contains(&Agent::Opencode));
+}
+
+#[test]
+fn cursor_entries_of_only_tool_results_are_tool_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    let (transcript, _) = cursor(&ctx, "tools");
+    let records = [
+        json!({"role":"assistant","message":{"content":[{"type":"tool-call","name":"Shell","input":{"command":"ls"}}]}}),
+        json!({"role":"tool","message":{"content":[{"type":"tool-result","result":"one"},{"type":"toolResult","output":"two"},{"type":"tool_result","content":"three"}]}}),
+        json!({"role":"assistant","message":{"content":[{"type":"tool_use","name":"Shell","input":"ls"},{"type":"tool_result","content":"mixed"}]}}),
+    ];
+    write(
+        &transcript,
+        &records
+            .iter()
+            .map(|r| r.to_string() + "\n")
+            .collect::<String>(),
+    );
+    let source = source_for(&ctx, Agent::Cursor).unwrap();
+    let discovery = discover(source.as_ref(), &ctx);
+    let (_, entries) = parse(source.as_ref(), &discovery.sessions[0]);
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| (e.kind, e.searchable))
+            .collect::<Vec<_>>(),
+        [
+            (Kind::Tool, Searchable::Text),
+            (Kind::Tool, Searchable::ToolResult),
+            (Kind::Tool, Searchable::Text),
+        ]
+    );
 }

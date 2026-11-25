@@ -11,11 +11,17 @@ timeout 900 just build
 timeout 900 python3 scripts/benchmark.py
 ```
 
-The default generator creates 50 sessions per agent and 200 message entries per session, across six supported formats, in an owned temporary directory below `.local/`. Every tenth message contains `needle`, the next contains `café`, and the rest contain ASCII filler. Cursor has companion JSON metadata; OpenCode uses a synthetic SQLite DB. Native titles exist for Cursor/Droid/OpenCode/Pi. This measures representative format plumbing and text volume, not a realistic distribution of tools or message lengths.
+The default generator creates 50 sessions per agent and 200 message entries per session, across seven supported formats (Claude, Codex, Cursor, Devin, Droid, OpenCode, Pi), in an owned temporary directory below `.local/`. Every tenth message contains `needle`, the next contains `café`, and the rest contain ASCII filler. Besides messages, each session carries reasoning blocks, tool calls and tool results in the agent's own record shape; tool-result lengths follow a seeded, deterministic mix (60% under 1 KB, 30% 1–16 KB, 10% 16–256 KB). Cursor has companion JSON metadata; OpenCode uses a synthetic SQLite DB; Devin uses a synthetic `cli/sessions.db` (WAL) with `sessions`, `message_nodes` and `subagent_heads`. Native titles exist for Cursor/Droid/OpenCode/Pi. This measures representative format plumbing and text volume, not a realistic distribution of tools or message lengths.
 
 The driver records one cold index, one index warmup, five warm indexes, five OpenCode-only and Claude-only inventories, then a warmup and five measurements each for `needle`, `ed`, `café`, and regex `needle|café`. Queries use `--scope all --max-snippets 0 --format json --time-zone UTC`. It appends one message to one synthetic Claude transcript and records a final incremental refresh. `--sessions`, `--entries` and `--repeat` adjust workload/repetitions; preserve them for comparisons.
 
 `just bench` runs this synthetic procedure and validates complete coverage, warm reuse, exactly one changed-source reparse and cleanup. Scheduled CI retains its aggregate output as an artifact without a timing threshold.
+
+`--coverage compact|full` (default `compact`) writes `coverage = "…"` to a config file in the owned workspace and points `SLIMETRAIL_CONFIG` at it, so a real user config is never read or modified. `--per-agent` additionally runs, after the standard measurements, one cold `slimetrail index --<agent>` per selected agent into a fresh index and emits one record per agent: `source_files`, `source_bytes`, `sessions`, `entries`, `cold_ms`, `index_bytes`, exit status, diagnostic counts and refresh counters. `index_bytes` is the DB plus WAL size after `PRAGMA wal_checkpoint(TRUNCATE)`; that checkpoint opens only the owned benchmark index, never an agent store. `cold_ms` is OS-cache-warm: the per-agent pass runs after the standard measurements, which have already read the source files, so it understates cold disk I/O (notably for `--real`). Each per-agent index is removed right after its record is emitted. `scripts/check_benchmark.py` validates these records (complete, exit 0, positive sizes, coverage matching the run).
+
+```sh
+timeout 900 python3 scripts/benchmark.py --per-agent --coverage full
+```
 
 Real sources require explicit opt-in:
 
@@ -27,7 +33,7 @@ This captures the existing environment's root overrides and selects all six agen
 
 ## Privacy, capacity and outputs
 
-The index always lives under an owned 0700 `.local/benchmark-*` workspace, never the default XDG location. Metadata preflight reports only per-agent file counts, byte counts and missing/unreadable counts, then requires free space of at least 12 × discovered source bytes plus a 2 GiB reserve. This is a conservative heuristic, not a maximum expansion guarantee. Runtime checks the free-space reserve every half second. Originals are read only by the app's source/snapshot code; benchmark SQLite connections touch only generated synthetic databases or the owned index for aggregate counts.
+The index always lives under an owned 0700 `.local/benchmark-*` workspace, never the default XDG location. Metadata preflight reports only per-agent file counts, byte counts and missing/unreadable counts, then requires free space of at least `--capacity-factor` (default 12) × discovered source bytes plus a 2 GiB reserve. This is a conservative heuristic, not a maximum expansion guarantee. Runtime checks the free-space reserve every half second. Originals are read only by the app's source/snapshot code; benchmark SQLite connections touch only generated synthetic databases or the owned index for aggregate counts.
 
 The JSON-lines output includes build hash, platform, dimensions, individual durations, medians, exit statuses, refresh counters, whitelisted diagnostic-code counts and cleanup proof. Search stdout is discarded; index stdout is parsed only to retain numeric counters. Stderr messages, paths, session IDs, titles, entry text and snippets are not emitted or stored. Unknown diagnostic codes are counted as `other`. Do not replace these safeguards with raw CLI logging on real stores.
 
@@ -41,6 +47,8 @@ Record hardware/toolchain, binary hash, actual arguments, workload dimensions, s
 
 ## Recorded runs
 
+- [2026-11-24 real per-agent cold builds](runs/2026-11-24-per-agent-real.md): index v3, each store indexed separately under compact and full coverage; source of the first-build estimate defaults.
+- [2026-11-24 synthetic per-agent measurements](runs/2026-11-24-per-agent-synthetic.md): the extended generator (reasoning, tool calls/results, Devin) under both coverages.
 - [2026-11-16 final-build synthetic measurements](runs/2026-11-16-final-synthetic.md): latest default-workload comparison baseline after the final fallback-query fix; five warm samples and verified cleanup.
 - [2026-11-16 final-build real all-agent attempt](runs/2026-11-16-final-real-all.md): current binary's cold build timed out at 900 seconds; no completed full-corpus warm/query evidence.
 - [2026-11-16 final-build real Pi/OpenCode subset](runs/2026-11-16-final-real-subset.md): current binary's complete subset measurements, separate from all-agent coverage.

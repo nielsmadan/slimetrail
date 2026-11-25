@@ -25,6 +25,7 @@ fn context(base: &Path) -> Context {
         now_ms: 0,
         cwd: "/fixture/project".into(),
         time_zone: "UTC".into(),
+        coverage: slimetrail::Coverage::Compact,
     }
 }
 
@@ -260,6 +261,19 @@ fn devin_reads_live_chain_and_restores_compacted_history() {
     );
     assert_eq!(parsed.session.started_at, Some(1_786_356_000_000));
     assert_eq!(parsed.session.source_updated_at, Some(1_786_356_300_000));
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|e| e.searchable == Searchable::ToolResult)
+            .map(|e| e.subtype.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("tool_result")]
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|e| matches!(e.searchable, Searchable::Text | Searchable::ToolResult))
+    );
     assert_eq!(
         shape(&entries),
         [
