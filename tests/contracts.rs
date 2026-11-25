@@ -211,3 +211,9 @@ fn agent_home_overrides_supply_default_subdirectories() {
         home.join(".local/share/opencode/opencode.db")
     );
 }
+
+#[test]
+fn query_analysis_shares_the_matchers_regex_syntax() {
+    let lock = include_str!("../Cargo.lock");
+    assert_eq!(lock.matches("\nname = \"regex-syntax\"\n").count(), 1);
+}

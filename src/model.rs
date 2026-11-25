@@ -276,14 +276,20 @@ pub enum Sort {
     Score,
     Recent,
 }
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CaseMode {
+    Smart,
+    Sensitive,
+    Insensitive,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchOptions {
     pub filter: Filter,
     pub query: String,
     pub regex: bool,
-    pub case_sensitive: bool,
-    #[serde(default)]
-    pub word: bool,
+    pub case_mode: CaseMode,
+    pub whole_word: bool,
     pub sort: Sort,
     pub max_results: usize,
     pub max_snippets: usize,

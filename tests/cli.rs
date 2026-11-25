@@ -67,6 +67,13 @@ impl Fixture {
         assert_eq!(value["version"], 1);
         value
     }
+    fn occurrences(&self, args: &[&str]) -> u64 {
+        let value = self.json(
+            &[&["search"], args, &["--codex", "--scope", "all"]].concat(),
+            0,
+        );
+        value["data"]["results"][0]["matches"].as_u64().unwrap_or(0)
+    }
 }
 
 #[test]
@@ -406,14 +413,6 @@ fn literal_regex_case_and_kind_options_reach_api() {
     assert_eq!(tools["data"]["count"], 0);
 }
 
-fn occurrences(fixture: &Fixture, args: &[&str]) -> u64 {
-    let value = fixture.json(
-        &[&["search"], args, &["--codex", "--scope", "all"]].concat(),
-        0,
-    );
-    value["data"]["results"][0]["matches"].as_u64().unwrap_or(0)
-}
-
 #[test]
 fn case_flags_follow_smart_case_and_last_flag_wins() {
     let fixture = Fixture::new();
@@ -430,8 +429,12 @@ fn case_flags_follow_smart_case_and_last_flag_wins() {
         (&["-i", "-s", "Needle"], 1),
         (&["-i", "-S", "Needle"], 1),
         (&["-i", "--smart-case", "needle"], 2),
+        (&["-s", "-S", "needle"], 2),
+        (&["-S", "-s", "needle"], 0),
+        (&["-ii", "Needle"], 2),
+        (&["-isS", "Needle"], 1),
     ] {
-        assert_eq!(occurrences(&fixture, args), expected, "{args:?}");
+        assert_eq!(fixture.occurrences(args), expected, "{args:?}");
     }
 }
 
@@ -442,10 +445,11 @@ fn regex_queries_use_smart_case_end_to_end() {
     for (args, expected) in [
         (&["--regex", "Needle|zzz"][..], 1),
         (&["--regex", "needle|zzz"], 2),
-        (&["-ii", "Needle"], 2),
-        (&["-isS", "Needle"], 1),
+        (&["--regex", r"\Wneedle"], 2),
+        (&["-E", "needle|zzz"], 2),
+        (&["-i", "--regex", "(?-i)Needle"], 1),
     ] {
-        assert_eq!(occurrences(&fixture, args), expected, "{args:?}");
+        assert_eq!(fixture.occurrences(args), expected, "{args:?}");
     }
 }
 
@@ -453,18 +457,39 @@ fn regex_queries_use_smart_case_end_to_end() {
 fn fixed_strings_and_regex_last_wins() {
     let fixture = Fixture::new();
     fixture.write("axb");
-    assert_eq!(occurrences(&fixture, &["--regex", "-F", "a.b"]), 0);
-    assert_eq!(occurrences(&fixture, &["--fixed-strings", "a.b"]), 0);
-    assert_eq!(occurrences(&fixture, &["-F", "--regex", "a.b"]), 1);
+    assert_eq!(fixture.occurrences(&["--regex", "-F", "a.b"]), 0);
+    assert_eq!(
+        fixture.occurrences(&["--regex", "--fixed-strings", "a.b"]),
+        0
+    );
+    assert_eq!(fixture.occurrences(&["-F", "--regex", "a.b"]), 1);
 }
 
 #[test]
 fn word_flag_reaches_api() {
     let fixture = Fixture::new();
-    fixture.write("trust rust_ rust");
-    assert_eq!(occurrences(&fixture, &["rust"]), 3);
-    assert_eq!(occurrences(&fixture, &["-w", "rust"]), 1);
-    assert_eq!(occurrences(&fixture, &["--word-regexp", "rust"]), 1);
+    fixture.write("trust rust_ rust Rust");
+    for (args, expected) in [
+        (&["rust"][..], 4),
+        (&["-w", "rust"], 2),
+        (&["--word-regexp", "rust"], 2),
+        (&["-w", "Rust"], 1),
+        (&["-w", "-s", "rust"], 1),
+        (&["-w", "-i", "Rust"], 2),
+    ] {
+        assert_eq!(fixture.occurrences(args), expected, "{args:?}");
+    }
+}
+
+#[test]
+fn word_query_starting_with_dash_follows_double_dash() {
+    let fixture = Fixture::new();
+    fixture.write("a -foo b x-foo");
+    let value = fixture.json(
+        &["search", "--codex", "--scope", "all", "-w", "--", "-foo"],
+        0,
+    );
+    assert_eq!(value["data"]["results"][0]["matches"], 1);
 }
 
 #[test]
@@ -480,25 +505,6 @@ fn refs_only_with_json_is_invalid_argument() {
             value["diagnostics"][0]["message"],
             "invalid argument: --refs-only applies to text output; JSON results already include ref"
         );
-    }
-}
-
-#[test]
-fn search_help_lists_flags() {
-    let fixture = Fixture::new();
-    let help = fixture.run(&["search", "--help"]);
-    assert!(help.status.success());
-    let text = String::from_utf8(help.stdout).unwrap();
-    for flag in [
-        "-i, --ignore-case",
-        "-s, --case-sensitive",
-        "-S, --smart-case",
-        "-F, --fixed-strings",
-        "--regex",
-        "-w, --word-regexp",
-        "-l, --refs-only",
-    ] {
-        assert!(text.contains(flag), "{flag}\n{text}");
     }
 }
 

@@ -3,11 +3,10 @@ use clap::{
     builder::{PossibleValuesParser, TypedValueParser},
 };
 use jiff::{Timestamp, civil, tz::TimeZone};
-use regex_syntax::ast;
 use serde::Serialize;
 use slimetrail::{
-    Admission, Agent, BuildPolicy, Context, Coverage, Diagnostic, Entry, Envelope, Error, Filter,
-    JobEstimate, Kind, Observer, ReadMode, ReadOptions, RefreshOptions, Result, Scope,
+    Admission, Agent, BuildPolicy, CaseMode, Context, Coverage, Diagnostic, Entry, Envelope, Error,
+    Filter, JobEstimate, Kind, Observer, ReadMode, ReadOptions, RefreshOptions, Result, Scope,
     SearchOptions, Session, SessionKey, Sort, TimelineOptions, config,
     dto::{EntryDto, ReadDataDto, SearchDataDto, SessionDto, SessionsDataDto, TimelineDataDto},
     entries, read, refresh, resolve_roots, search, sessions, timeline,
@@ -93,66 +92,97 @@ struct Common {
     current: bool,
 }
 
+const CASE_FLAGS: [&str; 3] = ["ignore_case", "case_sensitive", "smart_case"];
+const SYNTAX_FLAGS: [&str; 2] = ["fixed_strings", "regex"];
+
+#[derive(Args)]
+struct SearchArgs {
+    query: String,
+    #[command(flatten)]
+    case: CaseArgs,
+    #[command(flatten)]
+    syntax: SyntaxArgs,
+    #[arg(
+        short = 'w',
+        long,
+        help = "Only count matches bounded by non-word characters"
+    )]
+    word_regexp: bool,
+    #[arg(
+        short = 'l',
+        long,
+        help = "Print only the ref of each returned session, capped by --max-results (text output)"
+    )]
+    refs_only: bool,
+    #[arg(long, default_value = "score", value_parser = ["score", "recent"])]
+    sort: String,
+    #[arg(long, default_value_t = 50)]
+    max_results: usize,
+    #[arg(long, default_value_t = 3)]
+    max_snippets: usize,
+    #[arg(long, default_value_t = 160)]
+    context: usize,
+}
+
+#[derive(Args)]
+struct CaseArgs {
+    #[arg(
+        short = 'i',
+        long,
+        overrides_with_all = CASE_FLAGS,
+        help = "Match case-insensitively"
+    )]
+    ignore_case: bool,
+    #[arg(
+        short = 's',
+        long,
+        overrides_with_all = CASE_FLAGS,
+        help = "Match case-sensitively"
+    )]
+    case_sensitive: bool,
+    #[arg(
+        short = 'S',
+        long,
+        overrides_with_all = CASE_FLAGS,
+        help = "Match case-sensitively only if the query has an uppercase letter (default)"
+    )]
+    smart_case: bool,
+}
+
+impl CaseArgs {
+    const fn mode(&self) -> CaseMode {
+        if self.ignore_case {
+            CaseMode::Insensitive
+        } else if self.case_sensitive {
+            CaseMode::Sensitive
+        } else {
+            CaseMode::Smart
+        }
+    }
+}
+
+#[derive(Args)]
+struct SyntaxArgs {
+    #[arg(
+        short = 'F',
+        long,
+        overrides_with_all = SYNTAX_FLAGS,
+        help = "Treat the query as a literal string (default)"
+    )]
+    fixed_strings: bool,
+    #[arg(
+        short = 'E',
+        long,
+        overrides_with_all = SYNTAX_FLAGS,
+        help = "Treat the query as a regular expression"
+    )]
+    regex: bool,
+}
+
 #[derive(Subcommand)]
 enum Command {
     #[command(about = "Search session titles and entries")]
-    Search {
-        query: String,
-        #[arg(
-            short = 'i',
-            long,
-            overrides_with_all = ["ignore_case", "case_sensitive", "smart_case"],
-            help = "Match case-insensitively"
-        )]
-        ignore_case: bool,
-        #[arg(
-            short = 's',
-            long,
-            overrides_with_all = ["ignore_case", "case_sensitive", "smart_case"],
-            help = "Match case-sensitively"
-        )]
-        case_sensitive: bool,
-        #[arg(
-            short = 'S',
-            long,
-            overrides_with_all = ["ignore_case", "case_sensitive", "smart_case"],
-            help = "Match case-sensitively only if the query has an uppercase letter (default)"
-        )]
-        smart_case: bool,
-        #[arg(
-            short = 'F',
-            long,
-            overrides_with_all = ["fixed_strings", "regex"],
-            help = "Treat the query as a literal string (default)"
-        )]
-        fixed_strings: bool,
-        #[arg(
-            long,
-            overrides_with_all = ["fixed_strings", "regex"],
-            help = "Treat the query as a regular expression"
-        )]
-        regex: bool,
-        #[arg(
-            short = 'w',
-            long,
-            help = "Only count matches bounded by non-word characters"
-        )]
-        word_regexp: bool,
-        #[arg(
-            short = 'l',
-            long,
-            help = "Print only the ref of each returned session (text output)"
-        )]
-        refs_only: bool,
-        #[arg(long, default_value = "score", value_parser = ["score", "recent"])]
-        sort: String,
-        #[arg(long, default_value_t = 50)]
-        max_results: usize,
-        #[arg(long, default_value_t = 3)]
-        max_snippets: usize,
-        #[arg(long, default_value_t = 160)]
-        context: usize,
-    },
+    Search(SearchArgs),
     #[command(about = "Read a session transcript")]
     Read {
         session: SessionKey,
@@ -279,62 +309,8 @@ fn execute(
     };
     let filter = filter(&cli.common, env, &home, &cwd)?;
     match &cli.command {
-        Command::Search {
-            query,
-            ignore_case,
-            case_sensitive,
-            smart_case: _,
-            fixed_strings: _,
-            regex,
-            word_regexp,
-            refs_only,
-            sort,
-            max_results,
-            max_snippets,
-            context,
-        } => {
-            if *refs_only && is_json {
-                return Err(Error::InvalidArgument(
-                    "--refs-only applies to text output; JSON results already include ref".into(),
-                ));
-            }
-            let case_sensitive = if *ignore_case {
-                false
-            } else {
-                *case_sensitive || smart_case_sensitive(query, *regex)
-            };
-            let options = SearchOptions {
-                filter,
-                query: query.clone(),
-                regex: *regex,
-                case_sensitive,
-                word: *word_regexp,
-                sort: if sort == "score" {
-                    Sort::Score
-                } else {
-                    Sort::Recent
-                },
-                max_results: *max_results,
-                max_snippets: *max_snippets,
-                context_chars: *context,
-            };
-            let result = gated(&ctx, refreshing, &mut gate, |ctx, refreshing| {
-                convert(search(ctx, &options, refreshing)?, |v| {
-                    SearchDataDto::try_from(v)
-                })
-            })?;
-            if is_json {
-                emit(out, &result, true)
-            } else {
-                diagnostics(&result.diagnostics);
-                if *refs_only {
-                    search_text::render_refs(out, &result)
-                } else {
-                    search_text::render(out, &result)
-                }
-                .map_err(output_error)?;
-                Ok(i32::from(result.incomplete))
-            }
+        Command::Search(args) => {
+            run_search(&ctx, refreshing, &mut gate, filter, args, is_json, out)
         }
         Command::Read {
             session,
@@ -556,51 +532,51 @@ fn gated<T>(
     }
 }
 
-fn smart_case_sensitive(query: &str, regex: bool) -> bool {
-    struct Uppercase(bool);
-    impl Uppercase {
-        const fn literal(&mut self, literal: &ast::Literal) {
-            self.0 |= literal.c.is_uppercase();
-        }
+fn run_search(
+    ctx: &Context,
+    refreshing: RefreshOptions<'_>,
+    gate: &mut Gate<'_>,
+    filter: Filter,
+    args: &SearchArgs,
+    is_json: bool,
+    out: &mut dyn Write,
+) -> Result<i32> {
+    if args.refs_only && is_json {
+        return Err(Error::InvalidArgument(
+            "--refs-only applies to text output; JSON results already include ref".into(),
+        ));
     }
-    impl ast::Visitor for Uppercase {
-        type Output = bool;
-        type Err = std::convert::Infallible;
-        fn finish(self) -> std::result::Result<bool, Self::Err> {
-            Ok(self.0)
-        }
-        fn visit_pre(&mut self, ast: &ast::Ast) -> std::result::Result<(), Self::Err> {
-            if let ast::Ast::Literal(literal) = ast {
-                self.literal(literal);
-            }
-            Ok(())
-        }
-        fn visit_class_set_item_pre(
-            &mut self,
-            item: &ast::ClassSetItem,
-        ) -> std::result::Result<(), Self::Err> {
-            match item {
-                ast::ClassSetItem::Literal(literal) => self.literal(literal),
-                ast::ClassSetItem::Range(range) => {
-                    self.literal(&range.start);
-                    self.literal(&range.end);
-                }
-                _ => {}
-            }
-            Ok(())
-        }
-    }
-    let literal = || query.chars().any(char::is_uppercase);
-    if !regex {
-        return literal();
-    }
-    ast::parse::Parser::new().parse(query).map_or_else(
-        |_| literal(),
-        |parsed| {
-            let Ok(found) = ast::visit(&parsed, Uppercase(false));
-            found
+    let options = SearchOptions {
+        filter,
+        query: args.query.clone(),
+        regex: args.syntax.regex,
+        case_mode: args.case.mode(),
+        whole_word: args.word_regexp,
+        sort: if args.sort == "score" {
+            Sort::Score
+        } else {
+            Sort::Recent
         },
-    )
+        max_results: args.max_results,
+        max_snippets: if args.refs_only { 0 } else { args.max_snippets },
+        context_chars: args.context,
+    };
+    let result = gated(ctx, refreshing, gate, |ctx, refreshing| {
+        convert(search(ctx, &options, refreshing)?, |v| {
+            SearchDataDto::try_from(v)
+        })
+    })?;
+    if is_json {
+        return emit(out, &result, true);
+    }
+    diagnostics(&result.diagnostics);
+    if args.refs_only {
+        search_text::render_refs(out, &result)
+    } else {
+        search_text::render(out, &result)
+    }
+    .map_err(output_error)?;
+    Ok(i32::from(result.incomplete))
 }
 
 fn zone(explicit: Option<&str>, env: &BTreeMap<String, String>) -> Result<String> {
@@ -1162,34 +1138,6 @@ mod tests {
             accepted.stdout,
             "Changed text that is not indexed yet\nSecond reply\n"
         );
-    }
-
-    #[test]
-    fn smart_case_counts_only_literal_uppercase() {
-        for (query, regex, expected) in [
-            ("foo", false, false),
-            ("Foo", false, true),
-            ("ÉCOLE", false, true),
-            ("école", false, false),
-            (r"\w+", true, false),
-            (r"\W", true, false),
-            (r"\p{Lu}", true, false),
-            ("[[:upper:]]", true, false),
-            ("[A-Z]", true, true),
-            ("[a[B]]", true, true),
-            (r"\x41", true, true),
-            (r"\x6A", true, false),
-            ("(?i)foo", true, false),
-            ("foo|Bar", true, true),
-            ("(", true, false),
-            ("(A", true, true),
-        ] {
-            assert_eq!(
-                smart_case_sensitive(query, regex),
-                expected,
-                "{query} regex={regex}"
-            );
-        }
     }
 
     #[test]

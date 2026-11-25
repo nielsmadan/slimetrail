@@ -28,12 +28,19 @@ pub(crate) fn options(query: &str) -> SearchOptions {
         filter: filter(Agent::Claude),
         query: query.into(),
         regex: false,
-        case_sensitive: false,
-        word: false,
+        case_mode: CaseMode::Insensitive,
+        whole_word: false,
         sort: Sort::Score,
         max_results: 50,
         max_snippets: 3,
         context_chars: 8,
+    }
+}
+pub(crate) const fn case_mode(sensitive: bool) -> CaseMode {
+    if sensitive {
+        CaseMode::Sensitive
+    } else {
+        CaseMode::Insensitive
     }
 }
 pub(crate) fn write(path: &Path, text: &str) {

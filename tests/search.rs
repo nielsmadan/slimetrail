@@ -57,30 +57,33 @@ fn indexed_literals_equal_independent_scalar_matcher() {
     ] {
         for sensitive in [false, true] {
             let mut opt = options(query);
-            opt.case_sensitive = sensitive;
-            let actual = search(&ctx, &opt, &RefreshOptions::QUERY)
-                .unwrap()
-                .data
-                .unwrap();
+            opt.case_mode = case_mode(sensitive);
             let expected: std::collections::BTreeMap<_, _> = texts
                 .iter()
                 .enumerate()
                 .filter_map(|(i, text)| {
-                    let count = brute(text, query, sensitive, false);
+                    let count = brute(text, query, sensitive);
                     (count > 0).then_some((format!("s{i}"), count))
                 })
                 .collect();
-            let actual: std::collections::BTreeMap<_, _> = actual
-                .results
-                .into_iter()
-                .map(|h| (h.session.key.id, h.matches))
-                .collect();
-            assert_eq!(actual, expected, "{query:?}, case_sensitive={sensitive}");
+            assert_eq!(
+                session_matches(&ctx, &opt),
+                expected,
+                "{query:?}, case_sensitive={sensitive}"
+            );
         }
     }
 }
 
-fn brute(text: &str, query: &str, sensitive: bool, word: bool) -> u64 {
+fn brute(text: &str, query: &str, sensitive: bool) -> u64 {
+    count_matches(text, query, sensitive, false)
+}
+
+fn brute_word(text: &str, query: &str, sensitive: bool) -> u64 {
+    count_matches(text, query, sensitive, true)
+}
+
+fn count_matches(text: &str, query: &str, sensitive: bool, word: bool) -> u64 {
     fn fold(c: char) -> char {
         match c {
             'İ' => 'İ',
@@ -176,13 +179,13 @@ fn word_literals_equal_independent_matcher() {
     ] {
         for sensitive in [false, true] {
             let mut opt = options(query);
-            opt.case_sensitive = sensitive;
-            opt.word = true;
+            opt.case_mode = case_mode(sensitive);
+            opt.whole_word = true;
             let expected: std::collections::BTreeMap<_, _> = texts
                 .iter()
                 .enumerate()
                 .filter_map(|(i, text)| {
-                    let count = brute(text, query, sensitive, true);
+                    let count = brute_word(text, query, sensitive);
                     (count > 0).then_some((format!("s{i}"), count))
                 })
                 .collect();
@@ -193,7 +196,11 @@ fn word_literals_equal_independent_matcher() {
             );
         }
     }
-    assert_eq!(brute("x----", "---", true, true), 1);
+}
+
+#[test]
+fn word_oracle_retries_after_a_rejected_candidate() {
+    assert_eq!(brute_word("x----", "---", true), 1);
 }
 
 #[test]
@@ -215,8 +222,8 @@ fn word_regex_equals_word_literal() {
     ] {
         for sensitive in [false, true] {
             let mut literal = options(query);
-            literal.case_sensitive = sensitive;
-            literal.word = true;
+            literal.case_mode = case_mode(sensitive);
+            literal.whole_word = true;
             let mut pattern = literal.clone();
             pattern.regex = true;
             pattern.query = regex::escape(query);
@@ -240,7 +247,7 @@ fn word_with_invalid_regex_is_rejected() {
     let ctx = context(dir.path());
     let mut opt = options("(");
     opt.regex = true;
-    opt.word = true;
+    opt.whole_word = true;
     assert!(matches!(
         search(&ctx, &opt, &RefreshOptions::QUERY),
         Err(Error::InvalidArgument(message)) if message == "invalid or unsupported regular expression"
@@ -260,8 +267,10 @@ fn word_regex_wrapping_is_safe() {
     );
     let mut opt = options("(?x)foo # tail");
     opt.regex = true;
-    opt.word = true;
+    opt.whole_word = true;
     assert_eq!(session_matches(&ctx, &opt), [("one".into(), 2)].into());
+    opt.query = "foo|bar".into();
+    assert_eq!(session_matches(&ctx, &opt), [("one".into(), 3)].into());
     opt.query = "foo)|(?:bar".into();
     assert!(matches!(
         search(&ctx, &opt, &RefreshOptions::QUERY),
@@ -279,14 +288,47 @@ fn word_spot_checks() {
         ("rusty", "rusty"),
         ("underscore", "rust_"),
         ("generic", "use Result<T> here"),
+        ("accent", "naïve na"),
     ] {
         claude(&ctx, id, None, None, &[event("user", text, None)]);
     }
     let mut opt = options("rust");
-    opt.word = true;
+    opt.whole_word = true;
     assert_eq!(session_matches(&ctx, &opt), [("code".into(), 1)].into());
     opt.query = "Result<T>".into();
     assert_eq!(session_matches(&ctx, &opt), [("generic".into(), 1)].into());
+    opt.query = "na".into();
+    assert_eq!(session_matches(&ctx, &opt), [("accent".into(), 1)].into());
+}
+
+#[test]
+fn word_regex_counts_only_nonempty_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    claude(&ctx, "one", None, None, &[event("user", " aa xaa a", None)]);
+    let mut opt = options("a*");
+    opt.regex = true;
+    opt.whole_word = true;
+    assert_eq!(session_matches(&ctx, &opt), [("one".into(), 2)].into());
+}
+
+#[test]
+fn inline_case_flags_override_the_case_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path());
+    claude(
+        &ctx,
+        "one",
+        None,
+        None,
+        &[event("user", "NEEDLE Needle needle", None)],
+    );
+    let mut opt = options("(?-i)Needle");
+    opt.regex = true;
+    assert_eq!(session_matches(&ctx, &opt), [("one".into(), 1)].into());
+    opt.query = "(?i)needle".into();
+    opt.case_mode = CaseMode::Sensitive;
+    assert_eq!(session_matches(&ctx, &opt), [("one".into(), 3)].into());
 }
 
 #[test]
