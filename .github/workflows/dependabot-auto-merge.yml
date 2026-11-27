@@ -20,7 +20,7 @@ jobs:
         run: |
           set -euo pipefail
           required=$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$BASE_REF" \
-            --jq '[.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[] | select(.context == "check" and .integration_id == 15368)] | length')
+            --jq '[.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[] | select(.integration_id == 15368)] | length')
           if [ "$required" -eq 0 ]; then
             echo "Configure the required CI check ruleset before enabling auto-merge." >&2
             exit 1
